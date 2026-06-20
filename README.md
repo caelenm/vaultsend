@@ -120,19 +120,19 @@ from pip will not find your system GTK.
 Debian / Ubuntu:
 
 ```sh
-sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1
+sudo apt install python3-gi gir1.2-gtk-4.0 gir1.2-adw-1 cargo
 ```
 
 Fedora:
 
 ```sh
-sudo dnf install python3-gobject gtk4 libadwaita
+sudo dnf install python3-gobject gtk4 libadwaita cargo
 ```
 
 Arch:
 
 ```sh
-sudo pacman -S python-gobject gtk4 libadwaita
+sudo pacman -S python-gobject gtk4 libadwaita cargo
 ```
 
 Then:
