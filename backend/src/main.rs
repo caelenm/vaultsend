@@ -152,14 +152,28 @@ fn output_writer(path: Option<&str>) -> R<Box<dyn Write>> {
 // ---------------------------------------------------------------------------
 // Commands.
 // ---------------------------------------------------------------------------
+/// True if identity.age exists and is a structurally valid age file (its header
+/// parses). Needs no passphrase, and is what separates a recoverable identity
+/// from an empty/corrupt leftover. A valid identity is never overwritten; an
+/// invalid one is safe to replace because nothing can be recovered from it.
+fn identity_is_valid() -> bool {
+    match identity_path() {
+        Ok(p) => File::open(&p)
+            .map(|f| age::Decryptor::new(BufReader::new(f)).is_ok())
+            .unwrap_or(false),
+        Err(_) => false,
+    }
+}
+
 fn cmd_keygen(pass_fd: i32) -> R<()> {
     let dir = data_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
 
-    // Fast, friendly check before we consume the passphrase pipe. The atomic
-    // O_EXCL open below is the authoritative guard against the create race.
-    if identity_path()?.exists() {
+    // Refuse only if a *valid* identity already exists. An empty or corrupt
+    // identity.age (e.g. left by an interrupted earlier run) holds no key, so it
+    // is safe to replace rather than leaving the user permanently stuck.
+    if identity_is_valid() {
         return Err("an identity already exists; refusing to overwrite it".into());
     }
     let passphrase = read_passphrase(pass_fd)?;
@@ -168,38 +182,34 @@ fn cmd_keygen(pass_fd: i32) -> R<()> {
     let public = identity.to_public().to_string(); // "age1..."
     let secret = identity.to_string();             // SecretString "AGE-SECRET-KEY-1..."
 
-    // Create the identity file atomically as 0600, refusing to clobber an
-    // existing one (O_CREAT|O_EXCL). This removes the exists()/create race and
-    // the window in which the file was briefly readable at default (0644) perms.
-    let file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(identity_path()?)
-        .map_err(|e| match e.kind() {
-            io::ErrorKind::AlreadyExists => {
-                "an identity already exists; refusing to overwrite it".to_string()
-            }
-            _ => format!("writing identity: {e}"),
-        })?;
-
-    // Encrypt the secret key to the passphrase (age scrypt). If anything fails
-    // mid-write, remove the partial file so a later keygen isn't blocked by it.
+    // Write the encrypted identity to a temp file, then atomically rename it into
+    // place. identity.age is therefore only ever absent or fully written — never
+    // a partial/empty file that a later run would mistake for a real identity
+    // (the very state that produced "failed to fill whole buffer" on recovery).
+    let id_path = identity_path()?;
+    let tmp = format!("{}.new", id_path.display());
+    let file = open_private_new(&tmp)?;
     let write_result = (move || -> R<()> {
         let encryptor = age::Encryptor::with_user_passphrase(passphrase);
         let mut w = encryptor.wrap_output(file).map_err(|e| format!("encrypting identity: {e}"))?;
         w.write_all(secret.expose_secret().as_bytes())
             .map_err(|e| format!("encrypting identity: {e}"))?;
-        w.finish().map_err(|e| format!("encrypting identity: {e}"))?;
+        let mut inner = w.finish().map_err(|e| format!("encrypting identity: {e}"))?;
+        inner.flush().map_err(|e| format!("encrypting identity: {e}"))?;
+        inner.sync_all().map_err(|e| format!("encrypting identity: {e}"))?;
         Ok(())
     })();
     if let Err(e) = write_result {
-        let _ = fs::remove_file(identity_path()?);
+        let _ = fs::remove_file(&tmp);
         return Err(e);
     }
+    fs::rename(&tmp, &id_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("finalizing identity: {e}")
+    })?;
 
     fs::write(pubkey_path()?, &public).map_err(|e| format!("writing public key: {e}"))?;
-    println!("{public}");
+    print!("{public}");
     Ok(())
 }
 
@@ -207,6 +217,70 @@ fn cmd_pubkey() -> R<()> {
     let pk = fs::read_to_string(pubkey_path()?)
         .map_err(|_| "no identity yet — run keygen first".to_string())?;
     print!("{}", pk.trim());
+    Ok(())
+}
+
+/// Report whether an identity is present and usable without unlocking:
+///   "ready"  — the clear pubkey cache exists (encrypt/lookup work with no pass)
+///   "locked" — identity.age exists but the pubkey cache is missing/empty, so it
+///              must be regenerated with the passphrase (run `recover-pubkey`)
+///   "empty"  — no identity at all (first run; run `keygen`)
+/// Takes no secret, so the frontend can call it on every launch to decide what
+/// to do without ever prompting unnecessarily.
+fn cmd_status() -> R<()> {
+    let has_pubkey = match fs::read_to_string(pubkey_path()?) {
+        Ok(s) => !s.trim().is_empty(),
+        Err(_) => false,
+    };
+    let state = if has_pubkey {
+        "ready"
+    } else if !identity_path()?.exists() {
+        "empty"
+    } else if identity_is_valid() {
+        "locked" // a real encrypted identity, just missing its pubkey cache
+    } else {
+        "corrupt" // identity.age present but empty/unreadable — nothing to recover
+    };
+    print!("{state}");
+    Ok(())
+}
+
+/// Decrypt identity.age with the passphrase and return the parsed identity.
+/// Shared by `decrypt` and `recover-pubkey` so both use identical logic.
+fn load_identity(pass_fd: i32) -> R<x25519::Identity> {
+    let passphrase = read_passphrase(pass_fd)?;
+    let id_file = File::open(identity_path()?)
+        .map_err(|_| "no identity yet — run keygen first".to_string())?;
+    let dec = age::Decryptor::new(BufReader::new(id_file))
+        .map_err(|_| "your saved identity is empty or damaged and can't be read".to_string())?;
+    let scrypt_id = age::scrypt::Identity::new(passphrase);
+    let mut id_reader = dec
+        .decrypt(std::iter::once(&scrypt_id as &dyn age::Identity))
+        .map_err(|_| "wrong passphrase, or the identity file is damaged".to_string())?;
+    // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
+    // drop rather than left behind in freed heap. (age keeps the parsed scalar
+    // in its own zeroizing storage; this protects the intermediate text form.)
+    let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    id_reader
+        .read_to_end(&mut secret_bytes)
+        .map_err(|e| format!("reading identity: {e}"))?;
+    let secret = std::str::from_utf8(&secret_bytes)
+        .map_err(|_| "identity file is corrupt".to_string())?;
+    secret
+        .trim()
+        .parse::<x25519::Identity>()
+        .map_err(|e| format!("identity file is corrupt: {e}"))
+}
+
+/// Rebuild the clear pubkey cache from the encrypted identity. Used when the
+/// pubkey file was lost (e.g. deleted) but identity.age still exists — the public
+/// key is derived from the secret key, so unlocking the identity is enough to
+/// restore it; no new identity is created.
+fn cmd_recover_pubkey(pass_fd: i32) -> R<()> {
+    let identity = load_identity(pass_fd)?;
+    let public = identity.to_public().to_string();
+    fs::write(pubkey_path()?, &public).map_err(|e| format!("writing public key: {e}"))?;
+    print!("{public}");
     Ok(())
 }
 
@@ -236,28 +310,8 @@ fn cmd_encrypt(recipient_strs: &[String], armor: bool, in_p: Option<&str>, out_p
 }
 
 fn cmd_decrypt(pass_fd: i32, in_p: Option<&str>, out_p: Option<&str>) -> R<()> {
-    let passphrase = read_passphrase(pass_fd)?;
-
     // Recover the secret key by decrypting identity.age with the passphrase.
-    let id_file = File::open(identity_path()?)
-        .map_err(|_| "no identity yet — run keygen first".to_string())?;
-    let dec = age::Decryptor::new(BufReader::new(id_file))
-        .map_err(|e| format!("reading identity: {e}"))?;
-    let scrypt_id = age::scrypt::Identity::new(passphrase);
-    let mut id_reader = dec
-        .decrypt(std::iter::once(&scrypt_id as &dyn age::Identity))
-        .map_err(|_| "wrong passphrase, or the identity file is damaged".to_string())?;
-    // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
-    // drop rather than left behind in freed heap. (age keeps the parsed scalar
-    // in its own zeroizing storage; this protects the intermediate text form.)
-    let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
-    id_reader
-        .read_to_end(&mut secret_bytes)
-        .map_err(|e| format!("reading identity: {e}"))?;
-    let secret = std::str::from_utf8(&secret_bytes)
-        .map_err(|_| "identity file is corrupt".to_string())?;
-    let identity: x25519::Identity =
-        secret.trim().parse().map_err(|e| format!("identity file is corrupt: {e}"))?;
+    let identity = load_identity(pass_fd)?;
 
     // Decrypt the payload. ArmoredReader transparently handles both binary and
     // ASCII-armored input, so one path covers files and pasted text.
@@ -337,6 +391,8 @@ fn run() -> R<()> {
     match cmd {
         "keygen" => cmd_keygen(require_fd(rest)?),
         "pubkey" => cmd_pubkey(),
+        "status" => cmd_status(),
+        "recover-pubkey" => cmd_recover_pubkey(require_fd(rest)?),
         "encrypt" => cmd_encrypt(
             &all_values(rest, "-r"),
             has_flag(rest, "--armor"),
@@ -348,7 +404,9 @@ fn run() -> R<()> {
             opt_value(rest, "--in").as_deref(),
             opt_value(rest, "--out").as_deref(),
         ),
-        other => Err(format!("unknown command '{other}' (expected keygen|pubkey|encrypt|decrypt)")),
+        other => Err(format!(
+            "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt)"
+        )),
     }
 }
 
