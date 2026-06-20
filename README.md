@@ -225,6 +225,52 @@ Secrets are never passed as arguments (those are visible to other processes):
 the passphrase is read from the file descriptor named by `--pass-fd`. File data
 flows over stdin/stdout unless `--in`/`--out` are given.
 
+## Backing up and restoring
+
+VaultSend keeps all of your state in two well-known locations outside the
+project folder, so backing up and moving to a fresh checkout is just a matter of
+copying two files. Nothing here depends on the version of the code you have, so a
+backup taken from one checkout restores cleanly into another.
+
+**Your private key.** Back up `~/.local/share/vaultsend/identity.age` (or
+`$XDG_DATA_HOME/vaultsend/identity.age` if that variable is set). This file is
+already passphrase-encrypted at rest, so it is safe to store anywhere you would
+keep an encrypted file — an external drive, cloud storage, a USB stick. The one
+rule: keep your **passphrase** somewhere separate from the backup (a password
+manager is ideal), because the encrypted file is only as strong as the
+passphrase protecting it, and storing both together defeats the point. You may
+also copy the companion `pubkey` file alongside it for convenience, though it is
+not strictly required. To back up, simply copy the file:
+`cp ~/.local/share/vaultsend/identity.age /your/backup/location/`.
+
+**Your contacts.** Back up `~/.config/vaultsend/contacts.json` (or
+`$XDG_CONFIG_HOME/vaultsend/contacts.json`). Unlike the key, this file holds no
+secrets — it is just a plain, human-readable list of names and **public** keys,
+which are public by design — so you can copy, sync, version-control, or email it
+freely without any special handling: `cp ~/.config/vaultsend/contacts.json
+/your/backup/location/`.
+
+**Restoring into a fresh checkout.** Because your key and contacts live in your
+home directory rather than inside the project, a new copy of VaultSend pulled
+from GitHub will pick them up automatically — there is nothing to import. After
+cloning and building the backend (`make build`), just make sure the two files
+are back in their standard locations and launch the app:
+
+```sh
+mkdir -p ~/.local/share/vaultsend ~/.config/vaultsend
+cp /your/backup/location/identity.age  ~/.local/share/vaultsend/
+cp /your/backup/location/contacts.json ~/.config/vaultsend/
+chmod 600 ~/.local/share/vaultsend/identity.age   # keep the key private
+make run
+```
+
+VaultSend will find the existing identity (it will ask for your passphrase only
+when you first decrypt, not on launch) and show your restored contacts. If
+`contacts.json` is missing or unreadable for any reason, the app simply starts
+with an empty contact list rather than failing, so a partial restore is never
+fatal — and if `identity.age` is absent, you will be prompted to create a new
+key on first launch, exactly as you were the very first time.
+
 ## Where to look when auditing
 
 - `backend/src/main.rs` — the four `cmd_*` functions are the whole story;
