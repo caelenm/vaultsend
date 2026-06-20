@@ -188,6 +188,12 @@ cd appimage
 
 This copies the freshly built backend binary and the current frontend source into `VaultSend.AppDir`, downloads `appimagetool` on first run if it isn't already cached, and packs everything into `VaultSend-x86_64.AppImage` in that directory. Re-run it any time after changing the backend or frontend, since it always refreshes the bundled copies before packing.
 
+Make the AppImage executable:
+
+```sh
+chmod +x VaultSend-x86_64.AppImage
+```
+
 Run the built AppImage:
 
 ```sh
