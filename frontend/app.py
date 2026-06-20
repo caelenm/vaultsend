@@ -700,7 +700,7 @@ class Window(Adw.ApplicationWindow):
             developer_name="VaultSend",
             version="0.1.0",
             comments="File and text encryption using the age format. "
-            "All cryptography is performed by a small separate backend.",
+            "All cryptography is performed by a small separate backend."
             "Source code can be found here: https://github.com/caelenm/vaultsend/",
         )
         about.present(self)
