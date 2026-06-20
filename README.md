@@ -105,22 +105,6 @@ and just wraps a copy of that key to each recipient separately.
 
 ## Build
 
-The backend is the only thing that needs compiling:
-
-```sh
-cd backend
-cargo build --release
-```
-
-This produces `backend/target/release/vaultsend-backend`. A `Cargo.lock` is
-checked in and pins the dependency tree to versions that build on **Rust 1.75+**
-(age itself targets Rust 1.65; a few of its localization dependencies published
-newer releases that require a newer compiler, so they are pinned down). `age` is
-the primary cryptographic dependency; `zeroize` and (on Linux) `libc` support
-the process-hardening described above.
-
-## Run
-
 The frontend needs GTK 4 (≥ 4.10) and libadwaita (≥ 1.5) with their Python
 bindings. **Install these from your distribution, not from pip** — PyGObject
 from pip will not find your system GTK.
@@ -146,8 +130,28 @@ sudo pacman -S python-gobject gtk4 libadwaita cargo
 Then:
 
 ```sh
-make run        # or: python3 frontend/app.py
+cd appimage
+bash build-appimage.sh
 ```
+
+This copies the freshly built backend binary and the current frontend source into `VaultSend.AppDir`, downloads `appimagetool` on first run if it isn't already cached, and packs everything into `VaultSend-x86_64.AppImage` in that directory. Re-run it any time after changing the backend or frontend, since it always refreshes the bundled copies before packing.
+
+## Run
+```sh
+./VaultSend-x86_64.AppImage
+```
+You can then pin the app to your launcher using something like "Pin it!" , https://github.com/ryonakano/pinit
+
+Or, if your system lacks FUSE (some minimal distros, containers, or Wayland-only setups):
+
+```sh
+./VaultSend-x86_64.AppImage --appimage-extract-and-run
+```
+
+The AppImage bundles only the Rust backend and the Python frontend source; it deliberately does **not** bundle GTK4, libadwaita, or PyGObject, so your system still needs those installed (see the **Run** section above for the per-distro install commands). If you can already run a GTK4/libadwaita app like GNOME Text Editor, VaultSend's AppImage will work too.
+
+**If launching produces no window:** run it from a terminal rather than double-clicking it — a GUI launch hides stderr, and the most common cause is a GTK/libadwaita version below VaultSend's floor (≥ 4.10 / ≥ 1.5). The app detects this and reports a one-line message that a terminal will show you.
+
 
 On first launch you'll be asked to choose a passphrase; that creates your key.
 The frontend finds the backend by, in order: the `VAULTSEND_BACKEND`
@@ -178,45 +182,6 @@ list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
 - **Your public key** lives in the menu (⋮) — share it so others can write to you.
 
 
-
-## Building and running the AppImage
-
-To build the AppImage, first make sure the backend compiles:
-
-```sh
-cd backend && cargo build --release
-```
-
-Then pack it:
-
-```sh
-cd appimage
-./build-appimage.sh
-```
-
-This copies the freshly built backend binary and the current frontend source into `VaultSend.AppDir`, downloads `appimagetool` on first run if it isn't already cached, and packs everything into `VaultSend-x86_64.AppImage` in that directory. Re-run it any time after changing the backend or frontend, since it always refreshes the bundled copies before packing.
-
-Make the AppImage executable:
-
-```sh
-chmod +x VaultSend-x86_64.AppImage
-```
-
-Run the built AppImage:
-
-```sh
-./VaultSend-x86_64.AppImage
-```
-
-Or, if your system lacks FUSE (some minimal distros, containers, or Wayland-only setups):
-
-```sh
-./VaultSend-x86_64.AppImage --appimage-extract-and-run
-```
-
-The AppImage bundles only the Rust backend and the Python frontend source; it deliberately does **not** bundle GTK4, libadwaita, or PyGObject, so your system still needs those installed (see the **Run** section above for the per-distro install commands). If you can already run a GTK4/libadwaita app like GNOME Text Editor, VaultSend's AppImage will work too.
-
-**If launching produces no window:** run it from a terminal rather than double-clicking it — a GUI launch hides stderr, and the most common cause is a GTK/libadwaita version below VaultSend's floor (≥ 4.10 / ≥ 1.5). The app detects this and reports a one-line message that a terminal will show you.
 
 ## Backend command-line interface
 
@@ -296,8 +261,7 @@ Developed and hardened on Linux; the process-hardening in `harden_process()`
 The backend's cryptography and file handling are otherwise portable Rust, and
 the frontend's GTK4/libadwaita stack runs on macOS, though neither has been
 tested there. There is currently no Windows port (the backend's passphrase
-pipe uses Unix file descriptors). See the project history/issues for the
-current state of cross-platform work.
+pipe uses Unix file descriptors). This repo will not attempt to port to windows or MacOS in order to minimize scope creep and attack surface.
 
 ## Scope / limitations
 
