@@ -176,7 +176,37 @@ class Window(Adw.ApplicationWindow):
             copy.connect("clicked", lambda _b, pk=c["pubkey"]: self.copy(pk, "Public key copied."))
             row.add_suffix(copy)
             row.connect("activated", lambda _r, pk=c["pubkey"]: self.copy(pk, "Public key copied."))
+
+            # Right-click (or long-press / Menu key) opens a small context menu.
+            menu = Gio.Menu()
+            detailed = Gio.Action.print_detailed_name(
+                "win.delete-contact", GLib.Variant("s", c["pubkey"])
+            )
+            menu.append("Delete contact", detailed)
+            self._attach_context_menu(row, menu)
+
             self.contact_list.append(row)
+
+    def _attach_context_menu(self, row, menu):
+        """Show `menu` as a popover when `row` is right-clicked or long-pressed."""
+        def popup_at(x, y):
+            pop = Gtk.PopoverMenu.new_from_model(menu)
+            pop.set_parent(row)
+            pop.set_has_arrow(False)
+            rect = Gdk.Rectangle()
+            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+            pop.set_pointing_to(rect)
+            pop.connect("closed", lambda p: p.unparent())
+            pop.popup()
+
+        click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        click.connect("pressed", lambda _g, _n, x, y: popup_at(x, y))
+        row.add_controller(click)
+
+        # Touchscreens have no right button: long-press opens the same menu.
+        press = Gtk.GestureLongPress()
+        press.connect("pressed", lambda _g, x, y: popup_at(x, y))
+        row.add_controller(press)
 
     # -- Content --------------------------------------------------------------
     def _build_content(self):
@@ -259,6 +289,39 @@ class Window(Adw.ApplicationWindow):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", fn)
             self.add_action(act)
+        # Parameterized action invoked from a contact's right-click menu; the
+        # action target carries the contact's public key (which is unique).
+        del_act = Gio.SimpleAction.new("delete-contact", GLib.VariantType.new("s"))
+        del_act.connect("activate", self.on_delete_contact)
+        self.add_action(del_act)
+
+    def on_delete_contact(self, _action, param):
+        pubkey = param.get_string()
+        contact = next((c for c in self.contacts if c["pubkey"] == pubkey), None)
+        if contact is None:
+            return
+        name = contact["name"]
+        dlg = Adw.AlertDialog(
+            heading="Delete contact?",
+            body=f"Remove “{name}” from your contacts? This only forgets their saved "
+            "public key — it doesn't affect anything you've already encrypted.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Delete")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "delete":
+                return
+            self.contacts = [c for c in self.contacts if c["pubkey"] != pubkey]
+            save_contacts(self.contacts)
+            self._refresh_contacts()
+            self.toast(f"Deleted {name}.")
+
+        dlg.connect("response", resp)
+        dlg.present(self)
 
     # -- Small helpers --------------------------------------------------------
     def toast(self, text):
