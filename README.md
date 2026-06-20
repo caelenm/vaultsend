@@ -306,3 +306,5 @@ current state of cross-platform work.
 - One identity per user; no key fetching over a network; no plugins. By design.
 - No third-party security audit has been performed. See the security warning
   at the top of this document.
+
+My pubkey: age192d2u5rkgv9nvl9858fhyqsk78shhgknfjydukfgepu5c608439qnk8z62
