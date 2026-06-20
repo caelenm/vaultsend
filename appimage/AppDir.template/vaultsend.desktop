@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=VaultSend
+Comment=Encrypt files and text with age
+Exec=AppRun
+Icon=vaultsend
+Categories=Utility;Security;
+Terminal=false

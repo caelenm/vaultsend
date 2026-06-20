@@ -1,0 +1,26 @@
+#!/bin/sh
+# AppImage entry point for VaultSend.
+#
+# What's bundled inside this AppImage: the vaultsend-backend binary and the
+# Python frontend source. What's NOT bundled: GTK4, libadwaita, or PyGObject —
+# this AppImage relies on those being installed on the host system, the same
+# way it would if you ran the app from a checkout. See README-APPIMAGE.md for
+# why, and the exact packages to install per distro.
+
+HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+
+export VAULTSEND_BACKEND="$HERE/usr/bin/vaultsend-backend"
+
+if ! command -v python3 >/dev/null 2>&1; then
+    echo "VaultSend needs python3 on your system. Install it with your package manager." >&2
+    exit 1
+fi
+
+if ! python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw" 2>/tmp/vaultsend-gi-check; then
+    echo "VaultSend needs GTK 4 and libadwaita with their Python bindings (python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, or your distro's equivalents)." >&2
+    echo "Detail:" >&2
+    cat /tmp/vaultsend-gi-check >&2
+    exit 1
+fi
+
+exec python3 "$HERE/usr/share/vaultsend/frontend/app.py" "$@"

@@ -1,0 +1,8 @@
+# Disposable build staging — assembled fresh from sources on every run.
+/build/
+
+# Cached appimagetool download.
+/appimagetool
+
+# Built AppImage artifacts.
+*.AppImage
