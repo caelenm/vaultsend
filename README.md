@@ -17,7 +17,7 @@ are two parts and a hard line between them:
 - **`backend/`** — a tiny Rust command-line tool. It is the **only** component
   that ever touches your private key. All cryptography is delegated to the `age`
   crate; the backend itself contains no hand-written crypto, just plumbing and
-  process hardening (~365 lines, one file).
+  process hardening (~443 lines, one file).
 - **`frontend/`** — a GTK 4 / libadwaita app in Python. It draws the window and
   keeps your contact list. It **never sees your private key** — when a passphrase
   is needed it hands it to the backend over a private pipe and forgets it.
