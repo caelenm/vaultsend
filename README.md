@@ -8,11 +8,57 @@ are two parts and a hard line between them:
 
 - **`backend/`** — a tiny Rust command-line tool. It is the **only** component
   that ever touches your private key. All cryptography is delegated to the `age`
-  crate; the backend itself contains no hand-written crypto, just plumbing
-  (~235 lines, one file).
+  crate; the backend itself contains no hand-written crypto, just plumbing and
+  process hardening (~365 lines, one file).
 - **`frontend/`** — a GTK 4 / libadwaita app in Python. It draws the window and
   keeps your contact list. It **never sees your private key** — when a passphrase
   is needed it hands it to the backend over a private pipe and forgets it.
+
+## ⚠️ Security warning
+
+**This is a personal/hobby project, not an audited security product.** It has
+not been reviewed by a third party or a professional cryptography auditor.
+Treat it accordingly:
+
+- The cryptography itself is not custom — it is entirely delegated to the
+  [`age`](https://github.com/str4d/rage) crate, which is widely used and
+  reasonably well-reviewed. VaultSend's own code is plumbing around it: file
+  handling, process hardening, and a GTK UI.
+- The plumbing *has* been deliberately hardened against a specific, modest
+  threat model (below) — but "hardened" is not the same as "audited," and a
+  single careful pass cannot rule out mistakes the way independent review can.
+- Do not use this for anything where a flaw would be catastrophic without an
+  independent audit first.
+- If you find a security issue, please don't open a public issue with exploit
+  details — the README's "Where to look when auditing" section below tells you
+  exactly which ~150 lines matter most, so a report can be specific and fast to
+  fix.
+
+## What it defends against (and what it doesn't)
+
+VaultSend's backend is hardened against a same-user-process threat: another
+program running as *you* trying to read the private key out of memory, swap,
+or a crash dump while the backend is briefly holding it. Concretely:
+
+- The process disables core dumps and marks itself non-ptraceable
+  (`PR_SET_DUMPABLE(0)`) on Linux, so another process running as your user
+  cannot read its memory via `/proc/<pid>/mem` or `ptrace`, regardless of the
+  system's Yama `ptrace_scope` setting.
+- Secret-holding memory is locked out of swap (`mlockall`) where the OS
+  permits it, and intermediate secret buffers (the passphrase, the decrypted
+  key text) are held in zeroizing storage so they're wiped on drop rather than
+  left in freed heap.
+- The identity file is created atomically at `0600` (no window at a wider
+  permission, no clobber race), and a decrypted output file is staged to a
+  temp file and only renamed into place after the entire ciphertext has
+  authenticated — so a truncated or tampered file never leaves partial
+  plaintext on disk.
+
+**What this does *not* defend against:** a keylogger or compromised display
+server capturing your passphrase as you type it; a **root** user or kernel-level
+attacker (root can always read process memory, regardless of `PR_SET_DUMPABLE`);
+or a compromised frontend or backend binary itself. The hardening also only
+applies on Linux for now — see Platform support below.
 
 ## Security model in one paragraph
 
@@ -24,6 +70,30 @@ encrypt and look up your own address without typing a passphrase. The passphrase
 is therefore only ever needed to **decrypt**. Encrypting to several recipients
 does not weaken anything: age encrypts the body once under a single random key
 and just wraps a copy of that key to each recipient separately.
+
+## Features
+
+- **Encrypt / decrypt text.** Paste or type a message, encrypt it to one or
+  more recipients, and get back armored (ASCII) text you can paste into an
+  email or chat. Decrypting is the same in reverse — paste the armored text,
+  enter your passphrase.
+- **Encrypt / decrypt files.** Drag a file onto the window or use **Open
+  file…**; choose the operation and where to save the result. Files stream
+  through the backend rather than loading fully into memory.
+- **Multi-recipient encryption.** Pick any number of contacts when encrypting;
+  everyone you choose (plus you, automatically) can decrypt the result. This
+  costs nothing extra in security — age wraps one randomly generated body key
+  per recipient rather than re-encrypting the body multiple times.
+- **Contacts.** A simple, exportable JSON address book of names and public
+  keys. Nothing in it is secret, so it's safe to back up or sync however you
+  like.
+- **No network code, no plugins, one identity per user.** VaultSend doesn't
+  fetch keys from anywhere or phone home. What you see in the two source files
+  is the entire app.
+- **Plaintext touches disk only when you ask.** Decrypting writes a file to
+  disk only if you choose **Open file… → Decrypt** with an output path;
+  decrypting pasted text keeps the result in memory and on screen, never on
+  disk, unless you explicitly save it.
 
 ## Build
 
@@ -38,7 +108,8 @@ This produces `backend/target/release/vaultsend-backend`. A `Cargo.lock` is
 checked in and pins the dependency tree to versions that build on **Rust 1.75+**
 (age itself targets Rust 1.65; a few of its localization dependencies published
 newer releases that require a newer compiler, so they are pinned down). `age` is
-the sole cryptographic dependency.
+the primary cryptographic dependency; `zeroize` and (on Linux) `libc` support
+the process-hardening described above.
 
 ## Run
 
@@ -98,6 +169,41 @@ list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
   to copy their key.
 - **Your public key** lives in the menu (⋮) — share it so others can write to you.
 
+
+
+## Building and running the AppImage
+
+To build the AppImage, first make sure the backend compiles:
+
+```sh
+cd backend && cargo build --release
+```
+
+Then pack it:
+
+```sh
+cd appimage
+./build-appimage.sh
+```
+
+This copies the freshly built backend binary and the current frontend source into `VaultSend.AppDir`, downloads `appimagetool` on first run if it isn't already cached, and packs everything into `VaultSend-x86_64.AppImage` in that directory. Re-run it any time after changing the backend or frontend, since it always refreshes the bundled copies before packing.
+
+Run the built AppImage:
+
+```sh
+./VaultSend-x86_64.AppImage
+```
+
+Or, if your system lacks FUSE (some minimal distros, containers, or Wayland-only setups):
+
+```sh
+./VaultSend-x86_64.AppImage --appimage-extract-and-run
+```
+
+The AppImage bundles only the Rust backend and the Python frontend source; it deliberately does **not** bundle GTK4, libadwaita, or PyGObject, so your system still needs those installed (see the **Run** section above for the per-distro install commands). If you can already run a GTK4/libadwaita app like GNOME Text Editor, VaultSend's AppImage will work too.
+
+**If launching produces no window:** run it from a terminal rather than double-clicking it — a GUI launch hides stderr, and the most common cause is a GTK/libadwaita version below VaultSend's floor (≥ 4.10 / ≥ 1.5). The app detects this and reports a one-line message that a terminal will show you.
+
 ## Backend command-line interface
 
 The backend is usable on its own and easy to audit in isolation:
@@ -116,12 +222,27 @@ flows over stdin/stdout unless `--in`/`--out` are given.
 ## Where to look when auditing
 
 - `backend/src/main.rs` — the four `cmd_*` functions are the whole story;
-  `cmd_encrypt` / `cmd_decrypt` are the crypto paths.
+  `cmd_encrypt` / `cmd_decrypt` are the crypto paths. `harden_process()` (top of
+  the file) is the process-hardening described in the security warning above;
+  `read_passphrase` and the decrypt-to-file path in `cmd_decrypt` are where
+  secret material is held in memory and where staged writes happen.
 - `frontend/app.py` — `run_backend()` is the entire trust boundary: it shows
   exactly what is sent to the backend and how the passphrase is passed.
+
+## Platform support
+
+Developed and hardened on Linux; the process-hardening in `harden_process()`
+(`PR_SET_DUMPABLE`, `mlockall`, etc.) is Linux-specific and a no-op elsewhere.
+The backend's cryptography and file handling are otherwise portable Rust, and
+the frontend's GTK4/libadwaita stack runs on macOS, though neither has been
+tested there. There is currently no Windows port (the backend's passphrase
+pipe uses Unix file descriptors). See the project history/issues for the
+current state of cross-platform work.
 
 ## Scope / limitations
 
 - The backend is invoked synchronously, so encrypting a very large file will
   briefly freeze the window. Fine for typical use; kept this way for simplicity.
 - One identity per user; no key fetching over a network; no plugins. By design.
+- No third-party security audit has been performed. See the security warning
+  at the top of this document.
