@@ -374,9 +374,31 @@ class Window(Adw.ApplicationWindow):
 
     # -- Identity / first run -------------------------------------------------
     def ensure_identity(self):
+        # Ask the backend what state we're in (no passphrase needed):
+        #   ready  -> pubkey cache present, just read it
+        #   locked -> identity.age exists but pubkey was lost; rebuild it (needs pass)
+        #   empty  -> no identity at all; create one
         try:
-            self.my_pubkey = run_backend(["pubkey"]).decode("utf-8").strip()
+            status = run_backend(["status"]).decode("utf-8").strip()
         except BackendError:
+            # Older backend without `status`: fall back to the legacy path.
+            try:
+                self.my_pubkey = run_backend(["pubkey"]).decode("utf-8").strip()
+            except BackendError:
+                self.first_run()
+            return
+
+        if status == "ready":
+            try:
+                self.my_pubkey = run_backend(["pubkey"]).decode("utf-8").strip()
+            except BackendError:
+                # Cache vanished between the check and the read; recover it.
+                self.recover_identity()
+        elif status == "locked":
+            self.recover_identity()
+        elif status == "corrupt":
+            self.corrupt_identity()
+        else:
             self.first_run()
 
     def first_run(self):
@@ -393,6 +415,42 @@ class Window(Adw.ApplicationWindow):
             self.toast("Your key is ready.")
         except BackendError as e:
             self.error(str(e))
+
+    def recover_identity(self):
+        # identity.age exists but its public key cache was lost. Rebuild the
+        # public key from the identity — this needs the passphrase (the identity
+        # is encrypted) but creates nothing new.
+        self.ask_passphrase(
+            self._do_recover,
+            heading="Restore your public key",
+            body="Your saved key is here, but its public address needs to be rebuilt. "
+            "Enter your passphrase to restore it.",
+        )
+
+    def _do_recover(self, passphrase):
+        try:
+            self.my_pubkey = run_backend(["recover-pubkey"], passphrase=passphrase).decode("utf-8").strip()
+            self.toast("Your key is ready.")
+        except BackendError as e:
+            self.error(str(e))
+
+    def corrupt_identity(self):
+        # identity.age exists but is empty/unreadable: there is no key in it to
+        # recover. Be honest about the data loss and offer to start fresh.
+        dlg = Adw.AlertDialog(
+            heading="Your key file is damaged",
+            body="VaultSend found a saved identity, but it is empty or unreadable and "
+            "cannot be recovered. You can create a new key to continue — but anything "
+            "that was encrypted only to the old key will no longer be readable.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("new", "Create new key")
+        dlg.set_response_appearance("new", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        # keygen now replaces an invalid identity, so the normal create flow works.
+        dlg.connect("response", lambda _d, r: self.first_run() if r == "new" else None)
+        dlg.present(self)
 
     # -- File handling --------------------------------------------------------
     def on_file_dropped(self, _target, value, _x, _y):
