@@ -55,7 +55,28 @@ fn harden_process() {
         let _ = libc::prctl(libc::PR_SET_DUMPABLE, 0, 0, 0, 0);
         let no_core = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
         let _ = libc::setrlimit(libc::RLIMIT_CORE, &no_core);
-        let _ = libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE);
+
+        // Keep secret pages out of swap — but carefully. MCL_FUTURE locks every
+        // *future* allocation, and if one would exceed RLIMIT_MEMLOCK the kernel
+        // fails the allocation outright, aborting the process. scrypt (used by
+        // keygen/decrypt) allocates a large buffer, so on a machine with the
+        // common low memlock limit that abort is exactly what happens. So: try
+        // to lift the limit, and only lock future allocations when it is truly
+        // unlimited. Otherwise lock just what's mapped now (best-effort) and let
+        // allocations proceed normally. Hardening must never break the app.
+        let inf = libc::rlimit { rlim_cur: libc::RLIM_INFINITY, rlim_max: libc::RLIM_INFINITY };
+        let _ = libc::setrlimit(libc::RLIMIT_MEMLOCK, &inf);
+
+        let mut cur = libc::rlimit { rlim_cur: 0, rlim_max: 0 };
+        let unlimited = libc::getrlimit(libc::RLIMIT_MEMLOCK, &mut cur) == 0
+            && cur.rlim_cur == libc::RLIM_INFINITY;
+
+        let flags = if unlimited {
+            libc::MCL_CURRENT | libc::MCL_FUTURE
+        } else {
+            libc::MCL_CURRENT
+        };
+        let _ = libc::mlockall(flags);
     }
 }
 
