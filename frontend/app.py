@@ -329,6 +329,7 @@ class Window(Adw.ApplicationWindow):
         col.append(card)
 
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.set_propagation_phase(Gtk.PropagationPhase.CAPTURE) 
         drop.connect("drop", self.on_file_dropped)
         card.add_controller(drop)
 
@@ -455,7 +456,7 @@ class Window(Adw.ApplicationWindow):
     # -- File handling --------------------------------------------------------
     def on_file_dropped(self, _target, value, _x, _y):
         files = value.get_files()
-        if files:
+        if files and files[0].get_path():
             self.handle_file(files[0].get_path())
         return True
 
