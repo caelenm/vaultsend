@@ -124,6 +124,7 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(880, 600)
         self.my_pubkey = None
         self.contacts = load_contacts()
+        self._load_css()
 
         self.split = Adw.OverlaySplitView(sidebar_width_fraction=0.25)
         self.split.set_max_sidebar_width(320)
@@ -132,6 +133,28 @@ class Window(Adw.ApplicationWindow):
         self.split.set_content(self._build_content())
 
         self._install_actions()
+
+    def _load_css(self):
+        # App-wide styles. The delete menu entry shows its trash icon and label
+        # in red on hover/focus (#e01b24 is the standard Adwaita red), so the
+        # destructive nature is obvious before you commit to it.
+        css = """
+        .vaultsend-delete { padding: 6px 10px; border-radius: 6px; }
+        .vaultsend-delete:hover,
+        .vaultsend-delete:focus,
+        .vaultsend-delete:active {
+            color: #e01b24;
+            background-color: alpha(#e01b24, 0.12);
+        }
+        """
+        provider = Gtk.CssProvider()
+        try:
+            provider.load_from_string(css)      # GTK 4.12+
+        except AttributeError:
+            provider.load_from_data(css.encode())  # GTK 4.10 / 4.11
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(), provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+        )
 
     # -- Sidebar --------------------------------------------------------------
     def _build_sidebar(self):
@@ -177,36 +200,77 @@ class Window(Adw.ApplicationWindow):
             row.add_suffix(copy)
             row.connect("activated", lambda _r, pk=c["pubkey"]: self.copy(pk, "Public key copied."))
 
-            # Right-click (or long-press / Menu key) opens a small context menu.
-            menu = Gio.Menu()
-            detailed = Gio.Action.print_detailed_name(
-                "win.delete-contact", GLib.Variant("s", c["pubkey"])
-            )
-            menu.append("Delete contact", detailed)
-            self._attach_context_menu(row, menu)
+            # Right-click (or long-press, for touchscreens) opens a context menu
+            # offering to delete this contact.
+            self._attach_context_menu(row, c["pubkey"], c["name"])
 
             self.contact_list.append(row)
 
-    def _attach_context_menu(self, row, menu):
-        """Show `menu` as a popover when `row` is right-clicked or long-pressed."""
-        def popup_at(x, y):
-            pop = Gtk.PopoverMenu.new_from_model(menu)
-            pop.set_parent(row)
-            pop.set_has_arrow(False)
-            rect = Gdk.Rectangle()
-            rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
-            pop.set_pointing_to(rect)
-            pop.connect("closed", lambda p: p.unparent())
-            pop.popup()
-
+    def _attach_context_menu(self, row, pubkey, name):
+        """Open a delete menu when `row` is right-clicked or long-pressed."""
         click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
-        click.connect("pressed", lambda _g, _n, x, y: popup_at(x, y))
+        click.connect("pressed", lambda _g, _n, x, y: self._show_delete_menu(row, pubkey, name, x, y))
         row.add_controller(click)
 
-        # Touchscreens have no right button: long-press opens the same menu.
+        # Touchscreens have no secondary button: long-press opens the same menu.
         press = Gtk.GestureLongPress()
-        press.connect("pressed", lambda _g, x, y: popup_at(x, y))
+        press.connect("pressed", lambda _g, x, y: self._show_delete_menu(row, pubkey, name, x, y))
         row.add_controller(press)
+
+    def _show_delete_menu(self, row, pubkey, name, x, y):
+        """A small popover with a single destructive 'Delete contact' button.
+
+        Built by hand rather than from a Gio.Menu model so it can carry a trash
+        icon and turn red on hover, and so the delete is dispatched directly by
+        the button instead of through an action that races the popover's close.
+        """
+        pop = Gtk.Popover(has_arrow=False, autohide=True)
+        pop.set_parent(row)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+
+        btn = Gtk.Button()
+        btn.add_css_class("flat")
+        btn.add_css_class("vaultsend-delete")  # red-on-hover; see _load_css()
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        content.append(Gtk.Image.new_from_icon_name("user-trash-symbolic"))
+        content.append(Gtk.Label(label="Delete contact"))
+        btn.set_child(content)
+
+        def on_click(_b):
+            pop.popdown()
+            self._confirm_delete_contact(pubkey, name)
+
+        btn.connect("clicked", on_click)
+        pop.set_child(btn)
+        # Defer unparent to idle so it never runs mid-dispatch of the click.
+        pop.connect("closed", lambda p: GLib.idle_add(lambda: p.unparent() or False))
+        pop.popup()
+        return pop
+
+    def _confirm_delete_contact(self, pubkey, name):
+        dlg = Adw.AlertDialog(
+            heading="Delete contact?",
+            body=f"Remove “{name}” from your contacts? This only forgets their saved "
+            "public key — it doesn't affect anything you've already encrypted.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Delete")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "delete":
+                return
+            self.contacts = [c for c in self.contacts if c["pubkey"] != pubkey]
+            save_contacts(self.contacts)
+            self._refresh_contacts()
+            self.toast(f"Deleted {name}.")
+
+        dlg.connect("response", resp)
+        dlg.present(self)
 
     # -- Content --------------------------------------------------------------
     def _build_content(self):
@@ -289,39 +353,6 @@ class Window(Adw.ApplicationWindow):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", fn)
             self.add_action(act)
-        # Parameterized action invoked from a contact's right-click menu; the
-        # action target carries the contact's public key (which is unique).
-        del_act = Gio.SimpleAction.new("delete-contact", GLib.VariantType.new("s"))
-        del_act.connect("activate", self.on_delete_contact)
-        self.add_action(del_act)
-
-    def on_delete_contact(self, _action, param):
-        pubkey = param.get_string()
-        contact = next((c for c in self.contacts if c["pubkey"] == pubkey), None)
-        if contact is None:
-            return
-        name = contact["name"]
-        dlg = Adw.AlertDialog(
-            heading="Delete contact?",
-            body=f"Remove “{name}” from your contacts? This only forgets their saved "
-            "public key — it doesn't affect anything you've already encrypted.",
-        )
-        dlg.add_response("cancel", "Cancel")
-        dlg.add_response("delete", "Delete")
-        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
-        dlg.set_default_response("cancel")
-        dlg.set_close_response("cancel")
-
-        def resp(_d, r):
-            if r != "delete":
-                return
-            self.contacts = [c for c in self.contacts if c["pubkey"] != pubkey]
-            save_contacts(self.contacts)
-            self._refresh_contacts()
-            self.toast(f"Deleted {name}.")
-
-        dlg.connect("response", resp)
-        dlg.present(self)
 
     # -- Small helpers --------------------------------------------------------
     def toast(self, text):
