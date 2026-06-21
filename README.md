@@ -7,6 +7,7 @@
 
 [![Get it on Obtainium](https://github.com/user-attachments/assets/9e480740-e1db-4520-b52b-8d45bd1de410)](https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/%7B%22id%22%3A%22org.vaultsend%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fcaelenm%2Fvaultsend%22%2C%22author%22%3A%22caelenm%22%2C%22name%22%3A%22VaultSend%22%7D)
 
+[Or Download from the releases page](https://github.com/caelenm/vaultsend/releases)
 
 An Android port of [VaultSend](https://github.com/caelenm/vaultsend) — a small,
 auditable tool for encrypting messages and files to people you choose, using the
