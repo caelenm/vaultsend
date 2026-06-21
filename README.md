@@ -131,6 +131,7 @@ sudo pacman -S python-gobject gtk4 libadwaita cargo
 Then:
 
 ```sh
+cd vaultsend-main
 cd appimage
 bash build-appimage.sh
 ```
