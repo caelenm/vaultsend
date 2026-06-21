@@ -6,11 +6,13 @@
 | <img src="https://github.com/user-attachments/assets/07a1aaf4-7cd1-49d9-8803-247a39abafae" width="500"> | <img src="https://github.com/user-attachments/assets/f4649ce4-2f0f-4841-b88b-ddb7be84a4ca" width="500"> | <img src="https://github.com/user-attachments/assets/876c8c2a-a09e-4679-a3ab-25f051530b57" width="500"> |
 
 
-## Install in one command:
+## Install in one command (Linux):
 ```sh
 curl https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install.sh | bash
 ```
+This will download the necessary build dependencies, compile the program, pack it into an appimage, and add it to your launcher.
 
+#Description
 A small, auditable desktop app for encrypting files and text to people you
 choose, using the [age](https://github.com/str4d/rage) encryption format. Allows you to encrypt and decrypt text messages, files, and folders (if zipped) using public-private key cryptography. You can use it just to easily protect your own data, or for securely sharing data with others. Integrated functionality for file drag and drop and persistent contacts list.
 
