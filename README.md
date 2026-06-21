@@ -8,9 +8,6 @@
 [![Get it on Obtainium](https://github.com/user-attachments/assets/9e480740-e1db-4520-b52b-8d45bd1de410)](https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/%7B%22id%22%3A%22org.vaultsend%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fcaelenm%2Fvaultsend%22%2C%22author%22%3A%22caelenm%22%2C%22name%22%3A%22VaultSend%22%7D)
 
 
-
-
-
 An Android port of [VaultSend](https://github.com/caelenm/vaultsend) — a small,
 auditable tool for encrypting messages and files to people you choose, using the
 [age](https://github.com/str4d/rage) encryption format. This port keeps the same
@@ -25,6 +22,11 @@ and the way the two halves talk to each other are new.
 No new features were added; the goal was a faithful port. Where a desktop idiom
 doesn't fit a phone (drag-and-drop, a docked sidebar) the closest touch
 equivalent is used (an "Open file…" button, a contacts drawer).
+
+## App verifier Details
+
+org.vaultsend
+8B:33:70:31:E1:73:06:22:24:98:E6:24:53:F6:6C:57:8D:5F:9C:73:51:73:CE:32:57:16:B0:1F:9C:BA:85:82
 
 ## Project layout
 
