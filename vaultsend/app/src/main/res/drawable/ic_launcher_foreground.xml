@@ -1,0 +1,12 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- Shield (centred in the 108 viewport's safe zone) -->
+    <path android:fillColor="#FFFFFF"
+        android:pathData="M54,30 L74,38 L74,56 C74,68 65,76 54,80 C43,76 34,68 34,56 L34,38 Z" />
+    <!-- Keyhole -->
+    <path android:fillColor="#1C3A5E"
+        android:pathData="M54,48 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0 Z" />
+    <path android:fillColor="#1C3A5E"
+        android:pathData="M51.5,52 L56.5,52 L58,66 L50,66 Z" />
+</vector>

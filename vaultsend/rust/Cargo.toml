@@ -1,0 +1,38 @@
+[package]
+name = "vaultsend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[lib]
+name = "vaultsend"
+# cdylib -> the libvaultsend.so loaded by the Android app via System.loadLibrary.
+# rlib  -> lets `cargo test` exercise the pure core logic on the host.
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+# age (str4d/rage) — the only cryptographic dependency, exactly as on desktop.
+# `armor` enables the ASCII-armored copy/paste text path. We touch no crypto.
+age = { version = "0.11", features = ["armor"] }
+
+# Explicit zeroizing of intermediate secret buffers (passphrase bytes, decrypted
+# key text), so they are wiped from memory on drop rather than left in freed heap.
+zeroize = "1"
+
+# JNI glue between the Kotlin UI and this library. This is the entire FFI surface;
+# it replaces the desktop build's argv/stdin/stdout/pipe plumbing.
+jni = "0.21"
+
+# Pin kept from the desktop tree so the crate still builds on Rust 1.75 (an older
+# release of age's localization sub-tree). Harmless on the newer toolchain the
+# Android NDK ships; required only for building/testing the core on 1.75.
+zeroize_derive = "=1.4.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+# NOTE: unlike the desktop binary we do NOT set `panic = "abort"`. This library is
+# loaded into the JVM; unwinding must stop at the FFI boundary (each JNI entry
+# point catches its own errors and throws a Java exception) rather than aborting
+# the whole app process.
