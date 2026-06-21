@@ -1,3 +1,18 @@
-vaultsend/gradle/caches/
+# Gradle / Android
+.gradle/
+build/
+local.properties
+*.apk
+*.aab
+.idea/
+*.iml
+captures/
+
+# Native libraries are build outputs (produced by build-rust.sh)
+app/src/main/jniLibs/
+
+# Rust
+rust/target/
 vaultsend/gradle/
 .idea/
+gradle/
