@@ -6,6 +6,8 @@
 | <img src="https://github.com/user-attachments/assets/07a1aaf4-7cd1-49d9-8803-247a39abafae" width="500"> | <img src="https://github.com/user-attachments/assets/f4649ce4-2f0f-4841-b88b-ddb7be84a4ca" width="500"> | <img src="https://github.com/user-attachments/assets/876c8c2a-a09e-4679-a3ab-25f051530b57" width="500"> |
 
 
+## Install in one command:
+curl https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install.sh | bash
 
 
 A small, auditable desktop app for encrypting files and text to people you
