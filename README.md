@@ -1,5 +1,7 @@
 # VaultSend for Android
 
+[![Get it on Obtainium](https://github.com/ImranR98/Obtainium/blob/main/assets/graphics/badge_obtainium.png?raw=true)](obtainium://app/%7B%22id%22%3A%22org.vaultsend%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fcaelenm%2Fvaultsend%22%2C%22author%22%3A%22caelenm%22%2C%22name%22%3A%22VaultSend%22%7D)
+
 An Android port of [VaultSend](https://github.com/caelenm/vaultsend) — a small,
 auditable tool for encrypting messages and files to people you choose, using the
 [age](https://github.com/str4d/rage) encryption format. This port keeps the same
