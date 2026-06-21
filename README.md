@@ -273,6 +273,8 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
 - No third-party security audit has been performed. See the security warning
   at the top of this document.
 
+## Acknowledgements 
+
 Note: VaultSend's design, functionality and code review was performed by [myself](https://caelen.ca), technical implementation completed with the help of [claude](https://claude.ai)
 
 My pubkey: age192d2u5rkgv9nvl9858fhyqsk78shhgknfjydukfgepu5c608439qnk8z62
