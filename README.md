@@ -1,4 +1,8 @@
-# VaultSend for Android
+<h1>
+  <img src="https://github.com/user-attachments/assets/d590919f-bb4f-46fd-a9d8-12f54f0b6700" alt="VaultSend icon" width="48" height="48" style="vertical-align:middle; margin-right:8px;">
+  VaultSend for Android
+</h1>
+
 
 | Main View | Add Contact | Select Contacts | Decrypting View |
 |---|---|---|---|
@@ -20,7 +24,7 @@ and the way the two halves talk to each other are new.
   Python/GTK UI (`app/`).
 - **Output:** one universal `.apk` that installs on any current Android device.
 
-No new features were added; the goal was a faithful port. Where a desktop idiom
+The goal was a faithful port. Where a desktop idiom
 doesn't fit a phone (drag-and-drop, a docked sidebar) the closest touch
 equivalent is used (an "Open file…" button, a contacts drawer).
 
@@ -204,3 +208,10 @@ authored in (no Android SDK/NDK there); build it as above and it will pull its
 dependencies and assemble. Version numbers in the Gradle files are pinned to a
 known-consistent set — Android Studio may offer newer ones, which you can accept
 (bump AGP, Kotlin, and the Compose plugin together).
+
+## Acknowledgements 
+
+Note: VaultSend's design, functionality and code review was performed by [myself](https://caelen.ca), technical implementation completed with the help of [claude](https://claude.ai)
+
+My pubkey: age192d2u5rkgv9nvl9858fhyqsk78shhgknfjydukfgepu5c608439qnk8z62
+
