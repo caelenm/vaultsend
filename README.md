@@ -2,7 +2,7 @@
 <h1>
   <img src="https://private-user-images.githubusercontent.com/94644540/610923162-66c188df-b248-47c1-a4b5-1bbca4ddb251.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODIwODk4MTMsIm5iZiI6MTc4MjA4OTUxMywicGF0aCI6Ii85NDY0NDU0MC82MTA5MjMxNjItNjZjMTg4ZGYtYjI0OC00N2MxLWE0YjUtMWJiY2E0ZGRiMjUxLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA2MjIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNjIyVDAwNTE1M1omWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTdjMDk4ZWNmNDJlN2FhMzhkNzg1MDk2MzcyNzBiYWRkMGIwZTIzOWJjYzYzZGE5ZDVmMDk0OTQ3ZDE4NTY5N2UmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRnBuZyJ9.97PfFjl_l8ieXXplQvLJPdZ6o6WLs8ajW524ELutaJI" alt="VaultSend icon" width="48" height="48" style="vertical-align:middle; margin-right:8px;">
   VaultSend
-</h1># VaultSend
+</h1>
 
 | Main View | Drag and Drop File | Select Contacts |
 |---|---|---|
