@@ -1,4 +1,8 @@
-# VaultSend for Android
+<h1>
+  <img src="https://github.com/user-attachments/assets/d590919f-bb4f-46fd-a9d8-12f54f0b6700" alt="VaultSend icon" width="48" height="48" style="vertical-align:middle; margin-right:8px;">
+  VaultSend for Android
+</h1>
+
 
 | Main View | Add Contact | Select Contacts | Decrypting View |
 |---|---|---|---|
