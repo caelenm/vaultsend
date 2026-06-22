@@ -1,0 +1,35 @@
+[package]
+name = "vaultsend-backend"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+
+[[bin]]
+name = "vaultsend-backend"
+path = "src/main.rs"
+
+[dependencies]
+# age (str4d/rage) — the only cryptographic dependency. `armor` enables ASCII
+# armoring for the copy/paste text path. We touch no crypto ourselves.
+age = { version = "0.11", features = ["armor"] }
+
+# Explicit zeroizing of intermediate secret buffers (passphrase, decrypted key
+# text). Already present transitively via `secrecy`; named here so we can use it
+# directly. Cargo unifies it with the locked version, so the lock is unchanged.
+zeroize = "1"
+
+# --- Pins so the tree builds on Rust 1.75 (older releases of age's localization
+# --- sub-tree; age itself targets rustc 1.65). Recorded in Cargo.lock too. ---
+zeroize_derive = "=1.4.2"
+
+# Process hardening on Linux: prctl(PR_SET_DUMPABLE), setrlimit(RLIMIT_CORE),
+# mlockall. libc has a very low MSRV and builds fine on Rust 1.75. Linux-only so
+# the binary still compiles on macOS/Windows (where harden_process is a no-op).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+strip = true
+panic = "abort"
