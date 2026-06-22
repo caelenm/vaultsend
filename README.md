@@ -208,3 +208,10 @@ authored in (no Android SDK/NDK there); build it as above and it will pull its
 dependencies and assemble. Version numbers in the Gradle files are pinned to a
 known-consistent set — Android Studio may offer newer ones, which you can accept
 (bump AGP, Kotlin, and the Compose plugin together).
+
+## Acknowledgements 
+
+Note: VaultSend's design, functionality and code review was performed by [myself](https://caelen.ca), technical implementation completed with the help of [claude](https://claude.ai)
+
+My pubkey: age192d2u5rkgv9nvl9858fhyqsk78shhgknfjydukfgepu5c608439qnk8z62
+
