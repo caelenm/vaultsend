@@ -1,13 +1,21 @@
 
-# VaultSend
+<h1>
+  <img src="https://private-user-images.githubusercontent.com/94644540/610923162-66c188df-b248-47c1-a4b5-1bbca4ddb251.png?jwt=eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJpc3MiOiJnaXRodWIuY29tIiwiYXVkIjoicmF3LmdpdGh1YnVzZXJjb250ZW50LmNvbSIsImtleSI6ImtleTUiLCJleHAiOjE3ODIwODg5MzgsIm5iZiI6MTc4MjA4ODYzOCwicGF0aCI6Ii85NDY0NDU0MC82MTA5MjMxNjItNjZjMTg4ZGYtYjI0OC00N2MxLWE0YjUtMWJiY2E0ZGRiMjUxLnBuZz9YLUFtei1BbGdvcml0aG09QVdTNC1ITUFDLVNIQTI1NiZYLUFtei1DcmVkZW50aWFsPUFLSUFWQ09EWUxTQTUzUFFLNFpBJTJGMjAyNjA2MjIlMkZ1cy1lYXN0LTElMkZzMyUyRmF3czRfcmVxdWVzdCZYLUFtei1EYXRlPTIwMjYwNjIyVDAwMzcxOFomWC1BbXotRXhwaXJlcz0zMDAmWC1BbXotU2lnbmF0dXJlPTI1MDBmN2I3MDIwNTUxNGQ2OWNiNTg2OTg4YjVjMzdkMGUyMTQ1YWNlMTFiZWZlZjkyODg3NTM1NWU3ZTgwNGYmWC1BbXotU2lnbmVkSGVhZGVycz1ob3N0JnJlc3BvbnNlLWNvbnRlbnQtdHlwZT1pbWFnZSUyRnBuZyJ9.IReelWyY-CSbDtXaMyfm91zMp3W1pwI3yiQBggFuQ7I" alt="VaultSend icon" width="48" height="48" style="vertical-align:middle; margin-right:8px;">
+  VaultSend
+</h1># VaultSend
 
 | Main View | Drag and Drop File | Select Contacts |
 |---|---|---|
 | <img src="https://github.com/user-attachments/assets/07a1aaf4-7cd1-49d9-8803-247a39abafae" width="500"> | <img src="https://github.com/user-attachments/assets/f4649ce4-2f0f-4841-b88b-ddb7be84a4ca" width="500"> | <img src="https://github.com/user-attachments/assets/876c8c2a-a09e-4679-a3ab-25f051530b57" width="500"> |
 
 
+## Install in one command (Linux):
+```sh
+curl https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install.sh | bash
+```
+This will download the necessary build dependencies, compile the program, pack it into an appimage, and add it to your launcher.
 
-
+#Description
 A small, auditable desktop app for encrypting files and text to people you
 choose, using the [age](https://github.com/str4d/rage) encryption format. Allows you to encrypt and decrypt text messages, files, and folders (if zipped) using public-private key cryptography. You can use it just to easily protect your own data, or for securely sharing data with others. Integrated functionality for file drag and drop and persistent contacts list.
 
@@ -131,6 +139,7 @@ sudo pacman -S python-gobject gtk4 libadwaita cargo
 Then:
 
 ```sh
+cd vaultsend-main
 cd appimage
 bash build-appimage.sh
 ```
@@ -271,5 +280,9 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
 - One identity per user; no key fetching over a network; no plugins. By design.
 - No third-party security audit has been performed. See the security warning
   at the top of this document.
+
+## Acknowledgements 
+
+Note: VaultSend's design, functionality and code review was performed by [myself](https://caelen.ca), technical implementation completed with the help of [claude](https://claude.ai)
 
 My pubkey: age192d2u5rkgv9nvl9858fhyqsk78shhgknfjydukfgepu5c608439qnk8z62

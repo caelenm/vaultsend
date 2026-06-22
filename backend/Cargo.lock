@@ -1011,8 +1011,6 @@ name = "vaultsend-backend"
 version = "0.1.0"
 dependencies = [
  "age",
- "libc",
- "zeroize",
  "zeroize_derive",
 ]
 
