@@ -1,12 +1,26 @@
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp" android:height="108dp"
     android:viewportWidth="108" android:viewportHeight="108">
-    <!-- Shield (centred in the 108 viewport's safe zone) -->
-    <path android:fillColor="#FFFFFF"
-        android:pathData="M54,30 L74,38 L74,56 C74,68 65,76 54,80 C43,76 34,68 34,56 L34,38 Z" />
-    <!-- Keyhole -->
-    <path android:fillColor="#1C3A5E"
-        android:pathData="M54,48 m-5,0 a5,5 0 1,0 10,0 a5,5 0 1,0 -10,0 Z" />
-    <path android:fillColor="#1C3A5E"
-        android:pathData="M51.5,52 L56.5,52 L58,66 L50,66 Z" />
+
+    <!-- Speech bubble outline + tail (white stroke, hollow so the navy shows through) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="5"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"
+        android:pathData="M38,28 L70,28 A8,8 0 0 1 78,36 L78,58 A8,8 0 0 1 70,66 L54,66 L40,78 L44,66 L38,66 A8,8 0 0 1 30,58 L30,36 A8,8 0 0 1 38,28 Z" />
+
+    <!-- Padlock shackle (drawn first so the body overlaps its feet) -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="4"
+        android:strokeLineCap="round"
+        android:pathData="M49,46 L49,42 A5,5 0 0 1 59,42 L59,46" />
+
+    <!-- Padlock body (solid white rounded rectangle) -->
+    <path
+        android:fillColor="#FFFFFF"
+        android:pathData="M48,46 L60,46 A2.5,2.5 0 0 1 62.5,48.5 L62.5,56.5 A2.5,2.5 0 0 1 60,59 L48,59 A2.5,2.5 0 0 1 45.5,56.5 L45.5,48.5 A2.5,2.5 0 0 1 48,46 Z" />
 </vector>
