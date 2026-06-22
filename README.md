@@ -15,7 +15,7 @@ curl https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install
 ```
 This will download the necessary build dependencies, compile the program, pack it into an appimage, and add it to your launcher.
 
-#Description
+# Description
 A small, auditable desktop app for encrypting files and text to people you
 choose, using the [age](https://github.com/str4d/rage) encryption format. Allows you to encrypt and decrypt text messages, files, and folders (if zipped) using public-private key cryptography. You can use it just to easily protect your own data, or for securely sharing data with others. Integrated functionality for file drag and drop and persistent contacts list.
 
