@@ -24,7 +24,7 @@ and the way the two halves talk to each other are new.
   Python/GTK UI (`app/`).
 - **Output:** one universal `.apk` that installs on any current Android device.
 
-No new features were added; the goal was a faithful port. Where a desktop idiom
+The goal was a faithful port. Where a desktop idiom
 doesn't fit a phone (drag-and-drop, a docked sidebar) the closest touch
 equivalent is used (an "Open file…" button, a contacts drawer).
 
