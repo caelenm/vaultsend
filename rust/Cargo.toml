@@ -23,9 +23,9 @@ zeroize = "1"
 # it replaces the desktop build's argv/stdin/stdout/pipe plumbing.
 jni = "0.21"
 
-# Pin kept from the desktop tree so the crate still builds on Rust 1.75 (an older
-# release of age's localization sub-tree). Harmless on the newer toolchain the
-# Android NDK ships; required only for building/testing the core on 1.75.
+# Pinned to the last edition-2021 release: zeroize_derive 1.5.0+ requires edition
+# 2024 (Rust >= 1.85) and would break the 1.75 MSRV. Comes in via zeroize's derive
+# feature, not age's i18n crates; drop the pin if the MSRV ever moves to 1.85.
 zeroize_derive = "=1.4.2"
 
 [profile.release]
