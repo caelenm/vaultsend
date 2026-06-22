@@ -1,0 +1,45 @@
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSD-1-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Zlib",
+    "CC0-1.0",
+    "GPL-3.0-only",
+]
+
+[curve25519-dalek.clarify]
+license = "BSD-3-Clause"
+[[curve25519-dalek.clarify.git]]
+path = "LICENSE"
+checksum = "cca0bd3c4fcdba74145ef9d49c62337e2c9fbf9368288f11d0547f1b0273219f"
+
+[x25519-dalek.clarify]
+license = "BSD-3-Clause"
+[[x25519-dalek.clarify.git]]
+path = "LICENSE"
+checksum = "bebc725b8cb1ba1ed1798cb505cf31bf9bce4cbe942baf358b642666ba8186bd"
+
+[subtle.clarify]
+license = "BSD-3-Clause"
+[[subtle.clarify.git]]
+path = "LICENSE"
+checksum = "d1fc1bc0d155df60b2e7705b6b2ae02a05c96f948e1cec6e2fb86360b09f346b"
+
+[unicode-ident.clarify]
+license = "(MIT OR Apache-2.0) AND Unicode-3.0"
+[[unicode-ident.clarify.git]]
+path = "LICENSE-MIT"
+checksum = "23f18e03dc49df91622fe2a76176497404e46ced8a715d9d2b67a7446571cca3"
+[[unicode-ident.clarify.git]]
+path = "LICENSE-UNICODE"
+checksum = "f7db81051789b729fea528a63ec4c938fdcb93d9d61d97dc8cc2e9df6d47f2a1"
+
+[tinystr.clarify]
+license = "Unicode-3.0"
+[[tinystr.clarify.git]]
+path = "LICENSE"
+checksum = "f367c1b8e1aa262435251e442901da4607b4650e0e63a026f5044473ecfb90f2"
