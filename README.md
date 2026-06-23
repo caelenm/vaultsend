@@ -209,7 +209,7 @@ VaultSend builds on the work of others:
 - **fflate** — Arjun Barrett
 - **esbuild** — Evan Wallace
 
-All bundled dependencies are MIT-licensed. VaultSend is released under the MIT
+All bundled dependencies are MIT-licensed. VaultSend is released under the GPL-3.0
 license; see `LICENSE`.
 
 VaultSend is provided as-is, without warranty. It has not undergone a formal
