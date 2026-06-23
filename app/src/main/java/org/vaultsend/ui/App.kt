@@ -269,6 +269,46 @@ fun App(vm: AppViewModel = viewModel()) {
         }
     }
 
+    // Import contacts from a picked contacts.json (top-right menu → Import
+    // contacts). Mirrors the identity importPicker, but routes to the contact
+    // store instead of the crypto core: merges into the current list and reports
+    // how many new entries were added.
+    val importContactsPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.OpenDocument(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            try {
+                val added = vm.importContacts(uri)
+                toast(
+                    when (added) {
+                        0 -> "No new contacts to import."
+                        1 -> "Imported 1 contact."
+                        else -> "Imported $added contacts."
+                    },
+                )
+            } catch (e: Exception) {
+                toast(e.message ?: "Couldn't import that file.")
+            }
+        }
+    }
+
+    // Export contacts to a chosen destination (top-right menu → Export contacts).
+    // Mirrors backupPrivateKey: pick a save location, then write contacts.json.
+    fun exportContacts() {
+        if (vm.contacts.isEmpty()) { toast("You have no contacts to export."); return }
+        saveThen("contacts.json") { output ->
+            scope.launch {
+                try {
+                    vm.exportContacts(output)
+                    toast("Contacts exported.")
+                } catch (e: Exception) {
+                    toast(e.message ?: "Couldn't export contacts.")
+                }
+            }
+        }
+    }
+
     fun restoreKey() {
         dialog = AskPassphrase(
             "Restore your public key",
@@ -377,6 +417,8 @@ fun App(vm: AppViewModel = viewModel()) {
             onLock = { vm.lockSession(); toast("Locked.") },
             onBackupKey = { backupPrivateKey(thenGoMain = false) },
             onPublicKey = { dialog = ShowPublicKey },
+            onImportContacts = { importContactsPicker.launch(arrayOf("application/json", "text/plain", "application/octet-stream")) },
+            onExportContacts = { exportContacts() },
             onAbout = { dialog = AboutDialogState },
         )
     }
@@ -460,6 +502,8 @@ private fun MainScreen(
     onLock: () -> Unit,
     onBackupKey: () -> Unit,
     onPublicKey: () -> Unit,
+    onImportContacts: () -> Unit,
+    onExportContacts: () -> Unit,
     onAbout: () -> Unit,
 ) {
     ModalNavigationDrawer(
@@ -489,6 +533,8 @@ private fun MainScreen(
                             onLock = onLock,
                             onBackupKey = onBackupKey,
                             onPublicKey = onPublicKey,
+                            onImportContacts = onImportContacts,
+                            onExportContacts = onExportContacts,
                             onAbout = onAbout,
                         )
                     },
@@ -548,6 +594,8 @@ private fun OverflowMenu(
     onLock: () -> Unit,
     onBackupKey: () -> Unit,
     onPublicKey: () -> Unit,
+    onImportContacts: () -> Unit,
+    onExportContacts: () -> Unit,
     onAbout: () -> Unit,
 ) {
     var open by remember { mutableStateOf(false) }
@@ -565,6 +613,14 @@ private fun OverflowMenu(
                 onClick = { open = false; onBackupKey() },
             )
         }
+        DropdownMenuItem(
+            text = { Text("Import contacts") },
+            onClick = { open = false; onImportContacts() },
+        )
+        DropdownMenuItem(
+            text = { Text("Export contacts") },
+            onClick = { open = false; onExportContacts() },
+        )
         if (unlocked) {
             DropdownMenuItem(
                 text = { Text("Lock") },
