@@ -9,7 +9,8 @@
 | <img src="https://github.com/user-attachments/assets/412faa21-2d96-46c7-a844-33d232d1885b" width="500"> | <img src="https://github.com/user-attachments/assets/47f8f56e-48c4-409c-b223-893fa2fbe869" width="500"> | <img src="https://github.com/user-attachments/assets/73e27861-424e-4df2-bfb7-5145d59b8036" width="500"> | <img src="https://github.com/user-attachments/assets/be1712bc-bc1a-4d9c-81df-f110372eed64" width="500"> |
 
 
-[![Get it on Obtainium](https://github.com/user-attachments/assets/9e480740-e1db-4520-b52b-8d45bd1de410)](https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/%7B%22id%22%3A%22org.vaultsend%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fcaelenm%2Fvaultsend%22%2C%22author%22%3A%22caelenm%22%2C%22name%22%3A%22VaultSend%22%7D)
+[![Get it on Obtainium](https://github.com/user-attachments/assets/9e480740-e1db-4520-b52b-8d45bd1de410)](https://apps.obtainium.imranr.dev/redirect.html?r=obtainium://app/%7B%22id%22%3A%22org.vaultsend%22%2C%22url%22%3A%22https%3A%2F%2Fgithub.com%2Fcaelenm%2Fvaultsend%22%2C%22author%22%3A%22caelenm%22%2C%22name%22%3A%22VaultSend%22%2C%22versionExtractionRegEx%22%3A%22v%3F%28%5B%5C%5Cd.%5D%2B%29%22%2C%22apkFilterRegExp%22%3A%22.%2A%5C%5C.apk%22%7D)
+
 
 [Or Download from the releases page](https://github.com/caelenm/vaultsend/releases)
 
