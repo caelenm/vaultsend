@@ -215,3 +215,12 @@ license; see `LICENSE`.
 VaultSend is provided as-is, without warranty. It has not undergone a formal
 third-party security audit. Review the code and verify the build before relying
 on it for anything important.
+
+
+## Acknowledgements 
+
+Note: VaultSend's design, functionality and code review was performed by [myself](https://caelen.ca), technical implementation completed with the help of [claude](https://claude.ai)
+
+My pubkey: age192d2u5rkgv9nvl9858fhyqsk78shhgknfjydukfgepu5c608439qnk8z62
+
+
