@@ -15,7 +15,7 @@
     Editing either <script> body invalidates its hash; recompute with the build
     step documented in the provenance comment near the app script.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;self&#39; &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-670BR8ToeIGFis0UgliV3yE6sNR7iwEyDRTO1iMJPio=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;; frame-ancestors &#39;none&#39;">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;self&#39; &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-TBmcOqgbvQAGaA/MX5V2bh4pGpV1yGY9MHYhJ41r0l4=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;; frame-ancestors &#39;none&#39;">
   <title>VaultSend</title>
   <style>
     /* ─── Design tokens — VaultSend "shield navy" / Material-3 aligned ─── */
@@ -1373,7 +1373,24 @@
   // when present. The picker must be opened directly from a user gesture;
   // callers reserve it before passphrase/recipient dialogs consume activation.
   const canStreamToDisk = typeof window.showSaveFilePicker === "function";
-  const MEMORY_FALLBACK_LIMIT = 512 * 1024 * 1024;
+  // How much of the result is held in JS memory at once on the fallback path.
+  // Chunks are folded into a Blob at this granularity; the Blob itself is
+  // browser-managed and may be backed by a temporary file, so the peak heap is
+  // this constant rather than the size of the output.
+  const BLOB_FOLD_BYTES = 16 * 1024 * 1024;
+
+  // Real headroom, from the browser, rather than a number picked by hand.
+  // Returns null when the browser will not say, in which case we attempt the
+  // operation rather than refusing it on a guess.
+  async function storageHeadroom() {
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const { quota, usage } = await navigator.storage.estimate();
+        if (typeof quota === "number") return Math.max(0, quota - (usage || 0));
+      }
+    } catch {}
+    return null;
+  }
 
   async function openDiskSink(suggestedName) {
     if (!canStreamToDisk) return { kind: "unsupported" };
@@ -1397,16 +1414,33 @@
     }
   }
 
+  // Folds the stream into a Blob incrementally instead of holding every chunk
+  // in an array until the end.
+  //
+  // Concatenating onto an existing Blob does not copy its contents in memory --
+  // the new Blob references the same browser-managed storage, which for
+  // anything sizeable is a temporary file on disk. So peak JS memory is one
+  // fold window (16 MB), not the whole output, and this path is limited by disk
+  // quota rather than by RAM. That is what removes the need for an arbitrary
+  // ceiling: a file larger than memory is fine here.
   async function drainToBlob(stream, prog) {
-    const chunks = [];
+    let blob = new Blob([]);
+    let pending = [], pendingBytes = 0;
     const reader = stream.getReader();
     for (;;) {
       const { done, value } = await reader.read();
       if (done) break;
       if (prog.cancelled) { await reader.cancel(); throw new DOMException("Aborted", "AbortError"); }
-      chunks.push(value);
+      pending.push(value);
+      pendingBytes += value.byteLength;
+      if (pendingBytes >= BLOB_FOLD_BYTES) {
+        blob = new Blob([blob, ...pending]);
+        pending = []; pendingBytes = 0;
+        // Let the browser commit the fold (and repaint) before continuing.
+        await new Promise((r) => setTimeout(r, 0));
+      }
     }
-    return new Blob(chunks);
+    return pending.length ? new Blob([blob, ...pending]) : blob;
   }
 
   // Verify before writing plaintext. This intentionally costs a second read on
@@ -1439,10 +1473,15 @@
       return { saved: true };
     }
 
-    if (total > MEMORY_FALLBACK_LIMIT) {
-      return sink.kind === "needsgesture" ? { needsGesture: true } : { tooBig: true };
-    }
+    // The stream-to-disk path above has no size limit at all -- it is constant
+    // memory regardless of the file. Only the fallback can run out of room, and
+    // the limit there is storage quota, which the browser will tell us. If it
+    // declines to, attempt the operation rather than refuse on a guess.
     if (sink.kind === "needsgesture") return { needsGesture: true };
+    const headroom = await storageHeadroom();
+    if (headroom !== null && total > headroom) {
+      return { tooBig: true, need: total, have: headroom };
+    }
     return { blob: await drainToBlob(counted, prog) };
   }
 
@@ -1507,8 +1546,9 @@
           if (res.needsGesture) return showToast(
             "The browser needs a fresh click to choose a save location. Press Encrypt again.", 6000, true);
           if (res.tooBig) return showToast(
-            "This browser can't stream to a file, and the result is too large to hold in memory. "
-            + "Use the desktop app for files this size.", 7000, true);
+            "Not enough browser storage: this needs " + formatSize(res.need)
+            + " but only " + formatSize(res.have) + " is available. "
+            + "Free up disk space, or use a browser that can save directly to a file.", 8000, true);
           if (res.saved) { clearActiveFile(); showToast("Encrypted and saved to disk."); }
           else { setActiveBlob(outName, res.blob); showToast("Encrypted for " + recipients.length + " recipient(s). Click Download."); }
         } catch (err) {
@@ -1572,7 +1612,7 @@
         // Pass 1 — authenticate the whole ciphertext, keeping nothing. A
         // wrong key fails here (header parsing), and so does any truncation or
         // tampering, all before a destination file exists.
-        prog.phase("Verifying… (1 of 2)");
+        prog.phase("Verification (1 of 2)");
         const probe = new age.Decrypter();
         probe.addIdentity(identity);
         const head = await probe.decrypt(activeStream());
@@ -1581,7 +1621,7 @@
         await verifyCiphertext(identity, total, prog);
 
         // Pass 2 — the ciphertext is now known intact, so it is safe to write.
-        prog.phase("Decrypting… (2 of 2)");
+        prog.phase("Decryption (2 of 2)");
         const dec = new age.Decrypter();
         dec.addIdentity(identity);
         const plainStream = await dec.decrypt(activeStream());
@@ -1591,8 +1631,9 @@
         if (res.needsGesture) return showToast(
           "The browser needs a fresh click to choose a save location. Press Decrypt again.", 6000, true);
         if (res.tooBig) return showToast(
-          "This browser can't stream to a file, and the result is too large to hold in memory. "
-          + "Use the desktop app for files this size.", 7000, true);
+          "Not enough browser storage: this needs " + formatSize(res.need)
+          + " but only " + formatSize(res.have) + " is available. "
+          + "Free up disk space, or use a browser that can save directly to a file.", 8000, true);
         if (res.saved) { clearActiveFile(); return showToast("Decrypted and saved to disk."); }
         setActiveBlob(outName, res.blob, true);
         return showToast("Decrypted. Click Download — it is held in memory until you do.", 5000);
