@@ -90,6 +90,116 @@ def run_backend(args, *, input_bytes=None, passphrase=None) -> bytes:
     return proc.stdout
 
 
+def spawn_backend(args, *, passphrase=None):
+    """Start the backend without waiting for it. Same passphrase handling as
+    run_backend (a private pipe, never argv); returns the Popen.
+
+    Only used for the file paths, where --in/--out are always given, so the
+    child neither reads stdin nor writes payload to stdout. stderr stays a pipe
+    because that is where a failure message arrives; it is a single short line,
+    far below the pipe buffer, so the child can never block writing it."""
+    extra = {}
+    read_fd = None
+    if passphrase is not None:
+        read_fd, write_fd = os.pipe()
+        os.write(write_fd, passphrase.encode("utf-8"))
+        os.close(write_fd)
+        args = list(args) + ["--pass-fd", str(read_fd)]
+        extra["pass_fds"] = (read_fd,)
+    try:
+        return subprocess.Popen(
+            [BACKEND, *args],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            **extra,
+        )
+    except FileNotFoundError:
+        raise BackendError(
+            f"Backend not found at '{BACKEND}'.\nBuild it with 'cargo build --release' "
+            "or set VAULTSEND_BACKEND."
+        )
+    finally:
+        # The write end is already closed, so the child sees EOF regardless;
+        # this just keeps the parent from leaking the descriptor.
+        if read_fd is not None:
+            try:
+                os.close(read_fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Progress measurement
+#
+# Progress is read from the output file's size as the backend streams into it.
+# That is a measurement of work actually completed, not a timer: age writes the
+# payload in fixed chunks and the file grows in step with them.
+#
+# Reading the backend's own input offset from /proc/<pid>/fdinfo would be more
+# direct, but harden_process() sets PR_SET_DUMPABLE(0) precisely so that a
+# same-user process cannot inspect it — that includes us. The output file is the
+# one honest channel that costs the backend nothing.
+#
+# The numerator is therefore exact. The denominator is derived, because age
+# stores no plaintext length: for encryption it follows from the input size and
+# the format's fixed overhead; for decryption it is the ciphertext size less
+# that same overhead. Both land within a fraction of a percent at any size where
+# a progress bar is worth showing.
+# ---------------------------------------------------------------------------
+AGE_CHUNK = 65536  # STREAM payload chunk, plaintext bytes
+AGE_TAG = 16  # Poly1305 tag appended to every chunk
+AGE_NONCE = 16  # STREAM nonce, once, before the first chunk
+# The header is not a fixed size: it holds one stanza per recipient and its
+# encoded fields vary in length. Measured against the age crate it runs roughly
+# 190-350 bytes for a single recipient and grows about 100 per extra one, so
+# this is a typical value rather than an exact one. At any file large enough for
+# a progress bar to appear the difference is under a hundredth of a percent, and
+# the bar clamps at both ends, so a miss in either direction is invisible.
+AGE_HEADER = 300
+
+
+def file_size(path) -> int:
+    try:
+        return os.path.getsize(path)
+    except OSError:
+        return 0
+
+
+def is_armored(path) -> bool:
+    try:
+        with open(path, "rb") as f:
+            return f.read(14) == b"-----BEGIN AGE"
+    except OSError:
+        return False
+
+
+def expected_ciphertext_size(plaintext: int) -> int:
+    """Size of the binary age file produced from `plaintext` bytes."""
+    chunks = max(1, -(-plaintext // AGE_CHUNK))
+    return AGE_HEADER + AGE_NONCE + plaintext + chunks * AGE_TAG
+
+
+def expected_plaintext_size(path) -> int:
+    """Size of the plaintext recovered from the age file at `path`."""
+    size = file_size(path)
+    if is_armored(path):
+        # Armor emits 64 base64 characters plus a newline per 48 raw bytes,
+        # wrapped in BEGIN/END lines.
+        size = max(0, (size - 70) * 48 // 65)
+    body = max(0, size - AGE_HEADER - AGE_NONCE)
+    chunks = max(1, -(-body // (AGE_CHUNK + AGE_TAG)))
+    return max(1, body - chunks * AGE_TAG)
+
+
+def human_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} B" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
 # ---------------------------------------------------------------------------
 # Contacts (plain, exportable JSON)
 # ---------------------------------------------------------------------------
@@ -116,6 +226,152 @@ def short(pubkey: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# One file encrypt/decrypt, run without blocking the UI
+# ---------------------------------------------------------------------------
+class FileOperation:
+    """Runs the backend on a file and reports real progress while it works.
+
+    The backend was previously invoked with subprocess.run() straight from the
+    GTK main loop, which froze the window for the whole operation and left no
+    way to draw a bar. Here it is spawned instead, and a single 100 ms timer
+    both polls for completion and samples the growing output file. No threads,
+    so nothing touches GTK off the main loop.
+
+    Failure handling: the backend already stages a decrypt to `<out>.part` and
+    renames it only after the ciphertext authenticates, so a bad decrypt never
+    leaves plaintext at the destination. It cannot clean up after a signal,
+    though, and it does not stage encryption at all — so on cancel or failure
+    we remove whatever partial file is left rather than leaving a truncated
+    .age file that looks valid until the day someone tries to decrypt it.
+    """
+
+    POLL_MS = 100
+    DIALOG_DELAY_MS = 400  # don't flash a dialog for a file that finishes at once
+    KILL_AFTER_MS = 2000  # SIGKILL fallback if SIGTERM is ignored
+
+    def __init__(self, window, args, *, passphrase=None, heading, subject, watch_path, total, note):
+        self.window = window
+        self.args = args
+        self.passphrase = passphrase
+        self.heading = heading
+        self.subject = subject
+        self.watch_path = watch_path  # file whose size tracks progress
+        self.total = max(1, total)
+        self.note = note  # toast on success
+
+        self.proc = None
+        self.dialog = None
+        self.dialog_handler = None
+        self.bar = None
+        self.timer = None
+        self.cancelled = False
+        self.done = False
+
+    # -- lifecycle ------------------------------------------------------------
+    def start(self):
+        try:
+            self.proc = spawn_backend(self.args, passphrase=self.passphrase)
+        except BackendError as e:
+            self.window.error(str(e))
+            self.window.current_op = None
+            return
+        self.timer = GLib.timeout_add(self.POLL_MS, self._tick)
+        GLib.timeout_add(self.DIALOG_DELAY_MS, self._present_dialog)
+
+    def _present_dialog(self):
+        if self.done:
+            return False
+        self.bar = Gtk.ProgressBar(show_text=True, text="Starting…")
+        self.dialog = Adw.AlertDialog(heading=self.heading, body=self.subject)
+        self.dialog.set_extra_child(self.bar)
+        self.dialog.add_response("cancel", "Cancel")
+        self.dialog.set_close_response("cancel")
+        # Closing the dialog programmatically also emits "response" with the
+        # close response, so _finish() disconnects this before closing rather
+        # than letting a completed operation report itself as cancelled.
+        self.dialog_handler = self.dialog.connect(
+            "response", lambda _d, r: self.cancel() if r == "cancel" else None
+        )
+        self.dialog.present(self.window)
+        return False
+
+    def _tick(self):
+        if self.proc.poll() is None:
+            self._update()
+            return True
+        self.timer = None
+        self._finish()
+        return False
+
+    def _update(self):
+        if self.bar is None:
+            return
+        written = file_size(self.watch_path)
+        if written >= self.total:
+            # The stream is through; the backend is now flushing, fsyncing and
+            # renaming. That tail is real work with no byte count behind it, so
+            # pulse rather than sit at a stalled 100%.
+            self.bar.pulse()
+            self.bar.set_text("Finishing…")
+        else:
+            fraction = written / self.total
+            self.bar.set_fraction(fraction)
+            self.bar.set_text(
+                f"{fraction * 100:.0f}% — {human_bytes(written)} of {human_bytes(self.total)}"
+            )
+
+    def _finish(self):
+        self.done = True
+        if self.dialog is not None:
+            self.dialog.disconnect(self.dialog_handler)
+            self.dialog.close()
+            self.dialog = None
+        # The process has exited, so this returns immediately and cannot deadlock.
+        _, err = self.proc.communicate()
+        code = self.proc.returncode
+        self.window.current_op = None
+
+        if self.cancelled:
+            self._discard_partials()
+            self.window.toast("Cancelled.")
+        elif code == 0:
+            self.window.toast(self.note)
+        else:
+            self._discard_partials()
+            msg = err.decode("utf-8", "replace").strip().removeprefix("error: ")
+            # A signalled process (OOM killer, a crash) has no message of its own.
+            self.window.error(msg or f"the operation failed (exit {code})")
+
+    def cancel(self):
+        if self.done or self.proc is None:
+            return
+        self.cancelled = True
+        if self.bar is not None:
+            self.bar.set_text("Cancelling…")
+        self.proc.terminate()
+        GLib.timeout_add(self.KILL_AFTER_MS, self._force_kill)
+
+    def _force_kill(self):
+        if not self.done and self.proc is not None and self.proc.poll() is None:
+            self.proc.kill()
+        return False
+
+    def _discard_partials(self):
+        """Remove the incomplete output.
+
+        watch_path is exactly the file the backend was writing: `<out>` when
+        encrypting, `<out>.part` when decrypting. On the decrypt side `<out>`
+        itself is never touched until the atomic rename, so a failed decrypt
+        cannot cost the user an existing file. On the encrypt side the backend
+        opened `<out>` with File::create, which already truncated whatever was
+        there — so what we delete is a remnant of this run, not intact data."""
+        try:
+            os.remove(self.watch_path)
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class Window(Adw.ApplicationWindow):
@@ -124,6 +380,7 @@ class Window(Adw.ApplicationWindow):
         self.set_default_size(880, 600)
         self.my_pubkey = None
         self.contacts = load_contacts()
+        self.current_op = None  # in-flight FileOperation, if any
         self._load_css()
 
         self.split = Adw.OverlaySplitView(sidebar_width_fraction=0.25)
@@ -500,7 +757,7 @@ class Window(Adw.ApplicationWindow):
     def encrypt_file(self, path):
         self.pick_recipients(lambda recips: self._save_then(
             os.path.basename(path) + ".age",
-            lambda out: self._run_encrypt(["--in", path, "--out", out], recips, f"Encrypted to {len(recips)}."),
+            lambda out: self._run_encrypt(path, out, recips),
         ))
 
     def decrypt_file(self, path):
@@ -508,7 +765,7 @@ class Window(Adw.ApplicationWindow):
         suggested = suggested[:-4] if suggested.endswith(".age") else suggested + ".decrypted"
         self.ask_passphrase(lambda p: self._save_then(
             suggested,
-            lambda out: self._run_decrypt(["--in", path, "--out", out], p, "Decrypted."),
+            lambda out: self._run_decrypt(path, out, p),
         ))
 
     def _save_then(self, suggested_name, callback):
@@ -524,23 +781,46 @@ class Window(Adw.ApplicationWindow):
 
         dialog.save(self, None, done)
 
-    def _run_encrypt(self, io_args, recips, note):
+    def _start_op(self, op):
+        """Run one file operation at a time. The progress dialog is modal but
+        only appears after a short delay, so without this guard a quick second
+        drop could still start a concurrent backend."""
+        if self.current_op is not None:
+            self.error("Another file is still being processed.")
+            return
+        self.current_op = op
+        op.start()
+
+    def _run_encrypt(self, in_path, out_path, recips):
         args = ["encrypt"]
         for r in recips:
             args += ["-r", r]
-        args += io_args
-        try:
-            run_backend(args)
-            self.toast(note)
-        except BackendError as e:
-            self.error(str(e))
+        args += ["--in", in_path, "--out", out_path]
+        self._start_op(FileOperation(
+            self,
+            args,
+            heading="Encrypting…",
+            subject=os.path.basename(in_path),
+            # Encryption writes straight to the destination; its size tracks the
+            # ciphertext, whose final size follows from the input plus overhead.
+            watch_path=out_path,
+            total=expected_ciphertext_size(file_size(in_path)),
+            note=f"Encrypted to {len(recips)}.",
+        ))
 
-    def _run_decrypt(self, io_args, passphrase, note):
-        try:
-            run_backend(["decrypt", *io_args], passphrase=passphrase)
-            self.toast(note)
-        except BackendError as e:
-            self.error(str(e))
+    def _run_decrypt(self, in_path, out_path, passphrase):
+        self._start_op(FileOperation(
+            self,
+            ["decrypt", "--in", in_path, "--out", out_path],
+            passphrase=passphrase,
+            heading="Decrypting…",
+            subject=os.path.basename(in_path),
+            # Decryption stages to a sibling temp and renames only once the
+            # ciphertext authenticates, so the temp is what grows.
+            watch_path=out_path + ".part",
+            total=expected_plaintext_size(in_path),
+            note="Decrypted.",
+        ))
 
     # -- Text handling --------------------------------------------------------
     def encrypt_text(self):
