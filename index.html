@@ -1,7 +1,6 @@
 <!DOCTYPE html>
-<html lang="en" data-theme="light">
-<head>
-  <meta charset="UTF-8">
+<html lang="en" data-theme="dark"><head><meta http-equiv="Content-Type" content="text/html; charset=UTF-8">
+  
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <!--
     Content-Security-Policy: locked down to a fully self-contained, offline app.
@@ -16,7 +15,7 @@
     Editing either <script> body invalidates its hash; recompute with the build
     step documented in the provenance comment near the app script.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self' 'sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=' 'sha256-vnJbF/OJgQQuMJTde94S5etPTEEDNj1ortMECpCDAis='; style-src 'self' 'unsafe-inline'; img-src 'self' data:; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;self&#39; &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-670BR8ToeIGFis0UgliV3yE6sNR7iwEyDRTO1iMJPio=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;; frame-ancestors &#39;none&#39;">
   <title>VaultSend</title>
   <style>
     /* ─── Design tokens — VaultSend "shield navy" / Material-3 aligned ─── */
@@ -273,7 +272,7 @@
              animation: toastin .3s var(--ease), toastout .3s 2.5s var(--ease) forwards; }
     @keyframes toastin  { from { opacity:0; transform:translateY(16px); } to { opacity:1; transform:none; } }
     @keyframes toastout { from { opacity:1; } to { opacity:0; } }
-    .toast-error { background: var(--error) !important; color: #fff !important; }
+    .toast-error { background: #b3261e !important; color: #fff !important; border: 1px solid #7f1d1d; }
 
     /* ─── Spinner ─── */
     .spinner { width: 20px; height: 20px; border: 2px solid var(--border);
@@ -320,45 +319,64 @@
     .remember-row{display:flex;align-items:center;gap:.5rem;font-size:.82rem;color:var(--text-muted);
       margin:.4rem 0 .15rem;cursor:pointer;user-select:none}
     .remember-row input{width:16px;height:16px;flex-shrink:0;cursor:pointer}
-  </style>
+  
+    /* Progress bar (streaming file operations) */
+    .progress-track {
+      width: 100%; height: 8px; border-radius: 999px;
+      background: var(--surface-2, rgba(127,127,127,.18));
+      overflow: hidden; margin: 14px 0 10px;
+    }
+    .progress-fill {
+      height: 100%; width: 0%; border-radius: 999px;
+      background: var(--accent, #3584e4);
+    }
+    .progress-fill.indeterminate {
+      width: 40% !important; transition: none;
+      animation: vs-indet 1.1s ease-in-out infinite;
+    }
+    @keyframes vs-indet {
+      0%   { margin-left: -40%; }
+      100% { margin-left: 100%; }
+    }
+</style>
 </head>
 <body>
 
 <!-- ───────────────── TOP BAR ───────────────── -->
 <header class="topbar">
   <button class="btn-icon" id="sidebar-toggle" title="Toggle contacts" aria-label="Toggle contacts">
-    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"/><line x1="9" y1="3" x2="9" y2="21"/></svg>
+    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="3" width="18" height="18" rx="2"></rect><line x1="9" y1="3" x2="9" y2="21"></line></svg>
   </button>
   <span class="topbar-title">VaultSend</span>
   <div class="topbar-end">
     <button class="lock-pill state-none" id="lock-pill" title="Session lock status" aria-live="polite">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
       <span id="lock-pill-text">No key</span>
     </button>
     <button class="btn-icon" id="theme-btn" title="Toggle theme" aria-label="Toggle light/dark theme">
-      <svg id="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
-      <svg id="icon-sun" class="hidden" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg>
+      <svg id="icon-moon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false" class="hidden"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path></svg>
+      <svg id="icon-sun" class="" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="5"></circle><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"></path></svg>
     </button>
     <button class="btn-icon" id="hbg-btn" title="Menu" aria-label="Open menu" aria-haspopup="menu" aria-expanded="false" aria-controls="hbg-menu">
-      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="3" y1="6" x2="21" y2="6"></line><line x1="3" y1="12" x2="21" y2="12"></line><line x1="3" y1="18" x2="21" y2="18"></line></svg>
     </button>
     <nav class="hbg-menu" id="hbg-menu" role="menu" aria-label="Main menu">
       <div class="hbg-section" role="group" aria-label="Your key">
         <div class="hbg-label" aria-hidden="true">Your key</div>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-pubkey">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
           My public key
         </button>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-export-identity">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
           Export identity.age
         </button>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-import-identity">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
           Import identity.age
         </button>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-lock" style="display:none">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
           Lock session now
         </button>
       </div>
@@ -366,11 +384,11 @@
       <div class="hbg-section" role="group" aria-label="Contacts">
         <div class="hbg-label" aria-hidden="true">Contacts</div>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-export-contacts">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
           Export contacts
         </button>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-import-contacts">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
           Import contacts
         </button>
       </div>
@@ -378,17 +396,17 @@
       <div class="hbg-section" role="group" aria-label="Security">
         <div class="hbg-label" aria-hidden="true">Security</div>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-verify">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="M9 12l2 2 4-4"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path><path d="M9 12l2 2 4-4"></path></svg>
           Verify integrity
         </button>
         <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-selftest">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M9 11l3 3L22 4"></path><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"></path></svg>
           Run crypto self-test
         </button>
       </div>
       <div class="hbg-sep" role="separator"></div>
       <button class="hbg-item" role="menuitem" tabindex="-1" id="menu-about">
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><circle cx="12" cy="12" r="10"></circle><line x1="12" y1="8" x2="12" y2="12"></line><line x1="12" y1="16" x2="12.01" y2="16"></line></svg>
         About VaultSend
       </button>
     </nav>
@@ -403,10 +421,10 @@
     <div class="sidebar-head">
       Contacts
       <button class="btn-icon" id="add-contact-btn" title="Add contact" aria-label="Add contact">
-        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
       </button>
     </div>
-    <div class="contact-scroll" id="contact-list"></div>
+    <div class="contact-scroll" id="contact-list"><div class="empty-state">No contacts yet<br><small>Add someone's public key to send to them.</small></div></div>
   </aside>
 
   <!-- MAIN -->
@@ -416,17 +434,17 @@
     <div class="setup-view" id="setup-view">
       <div class="setup-card">
         <div class="setup-icon">
-          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <svg width="30" height="30" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"></path></svg>
         </div>
         <h1>Welcome to VaultSend</h1>
         <p>End-to-end encryption in your browser using the <strong>age</strong> format — interoperable with the desktop app and rage CLI. Your private key never leaves this device.</p>
         <div class="setup-actions">
           <button class="btn btn-primary" id="btn-gen-key">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>
             Generate new key
           </button>
           <button class="btn" id="btn-import-identity-setup">
-            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
             Import identity.age
           </button>
         </div>
@@ -442,7 +460,7 @@
     </div>
 
     <!-- Encrypt/Decrypt view -->
-    <div id="crypt-view" class="hidden" style="display:flex; flex-direction:column; gap:1.5rem; flex:1;">
+    <div id="crypt-view" class="hidden" style="display: none; flex-direction: column; gap: 1.5rem; flex: 1 1 0%;">
       <div>
         <h1 class="section-title">Encrypt a message or a file</h1>
         <p class="section-subtitle">Type or paste text below, or drop a file here. Encrypting scrambles it for chosen recipients; decrypting needs your passphrase.</p>
@@ -451,35 +469,35 @@
       <div class="drop-card" id="drop-zone">
         <textarea class="editor" id="editor" placeholder="Type or paste a message here, or drop a file or folder…" spellcheck="false"></textarea>
         <div class="drop-card-overlay" id="drop-overlay">
-          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg>
           <span id="drop-label">Drop to load</span>
         </div>
         <div id="file-badge" class="file-badge hidden">
-          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
           <span id="file-badge-name"></span>
           <span id="file-badge-size" style="color:var(--text-faint); margin-left:.25rem;"></span>
           <button id="file-clear-btn" title="Remove file" aria-label="Remove file">
-            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>
+            <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg>
           </button>
         </div>
       </div>
 
       <div class="action-bar">
         <button class="btn btn-primary" id="btn-encrypt">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
           Encrypt
         </button>
         <button class="btn" id="btn-decrypt">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 1 1 10 0"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><rect x="3" y="11" width="18" height="11" rx="2"></rect><path d="M7 11V7a5 5 0 1 1 10 0"></path></svg>
           Decrypt
         </button>
         <div class="spacer"></div>
         <button class="btn" id="btn-download" title="Download content as file">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="7 10 12 15 17 10"></polyline><line x1="12" y1="15" x2="12" y2="3"></line></svg>
           Download
         </button>
         <button class="btn" id="btn-open-file">
-          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
           Open file…
         </button>
       </div>
@@ -491,7 +509,7 @@
 <!-- ───────────────── CONTEXT MENU ───────────────── -->
 <div class="ctx-menu" id="ctx-menu">
   <button class="ctx-item ctx-delete" id="ctx-delete-btn">
-    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
+    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"></path><path d="M10 11v6"></path><path d="M14 11v6"></path><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"></path></svg>
     Delete contact
   </button>
 </div>
@@ -503,7 +521,7 @@
 <div class="backdrop" id="modal-pass">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="pass-title">
     <div class="modal-title" id="pass-title">Unlock your key</div>
-    <div class="modal-sub"   id="pass-sub">Enter your passphrase.</div>
+    <div class="modal-sub" id="pass-sub">Enter your passphrase.</div>
     <div class="form-group">
       <input type="password" id="pass-input" placeholder="Passphrase" autocomplete="current-password">
     </div>
@@ -512,7 +530,7 @@
       <input type="password" id="pass-confirm" placeholder="Repeat passphrase" autocomplete="new-password">
     </div>
     <label class="remember-row hidden" id="pass-remember-row">
-      <input type="checkbox" id="pass-remember" checked>
+      <input type="checkbox" id="pass-remember" checked="">
       <span>Keep unlocked for this session (auto-locks when idle)</span>
     </label>
     <div class="modal-actions">
@@ -555,18 +573,31 @@
   </div>
 </div>
 
+<!-- ───────────────── MODAL: Progress ───────────────── -->
+<div class="backdrop" id="modal-progress">
+  <div class="modal" role="dialog" aria-modal="true" aria-labelledby="progress-modal-title">
+    <div class="modal-title" id="progress-modal-title">Working…</div>
+    <div class="modal-sub" id="progress-sub"></div>
+    <div class="progress-track"><div class="progress-fill" id="progress-fill"></div></div>
+    <div class="modal-sub" id="progress-text">Starting…</div>
+    <div class="modal-actions">
+      <button class="btn" id="progress-cancel">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <!-- ───────────────── MODAL: Alert / Info ───────────────── -->
 <div class="backdrop" id="modal-alert">
   <div class="modal" role="dialog" aria-modal="true" aria-labelledby="alert-title">
     <div class="modal-title" id="alert-title"></div>
-    <div class="modal-sub"   id="alert-sub"></div>
+    <div class="modal-sub" id="alert-sub"></div>
     <div id="alert-extra"></div>
     <div class="modal-actions" id="alert-btns"></div>
   </div>
 </div>
 
 <!-- Hidden file inputs -->
-<input type="file" id="file-input" class="hidden" multiple>
+<input type="file" id="file-input" class="hidden" multiple="">
 <input type="file" id="import-contacts-input" accept=".json,application/json" class="hidden">
 
 <!-- ═══════════════════════════════════════════════════════════════════════
@@ -1093,20 +1124,51 @@
   }
 
   // ── File & text state ─────────────────────────────────────────────────────
-  let activeFileBytes = null;
+  // A payload is either a Blob/File (activeFileBlob) or bytes we produced in
+  // memory (activeFileBytes). Preferring the Blob matters: a File picked from
+  // disk is backed by the filesystem, so holding one costs no heap, whereas the
+  // previous code called arrayBuffer() the moment a file was dropped and paid
+  // full size in RAM before any work had even been requested.
+  let activeFileBytes = null;   // Uint8Array, for in-memory results
+  let activeFileBlob  = null;   // Blob/File, for anything that came from disk
   let activeFileName  = null;
+  // W-2: true when the payload is decrypted plaintext we are holding only so
+  // the user can download it. Large Blobs may be backed by a temporary file on
+  // disk, so this is dropped as soon as it has served its purpose rather than
+  // being left resident for the rest of the session.
+  let activeIsPlaintext = false;
 
-  function setActiveFile(name, bytes) {
-    activeFileName  = name;
-    activeFileBytes = bytes;
+  function activeSize() {
+    if (activeFileBlob) return activeFileBlob.size;
+    return activeFileBytes ? activeFileBytes.length : 0;
+  }
+  function hasActivePayload() { return !!(activeFileBlob || activeFileBytes); }
+  function activeStream() {
+    if (activeFileBlob) return activeFileBlob.stream();
+    return new Blob([activeFileBytes]).stream();
+  }
+
+  function showFileBadge(name, size) {
+    activeFileName = name;
     $("file-badge-name").textContent = name;
-    $("file-badge-size").textContent = "(" + formatSize(bytes.length) + ")";
+    $("file-badge-size").textContent = "(" + formatSize(size) + ")";
     show("file-badge");
     $("editor").value = "";
     $("editor").placeholder = "File loaded — ready to encrypt or decrypt.";
   }
+  function setActiveFile(name, bytes, isPlaintext) {
+    activeFileBytes = bytes; activeFileBlob = null;
+    activeIsPlaintext = !!isPlaintext;
+    showFileBadge(name, bytes.length);
+  }
+  function setActiveBlob(name, blob, isPlaintext) {
+    activeFileBlob = blob; activeFileBytes = null;
+    activeIsPlaintext = !!isPlaintext;
+    showFileBadge(name, blob.size);
+  }
   function clearActiveFile() {
-    activeFileName = null; activeFileBytes = null;
+    activeFileName = null; activeFileBytes = null; activeFileBlob = null;
+    activeIsPlaintext = false;
     hide("file-badge");
     $("editor").value = "";
     $("editor").placeholder = "Type or paste a message here, or drop a file or folder…";
@@ -1138,9 +1200,8 @@
   async function loadFiles(files, dt) {
     let totalSize = 0;
     for (const f of files) totalSize += f.size;
-    if (totalSize >= 1000 * 1024 * 1024) {
-      showToast("Warning: file very large, encryption may be slow — consider the VaultSend app.", 6000, true);
-    }
+    // Single files stream and are no longer size-limited by memory. Zipping a
+    // folder still buffers every member, so warn only on that path (below).
 
     const firstEntry = dt && dt.items && dt.items[0] && dt.items[0].webkitGetAsEntry && dt.items[0].webkitGetAsEntry();
     if (files.length === 1 && !(firstEntry && firstEntry.isDirectory)) {
@@ -1157,13 +1218,17 @@
           ]
         );
         if (choice === "identity") { await handleIdentityImport(file); return; }
-        if (choice === "load") { setActiveFile(file.name, new Uint8Array(await file.arrayBuffer())); return; }
+        if (choice === "load") { setActiveBlob(file.name, file); return; }
         return;
       }
-      setActiveFile(file.name, new Uint8Array(await file.arrayBuffer()));
+      setActiveBlob(file.name, file);
     } else {
       // Multiple files or a folder — zip first (synchronous; no Web Worker).
       showToast("Zipping folder/files…");
+      if (totalSize >= 256 * 1024 * 1024) {
+        showToast("Zipping holds every file in memory — large folders may fail. "
+                  + "Zip it yourself and drop the .zip to stream it instead.", 7000, true);
+      }
       const fileMap = {};
       for (const file of files) fileMap[file.name] = new Uint8Array(await file.arrayBuffer());
       let zipped;
@@ -1186,10 +1251,205 @@
     e.target.value = "";
   });
 
+  // ── Streaming file operations & progress ──────────────────────────────────
+  //
+  // Large files are never held whole in memory. age-encryption accepts a
+  // ReadableStream and returns one, so the file goes disk -> decrypt -> disk in
+  // fixed-size chunks. Progress is the byte count of that stream, and the
+  // denominator is exact: the returned stream carries a .size() helper that
+  // derives the output length from the input length using the format's real
+  // framing, so nothing here is estimated.
+  //
+  // Stream nearly every file. This keeps heap use bounded even for medium files;
+  // only very small files use the faster in-memory path.
+  const STREAM_THRESHOLD = 256 * 1024;
+  const PROGRESS_DELAY_MS = 400;
+
+  function newProgress(title, subject) {
+    const state = {
+      cancelled: false, done: false, shown: false,
+      ctrl: new AbortController(), started: now(),
+    };
+    const fill = $("progress-fill");
+
+    state.timer = setTimeout(() => {
+      if (state.done) return;
+      state.shown = true;
+      $("progress-modal-title").textContent = state.pendingHeading || title;
+      $("progress-sub").textContent = subject;
+      fill.classList.remove("indeterminate");
+      fill.style.width = "0%";
+      $("progress-text").textContent = "Starting…";
+      openBackdrop("modal-progress");
+    }, PROGRESS_DELAY_MS);
+
+    state.update = (done, total) => {
+      if (!state.shown) return;
+      if (total > 0 && done < total) {
+        const secs = (now() - state.started) / 1000;
+        const rate = secs > 0.25 ? "  ·  " + formatSize(done / secs) + "/s" : "";
+        fill.classList.remove("indeterminate");
+        fill.style.width = ((done / total) * 100).toFixed(1) + "%";
+        $("progress-text").textContent =
+          Math.floor((done / total) * 100) + "% — " + formatSize(done)
+          + " of " + formatSize(total) + rate;
+      } else {
+        // Bytes are through; the browser is still flushing to disk. Real work
+        // with no byte count behind it, so pulse rather than sit at 100%.
+        fill.classList.add("indeterminate");
+        $("progress-text").textContent = "Finishing…";
+      }
+    };
+    state.phase = (heading) => {
+      if (!state.shown) { state.pendingHeading = heading; return; }
+      $("progress-modal-title").textContent = heading;
+      fill.classList.remove("indeterminate");
+      fill.style.width = "0%";
+      $("progress-text").textContent = "Starting…";
+      state.started = now();
+    };
+    state.finish = () => {
+      state.done = true;
+      clearTimeout(state.timer);
+      if (state.shown) closeBackdrop("modal-progress");
+      if (activeProgress === state) activeProgress = null;
+    };
+    state.cancel = () => {
+      if (state.done) return;
+      state.cancelled = true;
+      $("progress-text").textContent = "Cancelling…";
+      try { state.ctrl.abort(); } catch {}
+    };
+    activeProgress = state;
+    return state;
+  }
+
+  let activeProgress = null;
+  $("progress-cancel").addEventListener("click", () => { if (activeProgress) activeProgress.cancel(); });
+
+  const now = () =>
+    (typeof performance !== "undefined" && performance.now) ? performance.now() : Date.now();
+
+  // Counts bytes as they pass, without copying or retaining them, and hands the
+  // main thread back often enough for the bar to be drawn.
+  //
+  // This yield is the whole point. A stream pipeline resolves through
+  // microtasks, which run to completion before the browser gets to paint, so
+  // without it the width of the bar was assigned thousands of times and shown
+  // perhaps twice -- measured at a single paint opportunity across a 2 GB file,
+  // which is exactly the reported jump from a few percent to nearly done.
+  //
+  // The yield is bounded from both sides so it cannot become the bottleneck:
+  // at most one per 0.5% of the payload (about 200 updates end to end, finer
+  // than anyone can see) and at most one per 16 ms (one display frame). A small
+  // file that finishes in half a second therefore yields a few dozen times, and
+  // a multi-gigabyte one yields ~200 times -- negligible either way against the
+  // cost of the crypto and the disk.
+  const PROGRESS_MIN_INTERVAL_MS = 16;
+  const PROGRESS_STEPS = 200;
+
+  function countingStream(total, onBytes) {
+    let seen = 0, sinceUpdate = 0, lastUpdate = 0;
+    const step = Math.max(65536, Math.floor((total || 0) / PROGRESS_STEPS));
+    return new TransformStream({
+      async transform(chunk, ctrl) {
+        seen += chunk.byteLength;
+        ctrl.enqueue(chunk);
+        sinceUpdate += chunk.byteLength;
+        const t = now();
+        if (sinceUpdate >= step && t - lastUpdate >= PROGRESS_MIN_INTERVAL_MS) {
+          sinceUpdate = 0;
+          lastUpdate = t;
+          onBytes(seen);
+          await new Promise((r) => setTimeout(r, 0));
+        }
+      },
+      flush() { onBytes(seen); },
+    });
+  }
+
+  // Prefer streaming straight to a file the user picks: constant memory no
+  // matter how big the result is. Chromium's File System Access API is used
+  // when present. The picker must be opened directly from a user gesture;
+  // callers reserve it before passphrase/recipient dialogs consume activation.
+  const canStreamToDisk = typeof window.showSaveFilePicker === "function";
+  const MEMORY_FALLBACK_LIMIT = 512 * 1024 * 1024;
+
+  async function openDiskSink(suggestedName) {
+    if (!canStreamToDisk) return { kind: "unsupported" };
+    try {
+      const handle = await window.showSaveFilePicker({ suggestedName });
+      return { kind: "file", writable: await handle.createWritable() };
+    } catch (e) {
+      if (e && e.name === "AbortError") return { kind: "abort" };
+      if (e && e.name === "SecurityError") return { kind: "needsgesture" };
+      return { kind: "unsupported" };
+    }
+  }
+
+  // Keep the writable stream obtained from the button click until encryption or
+  // decryption begins. It is deliberately single-use and is aborted on every
+  // early return, so an empty destination is never committed by accident.
+  async function reserveDiskSink(suggestedName) { return openDiskSink(suggestedName); }
+  async function discardReservedSink(sink) {
+    if (sink && sink.kind === "file") {
+      try { await sink.writable.abort(); } catch {}
+    }
+  }
+
+  async function drainToBlob(stream, prog) {
+    const chunks = [];
+    const reader = stream.getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (prog.cancelled) { await reader.cancel(); throw new DOMException("Aborted", "AbortError"); }
+      chunks.push(value);
+    }
+    return new Blob(chunks);
+  }
+
+  // Verify before writing plaintext. This intentionally costs a second read on
+  // decrypt: age reports final truncation/tampering only at end-of-stream, and
+  // the web API has no portable atomic rename for a temporary output file.
+  async function verifyCiphertext(identity, total, prog) {
+    const dec = new age.Decrypter();
+    dec.addIdentity(identity);
+    const stream = await dec.decrypt(activeStream());
+    await stream
+      .pipeThrough(countingStream(total, (n) => prog.update(n, total)))
+      .pipeTo(new WritableStream({ write() {} }), { signal: prog.ctrl.signal });
+  }
+
+  // If preselectedSink is supplied it was opened synchronously from a user
+  // gesture. This avoids the former "Press Encrypt/Decrypt again" failure after
+  // a modal passphrase or recipient selection.
+  async function runStreamingJob(outStream, total, outName, prog, preselectedSink) {
+    const counted = outStream.pipeThrough(countingStream(total, (n) => prog.update(n, total)));
+    const sink = preselectedSink || await openDiskSink(outName);
+    if (sink.kind === "abort") return { aborted: true };
+
+    if (sink.kind === "file") {
+      try {
+        await counted.pipeTo(sink.writable, { signal: prog.ctrl.signal });
+      } catch (err) {
+        try { await sink.writable.abort(); } catch {}
+        throw err;
+      }
+      return { saved: true };
+    }
+
+    if (total > MEMORY_FALLBACK_LIMIT) {
+      return sink.kind === "needsgesture" ? { needsGesture: true } : { tooBig: true };
+    }
+    if (sink.kind === "needsgesture") return { needsGesture: true };
+    return { blob: await drainToBlob(counted, prog) };
+  }
+
   // ── Encrypt ─────────────────────────────────────────────────────────────--
   $("btn-encrypt").addEventListener("click", async () => {
     const text = $("editor").value.trim();
-    if (!text && !activeFileBytes) return showToast("Type a message or drop a file first.");
+    if (!text && !hasActivePayload()) return showToast("Type a message or drop a file first.");
 
     // Build recipient picker.
     const listEl = $("recip-list");
@@ -1223,6 +1483,7 @@
     openBackdrop("modal-recip");
     const confirmed = await new Promise((res) => { pendingResolve = res; });
     if (!confirmed) return;
+    const reservedSink = confirmed.sink || null;
 
     const recipients = [myPubkey];
     checks.forEach((cb) => { if (cb.checked) recipients.push(contacts[cb.dataset.idx].pubkey); });
@@ -1231,11 +1492,38 @@
       const enc = new age.Encrypter();
       recipients.forEach((r) => enc.addRecipient(r));
 
-      if (activeFileBytes) {
-        const cipher = await enc.encrypt(activeFileBytes);
+      // Encryption streams and reports progress on exactly the same terms as
+      // decryption -- same threshold, same bar, same cancel.
+      if (hasActivePayload() && activeSize() >= STREAM_THRESHOLD) {
+        const outName = (activeFileName || "file") + ".age";
+        const prog = newProgress("Encrypting…", activeFileName || "file");
+        try {
+          const cipherStream = await enc.encrypt(activeStream());
+          // Exact, not estimated: derived from the input size by the library.
+          const total = cipherStream.size(activeSize());
+          const res = await runStreamingJob(cipherStream, total, outName, prog, reservedSink);
+          prog.finish();
+          if (res.aborted) return showToast("Cancelled.");
+          if (res.needsGesture) return showToast(
+            "The browser needs a fresh click to choose a save location. Press Encrypt again.", 6000, true);
+          if (res.tooBig) return showToast(
+            "This browser can't stream to a file, and the result is too large to hold in memory. "
+            + "Use the desktop app for files this size.", 7000, true);
+          if (res.saved) { clearActiveFile(); showToast("Encrypted and saved to disk."); }
+          else { setActiveBlob(outName, res.blob); showToast("Encrypted for " + recipients.length + " recipient(s). Click Download."); }
+        } catch (err) {
+          prog.finish();
+          if (prog.cancelled || (err && err.name === "AbortError")) return showToast("Cancelled.");
+          throw err;
+        }
+      } else if (hasActivePayload()) {
+        await discardReservedSink(reservedSink);
+        const bytes = activeFileBytes || new Uint8Array(await activeFileBlob.arrayBuffer());
+        const cipher = await enc.encrypt(bytes);
         setActiveFile((activeFileName || "file") + ".age", cipher);
         showToast("Encrypted for " + recipients.length + " recipient(s). Click Download.");
       } else {
+        await discardReservedSink(reservedSink);
         const cipher = await enc.encrypt(new TextEncoder().encode(text));
         // NOTE: clearActiveFile() resets the editor, so write the armored
         // output AFTER it (the original wrote-then-cleared, wiping the result).
@@ -1244,24 +1532,81 @@
         showToast("Encrypted for " + recipients.length + " recipient(s). Copy or download below.");
       }
     } catch (e) {
+      await discardReservedSink(typeof reservedSink === "undefined" ? null : reservedSink);
       showToast("Encryption failed: " + e.message, 4000, true);
     }
   });
-  $("recip-confirm").addEventListener("click", () => { closeBackdrop("modal-recip"); if (pendingResolve) { pendingResolve(true); pendingResolve = null; } });
+  $("recip-confirm").addEventListener("click", async () => {
+    // This handler itself is the user gesture. Reserve the file before closing
+    // the modal; do not move this await behind the Promise resolution.
+    let sink = null;
+    if (hasActivePayload() && activeSize() >= STREAM_THRESHOLD) {
+      const name = (activeFileName || "file") + ".age";
+      sink = await reserveDiskSink(name);
+      if (sink.kind === "abort") return;
+    }
+    closeBackdrop("modal-recip");
+    if (pendingResolve) { pendingResolve({ sink }); pendingResolve = null; }
+  });
   $("recip-cancel").addEventListener("click",  () => { closeBackdrop("modal-recip"); if (pendingResolve) { pendingResolve(false); pendingResolve = null; } });
 
   // ── Decrypt ─────────────────────────────────────────────────────────────--
   $("btn-decrypt").addEventListener("click", async () => {
     const text = $("editor").value.trim();
-    if (!text && !activeFileBytes) return showToast("Paste encrypted text or drop an age file first.");
+    if (!text && !hasActivePayload()) return showToast("Paste encrypted text or drop an age file first.");
 
+    const streamingPayload = hasActivePayload() && activeSize() >= STREAM_THRESHOLD;
+    const outName = activeFileName ? activeFileName.replace(/\.age$/, "") : "decrypted.bin";
+    // Reserve before the passphrase modal consumes transient user activation.
+    const reservedSink = streamingPayload ? await reserveDiskSink(outName) : null;
+    if (reservedSink && reservedSink.kind === "abort") return;
     const identity = await unlockIdentity();
-    if (!identity) return;
+    if (!identity) { await discardReservedSink(reservedSink); return; }
+
+    // Large ciphertext: stream it. The whole point is that neither the
+    // ciphertext nor the plaintext is ever fully resident, so a file far larger
+    // than available memory decrypts fine.
+    if (streamingPayload) {
+      const prog = newProgress("Decrypting…", activeFileName || "file");
+      try {
+        // Pass 1 — authenticate the whole ciphertext, keeping nothing. A
+        // wrong key fails here (header parsing), and so does any truncation or
+        // tampering, all before a destination file exists.
+        prog.phase("Verifying… (1 of 2)");
+        const probe = new age.Decrypter();
+        probe.addIdentity(identity);
+        const head = await probe.decrypt(activeStream());
+        const total = head.size(activeSize());   // exact plaintext length
+        await head.cancel();
+        await verifyCiphertext(identity, total, prog);
+
+        // Pass 2 — the ciphertext is now known intact, so it is safe to write.
+        prog.phase("Decrypting… (2 of 2)");
+        const dec = new age.Decrypter();
+        dec.addIdentity(identity);
+        const plainStream = await dec.decrypt(activeStream());
+        const res = await runStreamingJob(plainStream, total, outName, prog, reservedSink);
+        prog.finish();
+        if (res.aborted) return showToast("Cancelled.");
+        if (res.needsGesture) return showToast(
+          "The browser needs a fresh click to choose a save location. Press Decrypt again.", 6000, true);
+        if (res.tooBig) return showToast(
+          "This browser can't stream to a file, and the result is too large to hold in memory. "
+          + "Use the desktop app for files this size.", 7000, true);
+        if (res.saved) { clearActiveFile(); return showToast("Decrypted and saved to disk."); }
+        setActiveBlob(outName, res.blob, true);
+        return showToast("Decrypted. Click Download — it is held in memory until you do.", 5000);
+      } catch (err) {
+        prog.finish();
+        if (prog.cancelled || (err && err.name === "AbortError")) return showToast("Cancelled.");
+        return showToast("Decryption failed: " + err.message, 4000, true);
+      }
+    }
 
     try {
       let cipherBytes;
-      if (activeFileBytes) {
-        cipherBytes = activeFileBytes;
+      if (hasActivePayload()) {
+        cipherBytes = activeFileBytes || new Uint8Array(await activeFileBlob.arrayBuffer());
       } else {
         try { cipherBytes = age.armor.decode(text); }
         catch { cipherBytes = new TextEncoder().encode(text); }
@@ -1272,7 +1617,7 @@
       const plain = await dec.decrypt(cipherBytes);
 
       const isText = isValidUTF8(plain);
-      if (isText && !activeFileBytes) {
+      if (isText && !hasActivePayload()) {
         // clearActiveFile() resets the editor, so decode and assign AFTER it
         // (the original wrote-then-cleared, wiping the decrypted result).
         clearActiveFile();
@@ -1281,7 +1626,7 @@
       } else {
         const ext = isText ? ".txt" : ".bin";
         const fname = activeFileName ? activeFileName.replace(/\.age$/, "") : ("decrypted" + ext);
-        setActiveFile(fname, plain);
+        setActiveFile(fname, plain, true);
         showToast("Decrypted successfully. Click Download.");
       }
     } catch (e) {
@@ -1292,9 +1637,14 @@
   // ── Download ──────────────────────────────────────────────────────────────
   $("btn-download").addEventListener("click", () => {
     const text = $("editor").value;
-    if (!text && !activeFileBytes) return showToast("Nothing to download.");
-    if (activeFileBytes) {
-      dlBlob(new Blob([activeFileBytes]), activeFileName || "data.bin");
+    if (!text && !hasActivePayload()) return showToast("Nothing to download.");
+    if (activeFileBlob || activeFileBytes) {
+      dlBlob(activeFileBlob || new Blob([activeFileBytes]), activeFileName || "data.bin");
+      if (activeIsPlaintext) {
+        // The user now has the file; stop holding the plaintext.
+        clearActiveFile();
+        showToast("Saved. The decrypted copy has been dropped from this page.");
+      }
     } else {
       const isArmored = text.indexOf("BEGIN AGE ENCRYPTED FILE") !== -1;
       dlBlob(new Blob([text], { type: "text/plain" }), isArmored ? "message.age" : "message.txt");
@@ -1308,11 +1658,29 @@
     setTimeout(() => URL.revokeObjectURL(url), 5000);
   }
 
+  // Sniffs a bounded prefix, like file(1), instead of the whole payload.
+  //
+  // The previous version decoded every byte into a JS string and then called
+  // split("") on it, allocating one string object per character. On a few
+  // hundred MB of decrypted text that is tens of gigabytes of small objects and
+  // it killed the tab -- and it hit exactly the case it was meant to serve, a
+  // large file that really is valid UTF-8 (a log, a CSV, a SQL dump). Binary
+  // input was never affected, because the fatal decoder threw almost at once.
+  const UTF8_SNIFF_BYTES = 64 * 1024;
   function isValidUTF8(bytes) {
     try {
-      const s = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+      const head = bytes.subarray
+        ? bytes.subarray(0, UTF8_SNIFF_BYTES)
+        : bytes.slice(0, UTF8_SNIFF_BYTES);
+      // stream:true so a multi-byte character straddling the cut is buffered
+      // rather than reported as invalid.
+      const s = new TextDecoder("utf-8", { fatal: true }).decode(head, { stream: true });
       if (s.length === 0) return true;
-      const nonPrint = s.split("").filter((c) => c.charCodeAt(0) < 32 && c !== "\n" && c !== "\r" && c !== "\t").length;
+      let nonPrint = 0;
+      for (let i = 0; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c < 32 && c !== 10 && c !== 13 && c !== 9) nonPrint++;
+      }
       return nonPrint / s.length < 0.1;
     } catch { return false; }
   }
@@ -1341,7 +1709,7 @@
         "live via Menu \u2192 Verify integrity and Run crypto self-test.<br>" +
         "Your unlocked key auto-locks when idle or when the tab is hidden.<br>" +
         '<a href="https://github.com/caelenm/vaultsend" target="_blank" rel="noopener noreferrer" style="color:var(--primary);text-decoration:underline;">https://github.com/caelenm/vaultsend</a><br>' +
-        "Version: 1.2.0 web (self-contained)" +
+        "Version: 1.3.0 web (streaming output)" +
       "</p>",
       [{ label: "Close", val: "close" }]
     );
@@ -1559,5 +1927,6 @@
   updateView();
 })();
 </script>
-</body>
-</html>
+
+
+</body></html>
