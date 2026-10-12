@@ -130,6 +130,13 @@ private fun ContactRow(contact: Contact, onCopy: () -> Unit, onDelete: () -> Uni
 // --- Passphrase -------------------------------------------------------------
 
 /**
+ * Minimum length for a NEW passphrase. It is all that protects an exported
+ * identity.age, so trivially guessable ones are refused. Unlocking accepts
+ * whatever passphrase the existing key was made with.
+ */
+const val MIN_PASSPHRASE_LEN = 10
+
+/**
  * Asks for a passphrase.
  *
  * [confirm] adds a "repeat" field (for choosing a new passphrase at keygen).
@@ -168,6 +175,8 @@ fun PassphraseDialog(
     fun submit() {
         when {
             pass.isEmpty() -> error = "Passphrase can't be empty."
+            confirm && pass.length < MIN_PASSPHRASE_LEN ->
+                error = "Use at least $MIN_PASSPHRASE_LEN characters — a few random words works well."
             confirm && pass != repeat -> error = "Those passphrases don't match."
             validate != null -> {
                 val bytes = pass.toByteArray(Charsets.UTF_8)
@@ -301,7 +310,12 @@ fun RecipientsDialog(
 // --- Add / delete contact ---------------------------------------------------
 
 @Composable
-fun AddContactDialog(onCancel: () -> Unit, onAdd: (String, String) -> Unit) {
+fun AddContactDialog(
+    onCancel: () -> Unit,
+    onAdd: (String, String) -> Unit,
+    // Returns an error to show for this key, or null if it can be saved.
+    checkKey: (String) -> String?,
+) {
     var name by remember { mutableStateOf("") }
     var key by remember { mutableStateOf("") }
     var error by remember { mutableStateOf<String?>(null) }
@@ -331,7 +345,11 @@ fun AddContactDialog(onCancel: () -> Unit, onAdd: (String, String) -> Unit) {
                 when {
                     name.isBlank() -> error = "Give this contact a name."
                     !looksLikePubkey(key) -> error = "That doesn't look like an age public key."
-                    else -> onAdd(name, key)
+                    else -> {
+                        val problem = checkKey(key.trim())
+                        error = problem
+                        if (problem == null) onAdd(name, key)
+                    }
                 }
             }) { Text("Add") }
         },

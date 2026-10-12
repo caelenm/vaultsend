@@ -22,6 +22,7 @@ use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
@@ -39,6 +40,49 @@ fn identity_path(data_dir: &str) -> PathBuf {
 }
 fn pubkey_path(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("pubkey")
+}
+
+// scrypt work factor (N = 2^LOG_N) for the passphrase-encrypted identity.
+//
+// Fixed rather than left to age's default, which calibrates to ~1 s on the
+// device running keygen with no floor or ceiling: on a phone that gave keys
+// weaker than age's standard, and a key made on a fast desktop could exceed
+// what this device accepts (its own target + 4), so importing it failed with
+// "wrong passphrase". 18 is what age, rage, the desktop app and the web build
+// use, so an identity.age made anywhere opens everywhere.
+const SCRYPT_LOG_N: u8 = 18;
+// Highest work factor accepted when unlocking or importing. Above the fixed
+// value so keys from earlier, calibrating builds still open; capped at 2^20
+// (scrypt then needs 1 GiB) because a phone cannot afford more, and the web
+// build uses the same limit.
+const SCRYPT_MAX_LOG_N: u8 = 20;
+
+/// Encryptor for the identity file at the fixed work factor.
+fn identity_encryptor(passphrase: SecretString) -> R<age::Encryptor> {
+    let mut recipient = age::scrypt::Recipient::new(passphrase);
+    recipient.set_work_factor(SCRYPT_LOG_N);
+    age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+        .map_err(|e| format!("encrypting identity: {e}"))
+}
+
+/// Unwrap a passphrase-encrypted identity, with an error that says what failed.
+fn decrypt_identity<'a, RR: Read + 'a>(
+    dec: age::Decryptor<RR>,
+    passphrase: SecretString,
+    wrong_pass: &str,
+) -> R<impl Read + 'a> {
+    let mut scrypt_id = age::scrypt::Identity::new(passphrase);
+    scrypt_id.set_max_work_factor(SCRYPT_MAX_LOG_N);
+    dec.decrypt(std::iter::once(&scrypt_id as &dyn age::Identity))
+        .map_err(|e| match e {
+            // Not a passphrase problem: say so, or the user retypes a correct
+            // passphrase forever.
+            age::DecryptError::ExcessiveWork { required, .. } => format!(
+                "this identity file was created with a scrypt work factor of 2^{required}, \
+                 above this device's limit of 2^{SCRYPT_MAX_LOG_N}"
+            ),
+            _ => wrong_pass.to_string(),
+        })
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +243,7 @@ pub fn keygen(data_dir: &str, passphrase: &[u8]) -> R<String> {
     let tmp = id_path.with_extension("age.new");
     let file = open_private_new(&tmp)?;
     let write_result = (move || -> R<()> {
-        let encryptor = age::Encryptor::with_user_passphrase(passphrase);
+        let encryptor = identity_encryptor(passphrase)?;
         let mut w = encryptor
             .wrap_output(file)
             .map_err(|e| format!("encrypting identity: {e}"))?;
@@ -260,10 +304,8 @@ pub fn import_identity<R2: Read>(data_dir: &str, passphrase: &[u8], mut input: R
     let pass = passphrase_from_bytes(passphrase)?;
     let dec = age::Decryptor::new(BufReader::new(io::Cursor::new(&bytes)))
         .map_err(|_| "that file is not a valid age identity".to_string())?;
-    let scrypt_id = age::scrypt::Identity::new(pass);
-    let mut id_reader = dec
-        .decrypt(std::iter::once(&scrypt_id as &dyn age::Identity))
-        .map_err(|_| "wrong passphrase, or that is not a VaultSend identity file".to_string())?;
+    let mut id_reader =
+        decrypt_identity(dec, pass, "wrong passphrase, or that is not a VaultSend identity file")?;
     let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
     id_reader
         .read_to_end(&mut secret_bytes)
@@ -338,10 +380,8 @@ fn load_identity(data_dir: &str, passphrase: &[u8]) -> R<x25519::Identity> {
         .map_err(|_| "no identity yet — run keygen first".to_string())?;
     let dec = age::Decryptor::new(BufReader::new(id_file))
         .map_err(|_| "your saved identity is empty or damaged and can't be read".to_string())?;
-    let scrypt_id = age::scrypt::Identity::new(passphrase);
-    let mut id_reader = dec
-        .decrypt(std::iter::once(&scrypt_id as &dyn age::Identity))
-        .map_err(|_| "wrong passphrase, or the identity file is damaged".to_string())?;
+    let mut id_reader =
+        decrypt_identity(dec, passphrase, "wrong passphrase, or the identity file is damaged")?;
     // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
     // drop rather than left behind in freed heap.
     let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
@@ -473,6 +513,32 @@ pub fn decrypt_file_to_session<R2: Read, W: Write>(
     decrypt_file_staged(data_dir, input, output, |inp, tmp| decrypt_session(inp, tmp))
 }
 
+/// A staging file name unique to this operation. It used to be a fixed
+/// `.decrypt.part`, so two file decrypts running at once (the UI does not
+/// serialize them) deleted and reused each other's staging file, and one
+/// destination could receive the other file's plaintext.
+fn staging_path(data_dir: &str) -> PathBuf {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let n = NEXT.fetch_add(1, Ordering::Relaxed);
+    Path::new(data_dir).join(format!(".decrypt-{}-{n}.part", std::process::id()))
+}
+
+/// Remove staging files left by an earlier run that was killed mid-decrypt
+/// (they hold plaintext). Only called when no decrypt is in progress.
+fn clear_stale_staging(data_dir: &str) {
+    let Ok(entries) = fs::read_dir(data_dir) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".decrypt") && name.ends_with(".part") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
+/// Number of file decrypts currently staging; stale-file cleanup waits for 0.
+static ACTIVE_DECRYPTS: Mutex<usize> = Mutex::new(0);
+
 /// Shared staging logic for the two file-decrypt paths above.
 fn decrypt_file_staged<R2: Read, W: Write>(
     data_dir: &str,
@@ -480,9 +546,14 @@ fn decrypt_file_staged<R2: Read, W: Write>(
     mut output: W,
     decrypt_into: impl FnOnce(R2, &mut File) -> R<()>,
 ) -> R<()> {
-    let tmp = Path::new(data_dir).join(".decrypt.part");
-    // Clean any stale staging file from a previous interrupted run.
-    let _ = fs::remove_file(&tmp);
+    {
+        let mut active = ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner());
+        if *active == 0 {
+            clear_stale_staging(data_dir);
+        }
+        *active += 1;
+    }
+    let tmp = staging_path(data_dir);
 
     let staged: R<()> = (|| {
         let mut tmp_file = open_private_new(&tmp)?;
@@ -499,6 +570,7 @@ fn decrypt_file_staged<R2: Read, W: Write>(
     });
 
     let _ = fs::remove_file(&tmp);
+    *ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     result
 }
 
@@ -618,6 +690,73 @@ mod tests {
         decrypt_session(Cursor::new(&ct), &mut pt2).unwrap();
         assert_eq!(pt2, msg);
 
+        lock();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn identity_uses_fixed_work_factor() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-logn";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        keygen(&dir, b"work factor test").unwrap();
+        let text = fs::read(identity_path(&dir)).unwrap();
+        let stanza = String::from_utf8_lossy(&text).lines().nth(1).unwrap().to_string();
+        assert!(stanza.starts_with("-> scrypt "), "{stanza}");
+        assert!(stanza.ends_with(" 18"), "{stanza}");
+        lock();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn excessive_work_factor_is_reported_as_such() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-excess";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Hand-build an identity at 2^21; unwrapping it is refused before any
+        // scrypt work, so this costs nothing.
+        let mut r = age::scrypt::Recipient::new(SecretString::from("pw".to_owned()));
+        r.set_work_factor(SCRYPT_MAX_LOG_N + 1);
+        let enc = age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient)).unwrap();
+        let mut bytes = Vec::new();
+        let mut w = enc.wrap_output(&mut bytes).unwrap();
+        w.write_all(x25519::Identity::generate().to_string().expose_secret().as_bytes()).unwrap();
+        w.finish().unwrap();
+        let err = import_identity(&dir, b"pw", Cursor::new(&bytes)).unwrap_err();
+        assert!(err.contains("work factor"), "{err}");
+        assert_eq!(status(&dir).unwrap(), "empty");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn staged_decrypts_do_not_share_a_file() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-staging";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert_ne!(staging_path(&dir), staging_path(&dir));
+
+        // A stale staging file from a killed run is removed by the next decrypt.
+        let stale = Path::new(&dir).join(".decrypt.part");
+        fs::write(&stale, b"old plaintext").unwrap();
+        let pass = b"staging test";
+        lock();
+        let pk = keygen(&dir, pass).unwrap();
+        let msg = vec![7u8; 200_000];
+        let mut ct = Vec::new();
+        encrypt(&[pk], false, Cursor::new(&msg), &mut ct).unwrap();
+        let mut out = Vec::new();
+        decrypt_file_to_session(&dir, Cursor::new(&ct), &mut out).unwrap();
+        assert_eq!(out, msg);
+        assert!(!stale.exists());
+        let leftovers: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().ends_with(".part"))
+            .collect();
+        assert!(leftovers.is_empty());
         lock();
         let _ = fs::remove_dir_all(&dir);
     }

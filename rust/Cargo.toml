@@ -1,6 +1,6 @@
 [package]
 name = "vaultsend"
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 rust-version = "1.75"
 
@@ -36,3 +36,9 @@ strip = true
 # loaded into the JVM; unwinding must stop at the FFI boundary (each JNI entry
 # point catches its own errors and throws a Java exception) rather than aborting
 # the whole app process.
+
+# Optimize dependencies (notably scrypt) in debug/test builds. The identity uses
+# a fixed scrypt work factor of 2^18, which takes minutes per call unoptimized;
+# with this, `cargo test` stays fast. Release builds are unaffected.
+[profile.dev.package."*"]
+opt-level = 3

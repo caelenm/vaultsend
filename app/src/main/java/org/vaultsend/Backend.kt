@@ -2,6 +2,7 @@ package org.vaultsend
 
 import android.content.Context
 import android.net.Uri
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -77,6 +78,17 @@ class Backend(private val context: Context) {
         }
     }
 
+    /**
+     * True if [key] is an age X25519 public key the core accepts (bech32
+     * checksum, "age" prefix, 32-byte key). Checked by the core's own parser by
+     * encrypting zero bytes to it, so no recipient parsing is duplicated here.
+     */
+    fun isValidRecipient(key: String): Boolean {
+        val k = key.trim()
+        if (!k.startsWith("age1")) return false
+        return runCatching { VaultSendNative.encryptBytes(arrayOf(k), false, ByteArray(0)) }.isSuccess
+    }
+
     /** Encrypt copy/paste text; result is ASCII-armored so it pastes anywhere. */
     suspend fun encryptText(recipients: List<String>, text: String): String =
         withContext(Dispatchers.IO) {
@@ -127,6 +139,15 @@ class Backend(private val context: Context) {
                 VaultSendNative.decryptFdSession(dataDir, inFd, outFd)
             }
         }
+
+    /**
+     * Remove a destination created by "Save as" for an operation that failed,
+     * so a failed encrypt doesn't leave a truncated .age file (and a failed
+     * decrypt an empty one) that looks like a real result. Best-effort.
+     */
+    fun discardOutput(output: Uri) {
+        runCatching { DocumentsContract.deleteDocument(context.contentResolver, output) }
+    }
 
     /**
      * Open read/write file descriptors for the two content URIs and hand their

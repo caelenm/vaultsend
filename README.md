@@ -124,8 +124,9 @@ is the device-independent default requested here.)
 - **Encrypt** text or a file to yourself plus any contacts you pick; text comes
   out ASCII-armored so it pastes into any chat or email.
 - **Decrypt** text or a file. The first decrypt of a session asks for your
-  passphrase to **unlock**; after that you stay unlocked until you close the app or
-  tap **Lock** in the ⋮ menu (see the security note below). File decryption stages
+  passphrase to **unlock**; after that you stay unlocked until you close the app,
+  tap **Lock** in the ⋮ menu, or leave the app in the background for 2 minutes
+  (see the security note below). File decryption stages
   the output to a private temp file and only writes it to your chosen destination
   after the whole stream authenticates, so a tampered or truncated file never
   leaves partial plaintext behind.
@@ -172,7 +173,8 @@ zeroized on drop; and the atomic-write and staged-decrypt guarantees are intact.
 ### Unlock-once-per-session
 
 Decryption uses an **unlock-once** model: you enter your passphrase once, and the
-app then decrypts without re-asking until you lock it or close the app. The
+app then decrypts without re-asking until you lock it, close the app, or leave it
+in the background for 2 minutes. The
 passphrase itself is still **never stored** — what is cached is the *decrypted
 secret key* it unlocked.
 
@@ -181,7 +183,8 @@ That cache lives in the **Rust library, not the JVM**, on purpose. A Kotlin
 around the managed heap and leave the original in freed memory until it is
 reclaimed. The native cache is a `SecretString` that zeroes its buffer on drop;
 `lock()` drops it, the ⋮ **Lock** action calls it, and the Activity calls it when
-the app is finishing. The key is never written to disk and never crosses back into
+the app is finishing or has been in the background for 2 minutes (Android does not
+reliably call `onDestroy()` when an app is swiped away or left running). The key is never written to disk and never crosses back into
 the JVM; for each decrypt it is briefly copied into zeroizing storage, used, and
 dropped.
 
@@ -191,9 +194,15 @@ widens the window in which it is in memory. That is the cost of the unlock-once
 convenience; it is made as safe as an in-process design allows — zeroizing,
 mutex-guarded, native-only — and the OS sandbox above is the same boundary that
 protects `identity.age` itself. If you prefer the stronger per-operation posture,
-tap **Lock** after each use (or simply lock before backgrounding); to make locking
-on background automatic, call `backend.lock()` from `MainActivity.onStop()` instead
-of `onDestroy()`.
+tap **Lock** after each use, or shorten `BACKGROUND_LOCK_MS` in `MainActivity`.
+The recent-apps thumbnail is disabled (Android 13+) so decrypted text isn't shown
+there.
+
+New keys need a passphrase of at least 10 characters, and the identity is
+encrypted at the standard scrypt work factor of 2^18 (the same as the desktop app,
+the web build and the `age` CLI), so an `identity.age` from any of them imports
+here. Files at a work factor above 2^20 are refused with an explicit message:
+scrypt would need more than 1 GiB of memory.
 
 ## Build verification status
 
