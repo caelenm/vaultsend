@@ -68,7 +68,8 @@ This will:
    when nothing changed, and it guarantees the bundled binary is current).
 2. Stage a fresh `build/VaultSend.AppDir` from the backend binary, the frontend
    source, and `AppDir.template/`.
-3. Download `appimagetool` if not already present (cached as `./appimagetool`).
+3. Download `appimagetool` (a pinned release, checked against its SHA-256) if
+   not already present (cached as `./appimagetool`).
 4. Produce `VaultSend-x86_64.AppImage` in this directory.
 
 You never need to edit anything inside `build/` — it is regenerated each run.

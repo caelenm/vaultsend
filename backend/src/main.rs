@@ -7,6 +7,8 @@
 // Commands:
 //   keygen  --pass-fd N           Create the identity (first run). Print public key.
 //   pubkey                        Print this device's public key. (no secret needed)
+//   status                        Print ready|locked|empty|corrupt. (no secret needed)
+//   recover-pubkey --pass-fd N    Rebuild the public key cache from identity.age.
 //   encrypt -r AGE1.. [..] [--armor] [--in P] [--out P]   (no secret needed)
 //   decrypt --pass-fd N [--in P] [--out P]
 //
@@ -105,6 +107,25 @@ fn data_dir() -> R<PathBuf> {
 fn identity_path() -> R<PathBuf> { Ok(data_dir()?.join("identity.age")) }
 fn pubkey_path() -> R<PathBuf> { Ok(data_dir()?.join("pubkey")) }
 
+// scrypt work factor (N = 2^LOG_N) for the passphrase-encrypted identity.
+//
+// Fixed rather than left to age's default, which calibrates to ~1 s on the
+// machine running keygen and has no floor or ceiling. That produced identities
+// that were weaker than age's standard on slow machines, and on fast machines
+// identities that a slower device (default limit: its own target + 4) or the
+// web build (limit: 20) refuses to open. 18 is what age, rage's CLI and the web
+// build use, so an identity.age made anywhere opens everywhere.
+const SCRYPT_LOG_N: u8 = 18;
+// Highest work factor accepted when unlocking. Above the fixed value so that
+// identities created by earlier, calibrating builds still open on any device.
+const SCRYPT_MAX_LOG_N: u8 = 22;
+
+/// Plaintext and ciphertext written to a file are staged here first and renamed
+/// into place only once complete. A distinctive suffix, because a stale staging
+/// file is deleted on the next run and must never be one of the user's own
+/// files (`<name>.part` is what browsers use for in-progress downloads).
+fn staging_path(path: &str) -> String { format!("{path}.vaultsend-part") }
+
 // ---------------------------------------------------------------------------
 // Small IO helpers.
 // ---------------------------------------------------------------------------
@@ -157,16 +178,26 @@ fn open_private_new(path: &str) -> R<File> {
     }
 }
 
+/// Finish a staged write: on success fsync was already done by the caller, so
+/// atomically rename the staging file over `path`; on failure remove it so no
+/// partial output is ever left behind.
+fn commit_staged(staged: R<()>, tmp: &str, path: &str) -> R<()> {
+    match staged {
+        Ok(()) => fs::rename(tmp, path).map_err(|e| {
+            let _ = fs::remove_file(tmp);
+            format!("finalizing {path}: {e}")
+        }),
+        Err(e) => {
+            let _ = fs::remove_file(tmp);
+            Err(e)
+        }
+    }
+}
+
 fn input_reader(path: Option<&str>) -> R<Box<dyn Read>> {
     match path {
         Some(p) => Ok(Box::new(File::open(p).map_err(|e| format!("opening {p}: {e}"))?)),
         None => Ok(Box::new(io::stdin())),
-    }
-}
-fn output_writer(path: Option<&str>) -> R<Box<dyn Write>> {
-    match path {
-        Some(p) => Ok(Box::new(File::create(p).map_err(|e| format!("creating {p}: {e}"))?)),
-        None => Ok(Box::new(io::stdout())),
     }
 }
 
@@ -211,7 +242,11 @@ fn cmd_keygen(pass_fd: i32) -> R<()> {
     let tmp = format!("{}.new", id_path.display());
     let file = open_private_new(&tmp)?;
     let write_result = (move || -> R<()> {
-        let encryptor = age::Encryptor::with_user_passphrase(passphrase);
+        let mut recipient = age::scrypt::Recipient::new(passphrase);
+        recipient.set_work_factor(SCRYPT_LOG_N);
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .map_err(|e| format!("encrypting identity: {e}"))?;
         let mut w = encryptor.wrap_output(file).map_err(|e| format!("encrypting identity: {e}"))?;
         w.write_all(secret.expose_secret().as_bytes())
             .map_err(|e| format!("encrypting identity: {e}"))?;
@@ -274,10 +309,19 @@ fn load_identity(pass_fd: i32) -> R<x25519::Identity> {
         .map_err(|_| "no identity yet — run keygen first".to_string())?;
     let dec = age::Decryptor::new(BufReader::new(id_file))
         .map_err(|_| "your saved identity is empty or damaged and can't be read".to_string())?;
-    let scrypt_id = age::scrypt::Identity::new(passphrase);
+    let mut scrypt_id = age::scrypt::Identity::new(passphrase);
+    scrypt_id.set_max_work_factor(SCRYPT_MAX_LOG_N);
     let mut id_reader = dec
         .decrypt(std::iter::once(&scrypt_id as &dyn age::Identity))
-        .map_err(|_| "wrong passphrase, or the identity file is damaged".to_string())?;
+        .map_err(|e| match e {
+            // Not a passphrase problem: say so, or the user retypes a correct
+            // passphrase forever.
+            age::DecryptError::ExcessiveWork { required, .. } => format!(
+                "your identity file was created with a scrypt work factor of 2^{required}, \
+                 above this app's limit of 2^{SCRYPT_MAX_LOG_N}"
+            ),
+            _ => "wrong passphrase, or the identity file is damaged".to_string(),
+        })?;
     // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
     // drop rather than left behind in freed heap. (age keeps the parsed scalar
     // in its own zeroizing storage; this protects the intermediate text form.)
@@ -318,16 +362,44 @@ fn cmd_encrypt(recipient_strs: &[String], armor: bool, in_p: Option<&str>, out_p
         age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
             .map_err(|e| format!("preparing encryption: {e}"))?;
 
-    let format = if armor { Format::AsciiArmor } else { Format::Binary };
-    let armored = ArmoredWriter::wrap_output(output_writer(out_p)?, format)
-        .map_err(|e| format!("preparing output: {e}"))?;
-    let mut stream = encryptor.wrap_output(armored).map_err(|e| format!("encrypting: {e}"))?;
+    let reader = input_reader(in_p)?;
+    match out_p {
+        // Stage to a sibling temp and rename into place once complete, as
+        // decrypt does. Writing straight to the destination truncated it first,
+        // so `--out` naming the input destroyed the input (and reported success),
+        // and a cancelled or failed run left a truncated .age file that looked
+        // valid until someone tried to decrypt it.
+        Some(path) => {
+            let tmp = staging_path(path);
+            let file = open_private_new(&tmp)?;
+            let staged = encrypt_to(encryptor, armor, reader, file).and_then(|mut f| {
+                f.flush().map_err(|e| format!("writing output: {e}"))?;
+                f.sync_all().map_err(|e| format!("flushing output: {e}"))
+            });
+            commit_staged(staged, &tmp, path)
+        }
+        None => {
+            let mut stdout = encrypt_to(encryptor, armor, reader, io::stdout())?;
+            stdout.flush().map_err(|e| format!("writing output: {e}"))
+        }
+    }
+}
 
-    let mut reader = input_reader(in_p)?;
+/// Encrypt everything from `reader` into `out`, returning `out` once the age
+/// stream and any armor are finished.
+fn encrypt_to<W: Write>(
+    encryptor: age::Encryptor,
+    armor: bool,
+    mut reader: Box<dyn Read>,
+    out: W,
+) -> R<W> {
+    let format = if armor { Format::AsciiArmor } else { Format::Binary };
+    let armored =
+        ArmoredWriter::wrap_output(out, format).map_err(|e| format!("preparing output: {e}"))?;
+    let mut stream = encryptor.wrap_output(armored).map_err(|e| format!("encrypting: {e}"))?;
     io::copy(&mut reader, &mut stream).map_err(|e| format!("encrypting: {e}"))?;
     let armored = stream.finish().map_err(|e| format!("finishing: {e}"))?;
-    armored.finish().map_err(|e| format!("finishing: {e}"))?;
-    Ok(())
+    armored.finish().map_err(|e| format!("finishing: {e}"))
 }
 
 fn cmd_decrypt(pass_fd: i32, in_p: Option<&str>, out_p: Option<&str>) -> R<()> {
@@ -349,20 +421,14 @@ fn cmd_decrypt(pass_fd: i32, in_p: Option<&str>, out_p: Option<&str>) -> R<()> {
         // therefore never leaves a partial plaintext file at the destination,
         // and the destination is never a half-written file.
         Some(path) => {
-            let tmp = format!("{path}.part");
+            let tmp = staging_path(path);
             let mut file = open_private_new(&tmp)?;
             let staged = io::copy(&mut stream, &mut file)
                 .map_err(|e| format!("decrypting: {e}"))
                 .and_then(|_| file.flush().map_err(|e| format!("writing output: {e}")))
                 .and_then(|_| file.sync_all().map_err(|e| format!("flushing output: {e}")));
-            match staged {
-                Ok(()) => fs::rename(&tmp, path).map_err(|e| format!("finalizing {path}: {e}")),
-                Err(e) => {
-                    // Never leave partial plaintext behind on a failed decrypt.
-                    let _ = fs::remove_file(&tmp);
-                    Err(e)
-                }
-            }
+            // Never leave partial plaintext behind on a failed decrypt.
+            commit_staged(staged, &tmp, path)
         }
         // No --out: stream straight to stdout, an in-memory pipe to the caller.
         // Nothing is written to disk.

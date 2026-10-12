@@ -68,10 +68,30 @@ chmod +x "$APPDIR/usr/bin/vaultsend-backend"
 cp "$FRONTEND_SRC" "$APPDIR/usr/share/vaultsend/frontend/app.py"
 
 # 4. Fetch appimagetool if we don't have it (cached in ./ for reuse).
-if [ ! -x ./appimagetool ]; then
-    echo "Downloading appimagetool..."
-    curl -L -o appimagetool \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+#    Pinned to a tagged release and checked against its SHA-256: this binary is
+#    executed by install.sh's `curl | sh` path, so an unpinned "continuous"
+#    download would run whatever that URL served on the day. To upgrade, change
+#    both values together.
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+    else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+if [ ! -x ./appimagetool ] || [ "$(sha256_of ./appimagetool)" != "$APPIMAGETOOL_SHA256" ]; then
+    echo "Downloading appimagetool $APPIMAGETOOL_VERSION..."
+    rm -f appimagetool appimagetool.download
+    curl -fL -o appimagetool.download \
+        "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+    got="$(sha256_of appimagetool.download)"
+    if [ "$got" != "$APPIMAGETOOL_SHA256" ]; then
+        rm -f appimagetool.download
+        echo "error: appimagetool checksum mismatch (expected $APPIMAGETOOL_SHA256, got $got)" >&2
+        exit 1
+    fi
+    mv appimagetool.download appimagetool
     chmod +x appimagetool
 fi
 
