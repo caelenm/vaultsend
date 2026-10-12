@@ -40,9 +40,8 @@ jobs:
         with:
           gradle-version: "8.9"
 
+      # cargo-ndk finds the NDK through ANDROID_NDK_ROOT, which the runner sets.
       - name: Assemble debug APK (runs build-rust.sh via preBuild)
-        env:
-          ANDROID_NDK_HOME: ${{ env.ANDROID_NDK_LATEST_HOME }}
         run: gradle assembleDebug --stacktrace
 
       - uses: actions/upload-artifact@v4
