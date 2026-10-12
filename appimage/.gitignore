@@ -3,6 +3,7 @@
 
 # Cached appimagetool download.
 /appimagetool
+/appimagetool.download
 
 # Built AppImage artifacts.
 *.AppImage

@@ -32,6 +32,17 @@ APP_ID = "org.vaultsend.VaultSend"
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "vaultsend"
 CONTACTS_FILE = CONFIG_DIR / "contacts.json"
 
+APP_VERSION = "0.1.2"
+
+# Required when creating a key. The passphrase is all that protects identity.age
+# once it is backed up, so trivially guessable ones are refused. Unlocking an
+# existing key accepts whatever passphrase it was made with.
+MIN_PASSPHRASE_LEN = 10
+
+# Suffix the backend stages file output under before renaming it into place
+# (see staging_path() in backend/src/main.rs).
+STAGING_SUFFIX = ".vaultsend-part"
+
 
 # ---------------------------------------------------------------------------
 # Backend plumbing
@@ -206,19 +217,47 @@ def human_bytes(n: float) -> str:
 def load_contacts() -> list:
     try:
         data = json.loads(CONTACTS_FILE.read_text("utf-8"))
-        return [c for c in data if "name" in c and "pubkey" in c]
     except (OSError, ValueError):
         return []
+    if not isinstance(data, list):
+        return []
+    # Keep only well-formed entries: a hand-edited or foreign file must not be
+    # able to crash startup (e.g. a list of strings, where `"name" in c` is a
+    # substring test and c["name"] then raises).
+    return [
+        {"name": c["name"], "pubkey": c["pubkey"]}
+        for c in data
+        if isinstance(c, dict) and isinstance(c.get("name"), str) and isinstance(c.get("pubkey"), str)
+    ]
 
 
 def save_contacts(contacts: list) -> None:
+    # Write a temp file and rename it over the old one, so a crash or full disk
+    # mid-write can never leave a truncated contacts.json (which would load as
+    # an empty list and then be saved over).
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    CONTACTS_FILE.write_text(json.dumps(contacts, indent=2), "utf-8")
+    tmp = CONTACTS_FILE.with_name(CONTACTS_FILE.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(json.dumps(contacts, indent=2))
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, CONTACTS_FILE)
 
 
-def looks_like_pubkey(s: str) -> bool:
+def is_valid_pubkey(s: str) -> bool:
+    """True if `s` is an age X25519 recipient the backend accepts.
+
+    Checked by the backend's own parser (bech32 checksum, HRP and key length)
+    by encrypting zero bytes to it, rather than by a shape test that let typos
+    through and then broke every later encryption to that contact."""
     s = s.strip()
-    return s.startswith("age1") and 50 <= len(s) <= 80 and s[4:].isalnum()
+    if not s.startswith("age1"):
+        return False
+    try:
+        run_backend(["encrypt", "-r", s], input_bytes=b"")
+        return True
+    except BackendError:
+        return False
 
 
 def short(pubkey: str) -> str:
@@ -237,12 +276,11 @@ class FileOperation:
     both polls for completion and samples the growing output file. No threads,
     so nothing touches GTK off the main loop.
 
-    Failure handling: the backend already stages a decrypt to `<out>.part` and
-    renames it only after the ciphertext authenticates, so a bad decrypt never
-    leaves plaintext at the destination. It cannot clean up after a signal,
-    though, and it does not stage encryption at all — so on cancel or failure
-    we remove whatever partial file is left rather than leaving a truncated
-    .age file that looks valid until the day someone tries to decrypt it.
+    Failure handling: the backend stages both encrypt and decrypt output to
+    `<out>.vaultsend-part` and renames it into place only once complete (for a
+    decrypt, once the ciphertext has authenticated), so the destination is never
+    a partial file. It cannot clean up after a signal, though, so on cancel or
+    failure we remove the staging file ourselves.
     """
 
     POLL_MS = 100
@@ -359,12 +397,10 @@ class FileOperation:
     def _discard_partials(self):
         """Remove the incomplete output.
 
-        watch_path is exactly the file the backend was writing: `<out>` when
-        encrypting, `<out>.part` when decrypting. On the decrypt side `<out>`
-        itself is never touched until the atomic rename, so a failed decrypt
-        cannot cost the user an existing file. On the encrypt side the backend
-        opened `<out>` with File::create, which already truncated whatever was
-        there — so what we delete is a remnant of this run, not intact data."""
+        watch_path is exactly the file the backend was writing: the staging
+        file `<out>.vaultsend-part`. `<out>` itself is never touched until the
+        atomic rename, so a failed or cancelled run cannot cost the user an
+        existing file."""
         try:
             os.remove(self.watch_path)
         except OSError:
@@ -801,9 +837,10 @@ class Window(Adw.ApplicationWindow):
             args,
             heading="Encrypting…",
             subject=os.path.basename(in_path),
-            # Encryption writes straight to the destination; its size tracks the
-            # ciphertext, whose final size follows from the input plus overhead.
-            watch_path=out_path,
+            # The backend stages the ciphertext and renames it into place when
+            # done; the staging file's size tracks progress, and its final size
+            # follows from the input plus the format's overhead.
+            watch_path=out_path + STAGING_SUFFIX,
             total=expected_ciphertext_size(file_size(in_path)),
             note=f"Encrypted to {len(recips)}.",
         ))
@@ -817,15 +854,16 @@ class Window(Adw.ApplicationWindow):
             subject=os.path.basename(in_path),
             # Decryption stages to a sibling temp and renames only once the
             # ciphertext authenticates, so the temp is what grows.
-            watch_path=out_path + ".part",
+            watch_path=out_path + STAGING_SUFFIX,
             total=expected_plaintext_size(in_path),
             note="Decrypted.",
         ))
 
     # -- Text handling --------------------------------------------------------
     def encrypt_text(self):
-        text = self.get_text().strip()
-        if not text:
+        # Encrypted verbatim: leading/trailing whitespace is part of the message.
+        text = self.get_text()
+        if not text.strip():
             self.error("Type or paste a message first.")
             return
         self.pick_recipients(lambda recips: self._encrypt_text(text, recips))
@@ -911,11 +949,20 @@ class Window(Adw.ApplicationWindow):
             if r != "ok":
                 return
             p = entry.get_text()
+            problem = None
             if not p:
-                self.error("Passphrase can't be empty.")
-                return
-            if confirm and entry2 is not None and p != entry2.get_text():
-                self.error("Those passphrases don't match.")
+                problem = "Passphrase can't be empty."
+            elif confirm and len(p) < MIN_PASSPHRASE_LEN:
+                problem = f"Use at least {MIN_PASSPHRASE_LEN} characters — a few random words works well."
+            elif confirm and entry2 is not None and p != entry2.get_text():
+                problem = "Those passphrases don't match."
+            if problem:
+                self.error(problem)
+                # Creating a key: ask again. On first run nothing else in the
+                # UI leads back to this dialog, so returning left the app with
+                # no key until it was restarted.
+                if confirm:
+                    self.ask_passphrase(on_ok, heading=heading, body=body, confirm=confirm)
                 return
             on_ok(p)
 
@@ -944,8 +991,11 @@ class Window(Adw.ApplicationWindow):
             if not n:
                 self.error("Give the contact a name.")
                 return
-            if not looks_like_pubkey(k):
-                self.error("That doesn't look like an age public key (age1…).")
+            if not is_valid_pubkey(k):
+                self.error("That isn't a valid age public key (age1…). Check it was copied in full.")
+                return
+            if any(c["pubkey"] == k for c in self.contacts):
+                self.error("That public key is already saved.")
                 return
             self.contacts.append({"name": n, "pubkey": k})
             save_contacts(self.contacts)
@@ -978,7 +1028,7 @@ class Window(Adw.ApplicationWindow):
             application_name="VaultSend",
             application_icon="security-high-symbolic",
             developer_name="VaultSend",
-            version="0.1.0",
+            version=APP_VERSION,
             comments="File and text encryption using the age format. "
             "All cryptography is performed by a small separate backend. \n"
             "Source code can be found here: \n https://github.com/caelenm/vaultsend/",

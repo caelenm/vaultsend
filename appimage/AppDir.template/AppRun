@@ -16,10 +16,12 @@ if ! command -v python3 >/dev/null 2>&1; then
     exit 1
 fi
 
-if ! python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw" 2>/tmp/vaultsend-gi-check; then
+# Capture the failure detail in a variable rather than a fixed /tmp path, which
+# another local user could pre-create (or point at one of your files).
+if ! GI_ERR=$(python3 -c "import gi; gi.require_version('Gtk','4.0'); gi.require_version('Adw','1'); from gi.repository import Gtk, Adw" 2>&1); then
     echo "VaultSend needs GTK 4 and libadwaita with their Python bindings (python3-gi, gir1.2-gtk-4.0, gir1.2-adw-1, or your distro's equivalents)." >&2
     echo "Detail:" >&2
-    cat /tmp/vaultsend-gi-check >&2
+    printf '%s\n' "$GI_ERR" >&2
     exit 1
 fi
 
