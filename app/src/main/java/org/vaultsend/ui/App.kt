@@ -135,6 +135,7 @@ fun App(vm: AppViewModel = viewModel()) {
                     vm.backend.decryptFileSession(input, output)
                     toast("Decrypted and saved.")
                 } catch (e: Exception) {
+                    vm.backend.discardOutput(output)
                     toast(e.message ?: "The operation failed.")
                 }
             }
@@ -153,8 +154,9 @@ fun App(vm: AppViewModel = viewModel()) {
     // --- Actions (each mirrors a desktop handler) -----------------------------
 
     fun encryptText() {
-        val text = vm.message.trim()
-        if (text.isEmpty()) { toast("Type or paste a message first."); return }
+        // Encrypted verbatim: leading/trailing whitespace is part of the message.
+        val text = vm.message
+        if (text.isBlank()) { toast("Type or paste a message first."); return }
         val pk = vm.myPubkey
         if (pk == null) { toast("Your key isn't ready yet."); return }
         dialog = PickRecipients { recipients ->
@@ -177,7 +179,7 @@ fun App(vm: AppViewModel = viewModel()) {
         dialog = AskPassphrase(
             "Unlock your key",
             "Enter your passphrase to decrypt. You'll stay unlocked until you " +
-                "close the app or lock it.",
+                "lock it, close the app, or leave it in the background for 2 minutes.",
             confirm = false,
             validate = { bytes -> tryUnlock(bytes) },
         ) {
@@ -199,6 +201,7 @@ fun App(vm: AppViewModel = viewModel()) {
                         vm.backend.encryptFile(recipients, input, output)
                         toast("Encrypted to ${recipients.size} recipient(s).")
                     } catch (e: Exception) {
+                        vm.backend.discardOutput(output)
                         toast(e.message ?: "The operation failed.")
                     }
                 }
@@ -211,7 +214,7 @@ fun App(vm: AppViewModel = viewModel()) {
         dialog = AskPassphrase(
             "Unlock your key",
             "Enter your passphrase to decrypt. You'll stay unlocked until you " +
-                "close the app or lock it.",
+                "lock it, close the app, or leave it in the background for 2 minutes.",
             confirm = false,
             validate = { bytes -> tryUnlock(bytes) },
         ) {
@@ -279,14 +282,13 @@ fun App(vm: AppViewModel = viewModel()) {
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
             try {
-                val added = vm.importContacts(uri)
-                toast(
-                    when (added) {
-                        0 -> "No new contacts to import."
-                        1 -> "Imported 1 contact."
-                        else -> "Imported $added contacts."
-                    },
-                )
+                val (added, skipped) = vm.importContacts(uri)
+                val summary = when (added) {
+                    0 -> "No new contacts to import."
+                    1 -> "Imported 1 contact."
+                    else -> "Imported $added contacts."
+                }
+                toast(if (skipped > 0) "$summary Skipped $skipped with an invalid public key." else summary)
             } catch (e: Exception) {
                 toast(e.message ?: "Couldn't import that file.")
             }
@@ -450,6 +452,14 @@ fun App(vm: AppViewModel = viewModel()) {
                 vm.addContact(name, key)
                 dialog = null
                 toast("Contact added.")
+            },
+            checkKey = { key ->
+                when {
+                    !vm.backend.isValidRecipient(key) ->
+                        "That isn't a valid age public key. Check it was copied in full."
+                    vm.contacts.any { it.pubkey == key } -> "That public key is already saved."
+                    else -> null
+                }
             },
         )
         is DeleteContactDialogState -> DeleteContactDialog(

@@ -41,21 +41,21 @@
                 <data android:mimeType="text/plain" />
             </intent-filter>
 
-            <!-- "Open with" on a file. The content scheme covers Storage Access
-                 Framework / file-manager URIs; the .age extension match helps
-                 file managers that key off the name. -->
+            <!-- "Open with" on a file. Content URIs only (Storage Access Framework
+                 and file-manager providers): file:// URIs are refused, since this
+                 app would open them with its own permissions, and the filters are
+                 not BROWSABLE, so web pages can't launch them. The .age extension
+                 match helps file managers that key off the name. -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="content" />
                 <data android:mimeType="*/*" />
             </intent-filter>
             <intent-filter android:label="@string/app_name">
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
-                <category android:name="android.intent.category.BROWSABLE" />
                 <data android:scheme="content" />
-                <data android:scheme="file" />
                 <data android:host="*" />
                 <data android:mimeType="*/*" />
                 <data android:pathPattern=".*\\.age" />

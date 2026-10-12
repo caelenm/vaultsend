@@ -1,0 +1,51 @@
+# Builds the Android app on every PR to (and push of) the android branch:
+# unit-tests the Rust core, cross-compiles it for all four ABIs, and assembles a
+# debug APK, so a change that doesn't compile can't be merged unnoticed.
+name: Android build
+
+on:
+  pull_request:
+    branches: [android]
+  push:
+    branches: [android]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - name: Rust core unit tests
+        working-directory: rust
+        run: cargo test
+
+      - name: Install cargo-ndk
+        run: cargo install cargo-ndk --version 3.5.4 --locked
+
+      # The Gradle wrapper jar isn't committed (see README), so use a pinned Gradle.
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
+
+      # cargo-ndk finds the NDK through ANDROID_NDK_ROOT, which the runner sets.
+      - name: Assemble debug APK (runs build-rust.sh via preBuild)
+        run: gradle assembleDebug --stacktrace
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vaultsend-debug-apk
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

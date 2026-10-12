@@ -109,10 +109,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      * incoming entry whose pubkey is already present is skipped, so re-importing
      * the same file is a no-op rather than a source of duplicates.
      *
-     * Returns the number of new contacts actually added. Throws if the file can't
-     * be opened or isn't a valid contacts.json (the caller reports the message).
+     * Entries whose public key the core rejects are skipped rather than saved,
+     * since a bad key would break every later encryption to that contact.
+     *
+     * Returns (added, skipped). Throws if the file can't be opened or isn't a
+     * valid contacts.json (the caller reports the message).
      */
-    suspend fun importContacts(uri: Uri): Int {
+    suspend fun importContacts(uri: Uri): Pair<Int, Int> {
         val incoming = withContext(Dispatchers.IO) {
             getApplication<Application>().contentResolver.openInputStream(uri).use { input ->
                 requireNotNull(input) { "Couldn't open the selected file." }
@@ -122,14 +125,17 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         // Resumes on the caller's dispatcher (Main) — safe to mutate snapshot state.
         val seen = contacts.mapTo(HashSet()) { it.pubkey }
         var added = 0
+        var skipped = 0
         for (c in incoming) {
-            if (seen.add(c.pubkey)) {
+            if (!backend.isValidRecipient(c.pubkey)) {
+                skipped++
+            } else if (seen.add(c.pubkey)) {
                 contacts.add(c)
                 added++
             }
         }
         if (added > 0) contactStore.save(contacts)
-        return added
+        return added to skipped
     }
 
     /**

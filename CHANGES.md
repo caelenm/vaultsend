@@ -1,5 +1,26 @@
 # What changed in this build
 
+## Audit fixes (v0.1.2)
+
+- **Portable identity:** new keys use a fixed scrypt work factor of 2^18 instead
+  of one calibrated to the phone. Imports and unlocks accept up to 2^20, and a
+  higher work factor is reported as such instead of as "wrong passphrase".
+- **File decrypt staging:** each decrypt stages to its own temp file, so two
+  decrypts running at once can no longer swap plaintext. Leftovers from a killed
+  run are cleaned up on the next decrypt.
+- **Failed file operations** delete the destination the user picked, instead of
+  leaving a truncated `.age` file or an empty file behind.
+- **Session:** auto-locks after 2 minutes in the background. Decrypted text is
+  kept out of the recent-apps thumbnail (Android 13+).
+- **Passphrase:** at least 10 characters for a new key.
+- **Contacts:** keys are validated by the core's parser on add and on import
+  (invalid ones are skipped and counted), and duplicates are refused.
+- **Text:** encrypted verbatim (leading/trailing whitespace is no longer trimmed).
+- **Intents:** only `content://` URIs are accepted from other apps, and the VIEW
+  filters are no longer `BROWSABLE`.
+- Rust crate version 0.1.2, matching `versionName`. Dependencies are optimized in
+  test builds, so `cargo test` stays fast at the real work factor.
+
 Five updates were made on top of the `android` branch. The Rust core was
 compiled and unit-tested here; the Kotlin/Gradle half builds in Android Studio
 (no SDK/NDK was available in the authoring environment — same caveat as the
