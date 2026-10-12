@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 # VaultSend — reproducible-build verifier
-# Checks that the crypto bundle embedded in VaultSend_offline.html is
+# Checks that the crypto bundle embedded in index.html is
 # byte-identical to a clean rebuild from the pinned upstream sources.
 #
-#   usage:  bash verify.sh path/to/VaultSend_offline.html
+#   usage:  bash verify.sh path/to/index.html
 #   needs:  bash, python3, node, npm, sha256sum (or shasum on macOS)
 #
 # Every step prints its own status. If anything goes wrong you will see
@@ -36,7 +36,7 @@ step "0 / 5  Checking arguments"
 HTML="${1:-}"
 if [ -z "$HTML" ]; then
   fail "No HTML file given."
-  echo "       usage:  bash verify.sh path/to/VaultSend_offline.html"
+  echo "       usage:  bash verify.sh path/to/index.html"
   exit 1
 fi
 if [ ! -f "$HTML" ]; then

@@ -12,10 +12,14 @@
         fixed and auditable; nothing can be swapped in by a CDN or an injection.
       * style-src keeps 'unsafe-inline' only for the stylesheet + a few style=""
         attributes; styles cannot exfiltrate data under default-src 'none'.
-    Editing either <script> body invalidates its hash; recompute with the build
-    step documented in the provenance comment near the app script.
+      * script-src has no 'self': the page loads no script files, so allowing
+        same-origin scripts would only widen what an injection could pull in.
+      * frame-ancestors is not listed because browsers ignore it in a <meta>
+        tag; a hosted copy must send it as an HTTP header to block framing.
+    Editing either <script> body invalidates its hash; re-pin with
+    `python3 update-csp.py`.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;self&#39; &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-TBmcOqgbvQAGaA/MX5V2bh4pGpV1yGY9MHYhJ41r0l4=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;; frame-ancestors &#39;none&#39;">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-OQr3hb9mkuFSxQOfeTe9bOA8JsF8tLLxIZezsWPJBNM=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;">
   <title>VaultSend</title>
   <style>
     /* ─── Design tokens — VaultSend "shield navy" / Material-3 aligned ─── */
@@ -610,7 +614,7 @@
        @noble/curves  1.9.7            — P. Miller        (MIT)
        @noble/hashes  1.8.0            — P. Miller        (MIT)
        @scure/base    1.2.6            — P. Miller        (MIT)
-       fflate         0.8.2            — A. Gao           (MIT)
+       fflate         0.8.2            — A. Barrett       (MIT)
      It exposes exactly two globals — __VS_AGE__ and __VS_FFLATE__ — holding
      only the symbols the app calls. No crypto is hand-written here.
 
@@ -653,7 +657,7 @@
        vs_identity : base64 of the passphrase-encrypted age identity (secret)
        vs_pubkey   : the age1… public key, in the clear (a public key is public)
        vs_contacts : JSON array of {name, pubkey}
-     Editing this script changes its SHA-256; recompute the CSP hash (build.py).
+     Editing this script changes its SHA-256; re-pin it with `python3 update-csp.py`.
      ═══════════════════════════════════════════════════════════════════════ -->
 <script id="vs-app">
 "use strict";
@@ -704,6 +708,10 @@
     remember: true,          // toggled by the unlock-modal checkbox
     isUnlocked() { return this._bytes !== null; },
     stash(identityStr) {
+      // Always drop whatever was held before. Otherwise importing a new
+      // identity with "keep unlocked" unchecked left the OLD key cached, and
+      // every later decrypt silently used it.
+      this.lock(null);
       if (!this.remember) { updateLockUI(); return; }   // caution mode: don't retain
       this._bytes = new TextEncoder().encode(identityStr);
       this._armIdle();
@@ -791,6 +799,14 @@
     $("toast-wrap").appendChild(t);
     setTimeout(() => t.remove(), duration);
   }
+
+  // Full age recipient check (bech32 checksum, "age" HRP, 32-byte key) using the
+  // vendored parser, rather than a loose regex that accepts keys age rejects.
+  function isValidRecipient(pk) {
+    try { new age.Encrypter().addRecipient(pk); return true; } catch { return false; }
+  }
+
+  const MIN_PASSPHRASE_LEN = 10;
 
   function shortKey(k) {
     return k && k.length > 24 ? k.slice(0, 16) + "…" + k.slice(-6) : (k || "");
@@ -948,7 +964,7 @@
     const name = $("contact-name-in").value.trim();
     const pk   = $("contact-pk-in").value.trim();
     if (!name) return showToast("Give the contact a name.");
-    if (!/^age1[0-9a-z]{20,}$/.test(pk)) return showToast("That doesn't look like a valid age public key (age1…).");
+    if (!isValidRecipient(pk)) return showToast("That doesn't look like a valid age public key (age1…).");
     if (contacts.some((c) => c.pubkey === pk)) return showToast("That public key is already saved.");
     contacts.push({ name, pubkey: pk });
     saveContacts();
@@ -958,13 +974,14 @@
   });
 
   // ── Export identity ───────────────────────────────────────────────────────
-  $("menu-export-identity").addEventListener("click", () => {
+  function exportIdentity() {
     const b64 = store.get(SK_IDENTITY);
     if (!b64) return showToast("No identity to export.");
     const blob = new Blob([b64ToBytes(b64)], { type: "application/octet-stream" });
     dlBlob(blob, "identity.age");
     showToast("identity.age exported.");
-  });
+  }
+  $("menu-export-identity").addEventListener("click", exportIdentity);
 
   // ── Export / import contacts ──────────────────────────────────────────────
   $("menu-export-contacts").addEventListener("click", () => {
@@ -979,18 +996,20 @@
     try {
       const arr = JSON.parse(await f.text());
       if (!Array.isArray(arr)) throw new Error("not an array");
-      let added = 0;
+      let added = 0, invalid = 0;
       arr.forEach((c) => {
-        if (c && typeof c.name === "string" && typeof c.pubkey === "string" &&
-            /^age1[0-9a-z]{20,}$/.test(c.pubkey) &&
-            !contacts.some((x) => x.pubkey === c.pubkey)) {
-          contacts.push({ name: c.name, pubkey: c.pubkey });
+        if (!(c && typeof c.name === "string" && typeof c.pubkey === "string")) { invalid++; return; }
+        const pk = c.pubkey.trim();
+        if (!isValidRecipient(pk)) { invalid++; return; }
+        if (!contacts.some((x) => x.pubkey === pk)) {
+          contacts.push({ name: c.name, pubkey: pk });
           added++;
         }
       });
       saveContacts();
       renderContacts();
-      showToast("Imported " + added + " contact(s).");
+      showToast("Imported " + added + " contact(s)."
+                + (invalid ? " Skipped " + invalid + " with an invalid public key." : ""));
     } catch { showToast("Failed to parse contacts JSON.", 3000, true); }
     e.target.value = "";
   });
@@ -1047,7 +1066,7 @@
   $("btn-import-identity-setup").addEventListener("click", () => triggerIdentityImport());
   function triggerIdentityImport() {
     const input = document.createElement("input");
-    input.type = "file"; input.accept = ".age,*";
+    input.type = "file";
     input.style.display = "none";
     document.body.appendChild(input);
     input.addEventListener("change", async (e) => {
@@ -1060,13 +1079,23 @@
 
   async function handleIdentityImport(file) {
     const bytes = new Uint8Array(await file.arrayBuffer());
+    const replacing = !!store.get(SK_IDENTITY);
     const ok = await alertModal(
-      "Import identity file?",
-      'Do you want to import "' + file.name + '" as your VaultSend identity?',
+      replacing ? "Replace your current identity?" : "Import identity file?",
+      replacing
+        ? 'Importing "' + file.name + '" will replace the key stored in this browser. '
+          + "Anything encrypted to your current key (" + shortKey(myPubkey) + ") can no longer "
+          + "be decrypted here unless you have exported it. Export it first if unsure."
+        : 'Do you want to import "' + file.name + '" as your VaultSend identity?',
       null,
-      [{ label: "Cancel", val: false }, { label: "Import", val: true, primary: true }]
+      replacing
+        ? [{ label: "Cancel", val: false },
+           { label: "Export current first", val: "export" },
+           { label: "Replace", val: true, danger: true }]
+        : [{ label: "Cancel", val: false }, { label: "Import", val: true, primary: true }]
     );
-    if (!ok) return;
+    if (ok === "export") { exportIdentity(); return; }
+    if (ok !== true) return;
 
     const pass = await passphraseModal("Unlock identity file", "Enter the passphrase for this identity file to decrypt it.", false);
     if (pass === null) return;
@@ -1110,16 +1139,42 @@
     const pass = await passphraseModal("Unlock your key", "Enter your passphrase to decrypt.", false);
     if (pass === null) return null;
 
+    let identity;
     try {
       const dec = new age.Decrypter();
       dec.addPassphrase(pass);
       const plain = await dec.decrypt(b64ToBytes(b64), "text");
-      const identity = plain.trim();
-      keyVault.stash(identity);   // respects the remember toggle + arms auto-lock
-      return identity;            // transient: callers use it for one op and drop it
+      identity = plain.trim();
+      if (!identity.startsWith("AGE-SECRET-KEY-1")) throw new Error("not an identity");
+      await reconcilePubkey(identity);   // also rejects a malformed key
     } catch {
       showToast("Wrong passphrase, or the stored identity is damaged.", 4000, true);
       return null;
+    }
+    keyVault.stash(identity);     // respects the remember toggle + arms auto-lock
+    return identity;              // transient: callers use it for one op and drop it
+  }
+
+  // vs_pubkey is stored in the clear and trusted for "You" in every encryption,
+  // but localStorage is shared with other pages on the same origin (every
+  // file:// page in Chromium; every project page under one *.github.io host).
+  // Whenever the identity is unlocked, re-derive the public key from it and
+  // repair the cache if it was changed behind our back.
+  async function reconcilePubkey(identity) {
+    const derived = await age.identityToRecipient(identity);
+    if (derived === myPubkey) return;
+    const was = myPubkey;
+    store.set(SK_PUBKEY, derived);
+    myPubkey = derived;
+    if (was) {
+      alertModal(
+        "Your saved public key was changed",
+        "The public key stored for you did not match your private key and has been repaired. "
+        + "Another page on this origin may have modified VaultSend's storage — check your "
+        + "contacts' keys before encrypting to them.",
+        '<div class="mono-block">stored: ' + escHtml(was) + "<br>actual: " + escHtml(derived) + "</div>",
+        [{ label: "OK", val: "ok", primary: true }]
+      );
     }
   }
 
@@ -1192,19 +1247,83 @@
   dropZone.addEventListener("dragover", (e) => e.preventDefault());
   dropZone.addEventListener("drop", async (e) => {
     e.preventDefault(); dragDepth = 0; dropZone.classList.remove("dragover");
+    // DataTransfer items are only readable during the event, so take the
+    // entries before the first await.
+    const items = Array.prototype.slice.call(e.dataTransfer.items || []);
+    const entries = items.map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
     const files = Array.prototype.slice.call(e.dataTransfer.files);
     if (!files.length) return;
-    await loadFiles(files, e.dataTransfer);
+    if (entries.length && entries.every(Boolean) && entries.some((en) => en.isDirectory)) {
+      // A dropped folder arrives in dataTransfer.files as a single unreadable
+      // File, so walk the directory entries to get its real contents.
+      let list;
+      try { list = await filesFromEntries(entries); }
+      catch (err) { return showToast("Couldn't read the dropped folder: " + err.message, 4000, true); }
+      if (!list.length) return showToast("That folder is empty.");
+      return zipAndLoad(list, entries[0].name);
+    }
+    await loadFiles(files);
   });
 
-  async function loadFiles(files, dt) {
-    let totalSize = 0;
-    for (const f of files) totalSize += f.size;
-    // Single files stream and are no longer size-limited by memory. Zipping a
-    // folder still buffers every member, so warn only on that path (below).
+  function readAllEntries(reader) {
+    // readEntries() returns at most ~100 entries per call; keep reading to the end.
+    return new Promise((resolve, reject) => {
+      const all = [];
+      const next = () => reader.readEntries((batch) => {
+        if (!batch.length) return resolve(all);
+        all.push(...batch); next();
+      }, reject);
+      next();
+    });
+  }
+  async function filesFromEntries(entries) {
+    const out = [];
+    async function walk(entry, prefix) {
+      if (entry.isFile) {
+        const file = await new Promise((res, rej) => entry.file(res, rej));
+        out.push({ path: prefix + file.name, file });
+      } else if (entry.isDirectory) {
+        for (const child of await readAllEntries(entry.createReader())) {
+          await walk(child, prefix + entry.name + "/");
+        }
+      }
+    }
+    for (const entry of entries) await walk(entry, "");
+    return out;
+  }
 
-    const firstEntry = dt && dt.items && dt.items[0] && dt.items[0].webkitGetAsEntry && dt.items[0].webkitGetAsEntry();
-    if (files.length === 1 && !(firstEntry && firstEntry.isDirectory)) {
+  // Zips {path, file} members (synchronous; no Web Worker). Paths keep folder
+  // structure, and same-named members are kept rather than overwritten.
+  async function zipAndLoad(list, baseName) {
+    showToast("Zipping folder/files…");
+    const totalSize = list.reduce((n, m) => n + m.file.size, 0);
+    if (totalSize >= 256 * 1024 * 1024) {
+      showToast("Zipping holds every file in memory — large folders may fail. "
+                + "Zip it yourself and drop the .zip to stream it instead.", 7000, true);
+    }
+    const fileMap = {};
+    let zipped;
+    try {
+      for (const m of list) {
+        let key = m.path, n = 2;
+        while (Object.prototype.hasOwnProperty.call(fileMap, key)) {
+          key = m.path.replace(/(\.[^./]*)?$/, " (" + n++ + ")$1");
+        }
+        fileMap[key] = new Uint8Array(await m.file.arrayBuffer());
+      }
+      zipped = fflate.zipSync(fileMap);
+    } catch (err) {
+      return showToast("Failed to zip: " + err.message, 4000, true);
+    }
+    const name = (baseName || "archive") + ".zip";
+    setActiveFile(name, zipped);
+    showToast("Zipped " + list.length + " file(s) → " + name);
+  }
+
+  async function loadFiles(files) {
+    // Single files stream and are not size-limited by memory. Zipping several
+    // still buffers every member, so zipAndLoad warns on that path.
+    if (files.length === 1) {
       const file = files[0];
       if (file.name === "identity.age") {
         const choice = await alertModal(
@@ -1223,23 +1342,7 @@
       }
       setActiveBlob(file.name, file);
     } else {
-      // Multiple files or a folder — zip first (synchronous; no Web Worker).
-      showToast("Zipping folder/files…");
-      if (totalSize >= 256 * 1024 * 1024) {
-        showToast("Zipping holds every file in memory — large folders may fail. "
-                  + "Zip it yourself and drop the .zip to stream it instead.", 7000, true);
-      }
-      const fileMap = {};
-      for (const file of files) fileMap[file.name] = new Uint8Array(await file.arrayBuffer());
-      let zipped;
-      try {
-        zipped = fflate.zipSync(fileMap);
-      } catch (err) {
-        return showToast("Failed to zip: " + err.message, 4000, true);
-      }
-      const name = (files[0].name || "archive") + ".zip";
-      setActiveFile(name, zipped);
-      showToast("Zipped " + files.length + " file(s) → " + name);
+      await zipAndLoad(files.map((f) => ({ path: f.name, file: f })), files[0].name);
     }
   }
 
@@ -1247,7 +1350,7 @@
   $("btn-open-file").addEventListener("click", () => $("file-input").click());
   $("file-input").addEventListener("change", async (e) => {
     const files = Array.prototype.slice.call(e.target.files);
-    if (files.length) await loadFiles(files, null);
+    if (files.length) await loadFiles(files);
     e.target.value = "";
   });
 
@@ -1487,8 +1590,8 @@
 
   // ── Encrypt ─────────────────────────────────────────────────────────────--
   $("btn-encrypt").addEventListener("click", async () => {
-    const text = $("editor").value.trim();
-    if (!text && !hasActivePayload()) return showToast("Type a message or drop a file first.");
+    const text = $("editor").value;   // encrypted verbatim; whitespace is part of the message
+    if (!text.trim() && !hasActivePayload()) return showToast("Type a message or drop a file first.");
 
     // Build recipient picker.
     const listEl = $("recip-list");
@@ -1779,6 +1882,11 @@
     const p = $("pass-input").value;
     if (!p) return showToast("Passphrase cannot be empty.");
     if (!$("pass-confirm-group").classList.contains("hidden")) {
+      // Creating a key: the passphrase is all that protects identity.age once
+      // it is exported or backed up, so refuse trivially guessable ones.
+      if (p.length < MIN_PASSPHRASE_LEN) {
+        return showToast("Use at least " + MIN_PASSPHRASE_LEN + " characters — a few random words works well.", 4000, true);
+      }
       if (p !== $("pass-confirm").value) return showToast("Passphrases don't match.");
     }
     if (!$("pass-remember-row").classList.contains("hidden")) {
@@ -1794,8 +1902,14 @@
   $("pass-input").addEventListener("keydown", (e) => { if (e.key === "Enter") $("pass-submit").click(); });
   $("pass-confirm").addEventListener("keydown", (e) => { if (e.key === "Enter") $("pass-submit").click(); });
 
+  // Resolver of the alert dialog currently shown, so dismissing it with Escape
+  // or a backdrop click settles its Promise (with null) instead of leaving the
+  // caller awaiting forever.
+  let alertResolve = null;
   function alertModal(title, sub, extraHtml, buttons) {
+    if (alertResolve) { const prev = alertResolve; alertResolve = null; prev(null); }
     return new Promise((res) => {
+      alertResolve = res;
       $("alert-title").textContent = title;
       $("alert-sub").textContent   = sub;
       $("alert-extra").innerHTML   = extraHtml || "";
@@ -1805,27 +1919,36 @@
         const btn = document.createElement("button");
         btn.className = b.danger ? "btn btn-danger" : b.primary ? "btn btn-primary" : "btn";
         btn.textContent = b.label;
-        btn.addEventListener("click", () => { closeBackdrop("modal-alert"); res(b.val); });
+        btn.addEventListener("click", () => {
+          closeBackdrop("modal-alert");
+          if (alertResolve === res) alertResolve = null;
+          res(b.val);
+        });
         container.appendChild(btn);
       });
       openBackdrop("modal-alert");
     });
   }
 
-  // Close modals on backdrop click.
+  // Dismissing a modal (backdrop click / Escape) settles whatever is waiting on
+  // it. The progress dialog is not simply hidden -- that left the job running
+  // invisibly -- dismissing it requests cancellation instead.
+  function dismissBackdrop(bd) {
+    if (bd.id === "modal-progress") { if (activeProgress) activeProgress.cancel(); return; }
+    bd.classList.remove("open");
+    if (bd.id === "modal-alert") {
+      if (alertResolve) { const r = alertResolve; alertResolve = null; r(null); }
+      return;
+    }
+    if (pendingResolve) { pendingResolve(null); pendingResolve = null; }
+  }
   document.querySelectorAll(".backdrop").forEach((bd) => {
-    bd.addEventListener("click", (e) => {
-      if (e.target === bd) {
-        bd.classList.remove("open");
-        if (pendingResolve) { pendingResolve(null); pendingResolve = null; }
-      }
-    });
+    bd.addEventListener("click", (e) => { if (e.target === bd) dismissBackdrop(bd); });
   });
-  // Escape closes any open modal.
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
     const open = document.querySelector(".backdrop.open");
-    if (open) { open.classList.remove("open"); if (pendingResolve) { pendingResolve(null); pendingResolve = null; } }
+    if (open) dismissBackdrop(open);
   });
 
   // ── Session-lock wiring + activity listeners ─────────────────────────────

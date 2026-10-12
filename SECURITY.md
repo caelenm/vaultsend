@@ -1,4 +1,4 @@
-# VaultSend — security notes (v1.2.0)
+# VaultSend — security notes (v1.3.0)
 
 ## Session key lifetime (hardened in 1.2.0)
 
@@ -17,6 +17,13 @@ session with no lock. It is now managed by a `keyVault` that:
 - exposes **Menu → Lock session now**, and a status pill in the top bar
   (No key / Locked / Unlocked).
 
+Importing or generating an identity always wipes the previously held key first,
+and replacing an existing identity asks for confirmation (with an option to
+export the current one). Each unlock re-derives your public key from the private
+key and repairs the stored `vs_pubkey` if another page on the same origin has
+changed it. New keys need a passphrase of at least 10 characters, because the
+passphrase is all that protects an exported `identity.age`.
+
 Honest limits: JavaScript strings are immutable and cannot be reliably zeroed, so
 a transient plaintext copy still exists during each crypto call and lingers until
 garbage collection. None of this defends against script already executing in the
@@ -28,7 +35,7 @@ and `HIDDEN_LOCK_MS` near the top of the app script.
 
 See `PROVENANCE.md`. The crypto bundle is a byte-for-byte reproducible build of
 pinned upstream `age` releases; verify in-browser (Menu → Verify integrity / Run
-crypto self-test) or with `bash verify.sh VaultSend_offline.html`.
+crypto self-test) or with `bash verify.sh index.html`.
 
 ## “This was not encrypted to you” — diagnosis
 

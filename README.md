@@ -1,7 +1,7 @@
 # VaultSend
 
 A single-file, fully offline encryption tool for the [`age`](https://age-encryption.org)
-format. Open `VaultSend_offline.html` in any modern browser and encrypt text or
+format. Open `index.html` in any modern browser and encrypt text or
 files to anyone whose public key you have — no install, no accounts, no servers,
 no network requests at all.
 
@@ -9,7 +9,7 @@ VaultSend is interoperable with the `age` and [`rage`](https://github.com/str4d/
 command-line tools and the desktop app: anything you encrypt here can be
 decrypted there, and vice versa.
 
-> **Status:** v1.2.0 · self-contained web build · MIT-licensed dependencies
+> **Status:** v1.3.0 · self-contained web build · MIT-licensed dependencies
 
 ---
 
@@ -50,14 +50,22 @@ You can literally save the file, unplug from the network, and it still works.
 The page ships a strict Content-Security-Policy:
 
 ```
-default-src 'none'; script-src 'self' 'sha256-…' 'sha256-…';
+default-src 'none'; script-src 'sha256-…' 'sha256-…';
 style-src 'self' 'unsafe-inline'; img-src 'self' data:;
-base-uri 'none'; form-action 'none'; frame-ancestors 'none'
+base-uri 'none'; form-action 'none'
 ```
 
 `default-src 'none'` means `connect-src` is also `none`: **the page cannot make a
 network request** — no `fetch`, `XMLHttpRequest`, `WebSocket`, or beacon will
-load. There is no `unsafe-inline` and no `unsafe-eval` for scripts.
+load. Scripts are allowed only by hash: there is no `'self'`, no `unsafe-inline`
+and no `unsafe-eval`.
+
+Browsers ignore `frame-ancestors` in a `<meta>` policy, so the file cannot stop
+another site from framing it. If you host a copy, send
+`Content-Security-Policy: frame-ancestors 'none'` as an HTTP response header.
+
+After editing either inline script, re-pin its hash with `python3 update-csp.py`
+(`--check` only reports whether the pins are current).
 
 ### Pinned, auditable code
 
@@ -115,7 +123,7 @@ build** of pinned upstream releases, and you can confirm that three ways.
 With Node.js, npm, and Python 3 installed:
 
 ```sh
-bash verify.sh VaultSend_offline.html
+bash verify.sh index.html
 ```
 
 It extracts the embedded bundle, rebuilds it from the pinned sources, and compares
@@ -171,7 +179,7 @@ what is and isn't proven by a reproducible build.
 
 ## Usage
 
-1. **Open** `VaultSend_offline.html` in a browser.
+1. **Open** `index.html` in a browser.
 2. **Create your key** and set a strong passphrase. Copy your public key
    (`age1…`) to share it.
 3. **Add contacts** — paste the public keys others share with you.
@@ -192,8 +200,10 @@ what is and isn't proven by a reproducible build.
 
 | File | Purpose |
 |------|---------|
-| `VaultSend_offline.html` | The application — open this. |
+| `index.html` | The application — open this. |
 | `verify.sh`              | Reproducible-build verifier. |
+| `update-csp.py`          | Re-pins the CSP script hashes after an edit. |
+| `LICENSE`                | GPL-3.0 license text. |
 | `PROVENANCE.md`          | Pinned versions and what reproducibility proves. |
 | `SECURITY.md`            | Session-lock model and operational notes. |
 | `README.md`              | This file. |

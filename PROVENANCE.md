@@ -1,6 +1,6 @@
 # VaultSend — crypto bundle provenance
 
-The only third-party code in `VaultSend_offline.html` is a single inline
+The only third-party code in `index.html` is a single inline
 `<script id="vs-bundle">` IIFE: a tree-shaken bundle of the `age` encryption
 stack. This document records how to prove that those exact bytes were built from
 genuine, pinned upstream sources — and the result of doing so.
@@ -14,7 +14,7 @@ genuine, pinned upstream sources — and the result of doing so.
 | @noble/curves      | 1.9.7   | P. Miller     | MIT |
 | @noble/hashes      | 1.8.0   | P. Miller     | MIT |
 | @scure/base        | 1.2.6   | P. Miller     | MIT |
-| fflate             | 0.8.2   | A. Gao        | MIT |
+| fflate             | 0.8.2   | A. Barrett    | MIT |
 | esbuild (builder)  | 0.28.1  | —             | MIT |
 
 Bundle integrity is also enforced at runtime by the page's Content-Security-
@@ -30,7 +30,7 @@ script whose hash is not pinned.
 From the folder containing the HTML file and `verify.sh`:
 
 ```sh
-bash verify.sh VaultSend_offline.html
+bash verify.sh index.html
 ```
 
 This extracts the embedded bundle, rebuilds it from the pinned upstream versions
