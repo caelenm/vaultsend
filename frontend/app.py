@@ -12,6 +12,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 import gi
@@ -99,6 +100,26 @@ def run_backend(args, *, input_bytes=None, passphrase=None) -> bytes:
         msg = proc.stderr.decode("utf-8", "replace").strip()
         raise BackendError(msg.removeprefix("error: ") or "the operation failed")
     return proc.stdout
+
+
+def run_backend_async(args, on_done, *, input_bytes=None, passphrase=None):
+    """run_backend() without blocking the UI.
+
+    Used for the calls that can take long enough to freeze the window: every
+    passphrase operation (scrypt at logN 18 is ~256 MiB and up to a second or
+    more) and text encryption of a large paste. A worker thread waits on the
+    backend; the result is handed back through GLib.idle_add, so on_done runs
+    on the GTK main loop as on_done(stdout, None) or on_done(None, BackendError)
+    and the worker itself never touches GTK."""
+
+    def work():
+        try:
+            out, err = run_backend(args, input_bytes=input_bytes, passphrase=passphrase), None
+        except BackendError as e:
+            out, err = None, e
+        GLib.idle_add(lambda: on_done(out, err) or False)
+
+    threading.Thread(target=work, daemon=True).start()
 
 
 def spawn_backend(args, *, passphrase=None):
@@ -417,6 +438,7 @@ class Window(Adw.ApplicationWindow):
         self.my_pubkey = None
         self.contacts = load_contacts()
         self.current_op = None  # in-flight FileOperation, if any
+        self.busy = False  # a key or text backend call is running
         self._load_css()
 
         self.split = Adw.OverlaySplitView(sidebar_width_fraction=0.25)
@@ -637,7 +659,9 @@ class Window(Adw.ApplicationWindow):
         open_btn = Gtk.Button()
         open_btn.set_child(Adw.ButtonContent(icon_name="document-open-symbolic", label="Open file…"))
         open_btn.connect("clicked", lambda *_: self.open_file_dialog())
-        for w in (enc, dec, spacer, open_btn):
+        self.enc_btn, self.dec_btn = enc, dec
+        self.spinner = Gtk.Spinner(visible=False)
+        for w in (enc, dec, self.spinner, spacer, open_btn):
             actions.append(w)
         col.append(actions)
         return view
@@ -659,6 +683,31 @@ class Window(Adw.ApplicationWindow):
         self.get_clipboard().set(text)
         self.toast(note)
 
+    def _set_busy(self, busy):
+        """Show a key or text operation as running. Encrypt/Decrypt are disabled
+        and the text is read-only meanwhile, because the result replaces the
+        text and would otherwise overwrite anything typed in the interim."""
+        self.busy = busy
+        self.enc_btn.set_sensitive(not busy)
+        self.dec_btn.set_sensitive(not busy)
+        self.textview.set_editable(not busy)
+        self.spinner.set_visible(busy)
+        self.spinner.set_spinning(busy)
+
+    def run_busy(self, args, on_ok, *, input_bytes=None, passphrase=None):
+        """Run a backend call off the main loop with the busy state shown.
+        on_ok(stdout) runs on success; a failure is reported as a toast."""
+        self._set_busy(True)
+
+        def done(out, err):
+            self._set_busy(False)
+            if err is not None:
+                self.error(str(err))
+            else:
+                on_ok(out)
+
+        run_backend_async(args, done, input_bytes=input_bytes, passphrase=passphrase)
+
     def get_text(self):
         start, end = self.buffer.get_bounds()
         return self.buffer.get_text(start, end, False)
@@ -668,6 +717,10 @@ class Window(Adw.ApplicationWindow):
 
     # -- Identity / first run -------------------------------------------------
     def ensure_identity(self):
+        # A keygen or recover-pubkey may still be running from an earlier
+        # activation; let it finish rather than prompting a second time.
+        if self.busy:
+            return
         # Ask the backend what state we're in (no passphrase needed):
         #   ready  -> pubkey cache present, just read it
         #   locked -> identity.age exists but pubkey was lost; rebuild it (needs pass)
@@ -704,11 +757,11 @@ class Window(Adw.ApplicationWindow):
         )
 
     def _do_keygen(self, passphrase):
-        try:
-            self.my_pubkey = run_backend(["keygen"], passphrase=passphrase).decode("utf-8").strip()
-            self.toast("Your key is ready.")
-        except BackendError as e:
-            self.error(str(e))
+        self.run_busy(["keygen"], self._key_ready, passphrase=passphrase)
+
+    def _key_ready(self, out):
+        self.my_pubkey = out.decode("utf-8").strip()
+        self.toast("Your key is ready.")
 
     def recover_identity(self):
         # identity.age exists but its public key cache was lost. Rebuild the
@@ -722,11 +775,7 @@ class Window(Adw.ApplicationWindow):
         )
 
     def _do_recover(self, passphrase):
-        try:
-            self.my_pubkey = run_backend(["recover-pubkey"], passphrase=passphrase).decode("utf-8").strip()
-            self.toast("Your key is ready.")
-        except BackendError as e:
-            self.error(str(e))
+        self.run_busy(["recover-pubkey"], self._key_ready, passphrase=passphrase)
 
     def corrupt_identity(self):
         # identity.age exists but is empty/unreadable: there is no key in it to
@@ -872,12 +921,12 @@ class Window(Adw.ApplicationWindow):
         args = ["encrypt", "--armor"]
         for r in recips:
             args += ["-r", r]
-        try:
-            out = run_backend(args, input_bytes=text.encode("utf-8"))
+
+        def ok(out):
             self.set_text(out.decode("utf-8"))
             self.toast("Encrypted. Copy the text below and send it.")
-        except BackendError as e:
-            self.error(str(e))
+
+        self.run_busy(args, ok, input_bytes=text.encode("utf-8"))
 
     def decrypt_text(self):
         text = self.get_text().strip()
@@ -887,12 +936,11 @@ class Window(Adw.ApplicationWindow):
         self.ask_passphrase(lambda p: self._decrypt_text(text, p))
 
     def _decrypt_text(self, text, passphrase):
-        try:
-            out = run_backend(["decrypt"], input_bytes=text.encode("utf-8"), passphrase=passphrase)
+        def ok(out):
             self.set_text(out.decode("utf-8", "replace"))
             self.toast("Decrypted.")
-        except BackendError as e:
-            self.error(str(e))
+
+        self.run_busy(["decrypt"], ok, input_bytes=text.encode("utf-8"), passphrase=passphrase)
 
     # -- Dialogs --------------------------------------------------------------
     def pick_recipients(self, on_ok):
