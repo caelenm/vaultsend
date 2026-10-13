@@ -13,6 +13,3 @@ app/src/main/jniLibs/
 
 # Rust
 rust/target/
-vaultsend/gradle/
-.idea/
-gradle/

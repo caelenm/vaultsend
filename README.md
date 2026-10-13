@@ -53,8 +53,9 @@ vaultsend-android/
 
 ## Building
 
-The simplest path is **Android Studio** (it provides the SDK, the Gradle wrapper,
-and a one-click NDK install). You also need a Rust toolchain to compile the core.
+The simplest path is **Android Studio** (it provides the SDK and a one-click NDK
+install). The Gradle wrapper is checked in and pins Gradle 8.13 by version and
+SHA-256, so `./gradlew` works on a fresh clone with no system Gradle. You also need a Rust toolchain to compile the core.
 
 ### One-time setup
 
@@ -81,10 +82,6 @@ build invokes `build-rust.sh` automatically (see the `buildRust` task in
 From the command line:
 
 ```sh
-# If you don't have the Gradle wrapper jar yet (it isn't checked in), generate it:
-gradle wrapper --gradle-version 8.9        # needs a system Gradle once; or let
-                                           # Android Studio create it for you.
-
 # Debug build:
 ./gradlew assembleDebug
 # Release (minified, shrunk) universal APK:
@@ -212,12 +209,14 @@ the new **unlock/lock/session-decrypt** flow, and **importing** an identity in t
 desktop format (wrong-passphrase and garbage-input rejection included) — and all
 **fourteen** JNI symbols are confirmed exported from the built `.so` (the eight
 original ones plus `unlock`, `lock`, `isUnlocked`, `importIdentity`,
-`decryptBytesSession`, and `decryptFdSession`). The Kotlin/Gradle half was written
-against stable Compose/AGP APIs but **not** compiled in the environment it was
-authored in (no Android SDK/NDK there); build it as above and it will pull its
-dependencies and assemble. Version numbers in the Gradle files are pinned to a
-known-consistent set — Android Studio may offer newer ones, which you can accept
-(bump AGP, Kotlin, and the Compose plugin together).
+`decryptBytesSession`, and `decryptFdSession`). The Kotlin/Gradle half is compiled
+by CI (`.github/workflows/android.yml`): every push to and pull request against the
+`android` branch runs `cargo test`, cross-compiles the core for all four ABIs, and
+runs `./gradlew assembleDebug`. Version numbers in the Gradle files are pinned to a
+known-consistent set (AGP 8.9, Kotlin 2.1.10, Gradle 8.13) — Android Studio may
+offer newer ones, which you can accept (bump AGP, Kotlin, and the Compose plugin
+together, and regenerate the wrapper with `./gradlew wrapper --gradle-version <v>
+--gradle-distribution-sha256-sum <sha>`).
 
 ## Acknowledgements 
 
