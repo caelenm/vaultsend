@@ -1,5 +1,16 @@
 # What changed in this build
 
+## Build
+
+- **Gradle wrapper committed:** `gradle/wrapper/` (jar and properties) is now in
+  the repo, pinning Gradle 8.13 by version and SHA-256, so `./gradlew` works on a
+  fresh clone. It was previously excluded by `.gitignore`. The committed `gradlew`
+  script, which had a broken `printf` line, is regenerated.
+- **Supported toolchain:** AGP 8.2.2 was only tested up to API 34 and warned with
+  `compileSdk = 35`. Now AGP 8.9.0 with Kotlin (and the Compose compiler plugin)
+  2.1.10.
+- **CI** builds with `./gradlew` instead of a separately pinned Gradle.
+
 ## Audit fixes (v0.1.2)
 
 - **Portable identity:** new keys use a fixed scrypt work factor of 2^18 instead

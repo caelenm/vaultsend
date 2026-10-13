@@ -35,14 +35,13 @@ jobs:
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 3.5.4 --locked
 
-      # The Gradle wrapper jar isn't committed (see README), so use a pinned Gradle.
+      # Caches Gradle and validates the committed wrapper jar against Gradle's
+      # published checksums; the wrapper pins the Gradle version and its hash.
       - uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: "8.9"
 
       # cargo-ndk finds the NDK through ANDROID_NDK_ROOT, which the runner sets.
       - name: Assemble debug APK (runs build-rust.sh via preBuild)
-        run: gradle assembleDebug --stacktrace
+        run: ./gradlew assembleDebug --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
