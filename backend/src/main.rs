@@ -1,11 +1,16 @@
 // VaultSend backend — the only component that ever touches the private key.
 //
 // It is a small, stateless command-line tool. The Python UI runs it once per
-// operation. All cryptography is delegated to the `age` crate (str4d/rage); this
-// file contains no custom crypto, only plumbing.
+// operation. All encryption is delegated to the `age` crate (str4d/rage). The
+// only other cryptographic call is one HKDF (RustCrypto `hkdf`) that mixes
+// optional user entropy into a new key at keygen; this file implements no
+// primitives, only plumbing.
 //
 // Commands:
-//   keygen  --pass-fd N           Create the identity (first run). Print public key.
+//   keygen  --pass-fd N [--entropy-fd M]
+//                                 Create the identity (first run). Print public key.
+//                                 M, if given, carries exactly 64 bytes of user
+//                                 entropy (the scribble digest) mixed into the key.
 //   pubkey                        Print this device's public key. (no secret needed)
 //   status                        Print ready|locked|empty|corrupt. (no secret needed)
 //   recover-pubkey --pass-fd N    Rebuild the public key cache from identity.age.
@@ -13,7 +18,8 @@
 //   decrypt --pass-fd N [--in P] [--out P]
 //
 // Secrets never travel on argv (which is world-readable via /proc). The identity
-// passphrase is read from a file descriptor handed over by the parent process.
+// passphrase, and keygen's optional user entropy, are read from file descriptors
+// handed over by the parent process.
 // File data flows over stdin/stdout (in-memory pipes) so plaintext need not touch
 // disk; an explicit --in / --out path may be used instead.
 //
@@ -34,6 +40,10 @@ use std::process::ExitCode;
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::{ExposeSecret, SecretString};
 use age::x25519;
+use bech32::{ToBase32, Variant};
+use hkdf::Hkdf;
+use rand_core::{OsRng, RngCore};
+use sha2::Sha256;
 use zeroize::Zeroizing;
 
 type R<T> = Result<T, String>;
@@ -156,6 +166,32 @@ fn read_passphrase(fd: i32) -> R<SecretString> {
     Ok(SecretString::from(pass.to_owned()))
 }
 
+/// Length of keygen's optional user entropy: the frontend's scribble digest.
+const USER_ENTROPY_LEN: usize = 64;
+
+/// Read exactly USER_ENTROPY_LEN bytes of user entropy from `fd`, with the same
+/// ownership rules as read_passphrase. Too few or too many bytes is an error, so
+/// a truncated or partial scribble can never become a key.
+fn read_entropy(fd: i32) -> R<Zeroizing<[u8; USER_ENTROPY_LEN]>> {
+    if fd < 3 {
+        return Err("--entropy-fd must refer to a dedicated pipe (fd >= 3)".into());
+    }
+    // SAFETY: as in read_passphrase — a readable pipe end we now own and close.
+    let mut f = unsafe { File::from_raw_fd(fd) };
+    let mut buf = Zeroizing::new([0u8; USER_ENTROPY_LEN]);
+    f.read_exact(&mut buf[..]).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => {
+            format!("entropy must be exactly {USER_ENTROPY_LEN} bytes (got fewer)")
+        }
+        _ => format!("reading entropy: {e}"),
+    })?;
+    match f.read(&mut [0u8; 1]) {
+        Ok(0) => Ok(buf),
+        Ok(_) => Err(format!("entropy must be exactly {USER_ENTROPY_LEN} bytes (got more)")),
+        Err(e) => Err(format!("reading entropy: {e}")),
+    }
+}
+
 /// Create a brand-new file private to the user (0600), refusing to follow or
 /// reuse anything already at the path (O_CREAT|O_EXCL). A stale file from an
 /// interrupted run is removed and recreated, so we never write through a
@@ -202,6 +238,80 @@ fn input_reader(path: Option<&str>) -> R<Box<dyn Read>> {
 }
 
 // ---------------------------------------------------------------------------
+// Key generation, with optional user entropy (the "scribble").
+// ---------------------------------------------------------------------------
+// By default a new secret key is age's own x25519::Identity::generate(): 32
+// bytes straight from the OS RNG. If the user opted in at first run, the
+// frontend also hands over a 64-byte digest of their pointer scribble, and the
+// key becomes
+//
+//     HKDF-SHA256(salt = "vaultsend/keygen/v1",
+//                 ikm  = 32 bytes of OS randomness || 64-byte scribble digest,
+//                 info = "age X25519 secret key")
+//
+// Why hash the two together rather than XOR them: XOR needs equal-length inputs
+// and only gives a uniformly random key when one input already is one. If the
+// OS RNG were weak, XOR with a scribble (human input of unknown quality) would
+// still leave a skewed key. HKDF extracts from the whole concatenation, so the
+// key is uniformly distributed and at least as hard to predict as the stronger
+// of the two inputs. A healthy OS RNG keeps the key strong however poor
+// the scribble, and a good scribble keeps it strong if the OS RNG is weak or
+// compromised. Any 32 bytes are a valid X25519 secret (clamping happens inside
+// x25519-dalek at use), so the HKDF output is used as-is.
+//
+// The scribble is not a second factor. It is used once, here, and discarded,
+// and never has to be reproduced: the resulting key is stored in identity.age
+// and unlocked with the passphrase exactly like any other.
+const KEYGEN_HKDF_SALT: &[u8] = b"vaultsend/keygen/v1";
+const KEYGEN_HKDF_INFO: &[u8] = b"age X25519 secret key";
+/// Bech32 HRP of an age secret key, as used by x25519::Identity::to_string.
+const AGE_SECRET_KEY_HRP: &str = "age-secret-key-";
+
+fn derive_secret(os: &[u8; 32], user: &[u8; USER_ENTROPY_LEN]) -> Zeroizing<[u8; 32]> {
+    let mut ikm = Zeroizing::new([0u8; 32 + USER_ENTROPY_LEN]);
+    ikm[..32].copy_from_slice(os);
+    ikm[32..].copy_from_slice(user);
+    // (hkdf keeps its intermediate PRK on the stack without zeroizing it; like
+    // age's own internal HKDF use, that is covered by harden_process.)
+    let hk = Hkdf::<Sha256>::new(Some(KEYGEN_HKDF_SALT), &ikm[..]);
+    let mut okm = Zeroizing::new([0u8; 32]);
+    hk.expand(KEYGEN_HKDF_INFO, &mut okm[..])
+        .expect("32 bytes is a valid HKDF-SHA256 output length");
+    okm
+}
+
+/// Turn 32 raw secret-key bytes into an age identity. age 0.11 has no
+/// constructor from bytes, so this produces the identity's own text form exactly
+/// as x25519::Identity::to_string does (Bech32, uppercased) and parses it.
+fn identity_from_secret(secret: &[u8; 32]) -> R<x25519::Identity> {
+    // Encode into one pre-sized zeroizing buffer, so no reallocation leaves a
+    // copy of the key text behind. (The intermediate base32 digits are not
+    // wiped: bech32's u5 has no Zeroize, the same limitation age's to_string has.)
+    let mut encoded = Zeroizing::new(String::with_capacity(128));
+    bech32::encode_to_fmt(&mut *encoded, AGE_SECRET_KEY_HRP, secret.to_base32(), Variant::Bech32)
+        .map_err(|e| format!("encoding new key: {e}"))?
+        .map_err(|e| format!("encoding new key: {e}"))?;
+    encoded.make_ascii_uppercase();
+    encoded
+        .parse::<x25519::Identity>()
+        .map_err(|e| format!("encoding new key: {e}"))
+}
+
+/// Generate a new identity: from the OS RNG alone when `user` is None (age's own
+/// generator, unchanged), otherwise from derive_secret(OS randomness, user).
+fn generate_identity(user: Option<&[u8; USER_ENTROPY_LEN]>) -> R<x25519::Identity> {
+    let Some(user) = user else {
+        return Ok(x25519::Identity::generate());
+    };
+    let mut os = Zeroizing::new([0u8; 32]);
+    OsRng
+        .try_fill_bytes(&mut os[..])
+        .map_err(|e| format!("reading OS randomness: {e}"))?;
+    let secret = derive_secret(&os, user);
+    identity_from_secret(&secret)
+}
+
+// ---------------------------------------------------------------------------
 // Commands.
 // ---------------------------------------------------------------------------
 /// True if identity.age exists and is a structurally valid age file (its header
@@ -217,7 +327,7 @@ fn identity_is_valid() -> bool {
     }
 }
 
-fn cmd_keygen(pass_fd: i32) -> R<()> {
+fn cmd_keygen(pass_fd: i32, entropy_fd: Option<i32>) -> R<()> {
     let dir = data_dir()?;
     fs::create_dir_all(&dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let _ = fs::set_permissions(&dir, fs::Permissions::from_mode(0o700));
@@ -228,9 +338,16 @@ fn cmd_keygen(pass_fd: i32) -> R<()> {
     if identity_is_valid() {
         return Err("an identity already exists; refusing to overwrite it".into());
     }
+    if entropy_fd == Some(pass_fd) {
+        return Err("--entropy-fd and --pass-fd must be different pipes".into());
+    }
+    // Read every input before any key material exists. A bad entropy pipe
+    // (wrong length, unreadable) fails here, with nothing written.
     let passphrase = read_passphrase(pass_fd)?;
+    let entropy = entropy_fd.map(read_entropy).transpose()?;
 
-    let identity = x25519::Identity::generate();
+    let identity = generate_identity(entropy.as_deref())?;
+    drop(entropy); // consumed once; wipe it now
     let public = identity.to_public().to_string(); // "age1..."
     let secret = identity.to_string();             // SecretString "AGE-SECRET-KEY-1..."
 
@@ -470,13 +587,25 @@ fn require_fd(args: &[String]) -> R<i32> {
         .parse::<i32>()
         .map_err(|_| "--pass-fd must be a number".into())
 }
+/// An optional fd flag. Present without a usable value is an error rather than
+/// "absent", so a malformed --entropy-fd can never silently mean "no entropy".
+fn optional_fd(args: &[String], name: &str) -> R<Option<i32>> {
+    if !has_flag(args, name) {
+        return Ok(None);
+    }
+    opt_value(args, name)
+        .ok_or_else(|| format!("{name} needs a value"))?
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|_| format!("{name} must be a number"))
+}
 
 fn run() -> R<()> {
     let args: Vec<String> = env::args().skip(1).collect();
     let cmd = args.first().map(String::as_str).unwrap_or("");
     let rest = if args.is_empty() { &[][..] } else { &args[1..] };
     match cmd {
-        "keygen" => cmd_keygen(require_fd(rest)?),
+        "keygen" => cmd_keygen(require_fd(rest)?, optional_fd(rest, "--entropy-fd")?),
         "pubkey" => cmd_pubkey(),
         "status" => cmd_status(),
         "recover-pubkey" => cmd_recover_pubkey(require_fd(rest)?),
@@ -505,5 +634,65 @@ fn main() -> ExitCode {
             eprintln!("error: {e}");
             ExitCode::FAILURE
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bech32::FromBase32;
+
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn derive_secret_known_answer() {
+        // Computed independently with Python's hmac/hashlib (RFC 5869 HKDF).
+        let os: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let user = [0xAB; USER_ENTROPY_LEN];
+        assert_eq!(
+            hex(&derive_secret(&os, &user)[..]),
+            "5288c681a97744dc9bf50730353ac4adf08fdd82e74aa5181e8771c108eca924"
+        );
+    }
+
+    #[test]
+    fn identity_text_round_trips_to_secret_bytes() {
+        let os: [u8; 32] = std::array::from_fn(|i| i as u8);
+        let secret = derive_secret(&os, &[0xAB; USER_ENTROPY_LEN]);
+        let identity = identity_from_secret(&secret).unwrap();
+        let text = identity.to_string();
+        let (hrp, data, variant) = bech32::decode(text.expose_secret()).unwrap();
+        assert_eq!(hrp, AGE_SECRET_KEY_HRP);
+        assert_eq!(variant, Variant::Bech32);
+        assert_eq!(Vec::<u8>::from_base32(&data).unwrap(), secret.to_vec());
+    }
+
+    #[test]
+    fn same_user_entropy_gives_different_keys() {
+        let user = [0x42; USER_ENTROPY_LEN];
+        let a = generate_identity(Some(&user)).unwrap();
+        let b = generate_identity(Some(&user)).unwrap();
+        assert_ne!(a.to_public().to_string(), b.to_public().to_string());
+    }
+
+    #[test]
+    fn derived_identity_works_with_age() {
+        let identity = generate_identity(Some(&[0x42; USER_ENTROPY_LEN])).unwrap();
+        let recipient = identity.to_public();
+        let encryptor =
+            age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+                .unwrap();
+        let mut ciphertext = Vec::new();
+        let mut w = encryptor.wrap_output(&mut ciphertext).unwrap();
+        w.write_all(b"hello").unwrap();
+        w.finish().unwrap();
+
+        let dec = age::Decryptor::new(&ciphertext[..]).unwrap();
+        let mut r = dec.decrypt(std::iter::once(&identity as &dyn age::Identity)).unwrap();
+        let mut plaintext = Vec::new();
+        r.read_to_end(&mut plaintext).unwrap();
+        assert_eq!(plaintext, b"hello");
     }
 }

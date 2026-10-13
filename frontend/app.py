@@ -12,6 +12,8 @@ import json
 import os
 import subprocess
 import sys
+import time
+from collections import deque
 from pathlib import Path
 
 import gi
@@ -26,6 +28,23 @@ if (Adw.get_major_version(), Adw.get_minor_version()) < (1, 5):
     sys.exit("VaultSend needs libadwaita 1.5 or newer.")
 if (Gtk.get_major_version(), Gtk.get_minor_version()) < (4, 10):
     sys.exit("VaultSend needs GTK 4.10 or newer.")
+
+# Drawing the scribble trail needs PyGObject's cairo support (python3-gi-cairo
+# on Debian/Ubuntu). Without it the scribble still works; the pad stays blank.
+try:
+    gi.require_foreign("cairo")
+    import cairo
+except ImportError:
+    cairo = None
+
+# The scribble meter ships beside this file. A build that copies only app.py
+# still starts; it just doesn't offer the optional scribble at key creation.
+try:
+    from entropy_meter import EntropyMeter
+except ImportError:
+    EntropyMeter = None
+    print("vaultsend: entropy_meter.py not found; the optional scribble at key "
+          "creation is unavailable", file=sys.stderr)
 
 APP_ID = "org.vaultsend.VaultSend"
 
@@ -65,24 +84,32 @@ def find_backend() -> str:
 BACKEND = find_backend()
 
 
-def run_backend(args, *, input_bytes=None, passphrase=None) -> bytes:
-    """Run the backend once. Passphrase (if any) is handed over on a private pipe,
-    never on the command line. Returns stdout; raises BackendError on failure."""
-    extra = {}
-    read_fd = None
-    if passphrase is not None:
-        read_fd, write_fd = os.pipe()
-        os.write(write_fd, passphrase.encode("utf-8"))
-        os.close(write_fd)
-        args = list(args) + ["--pass-fd", str(read_fd)]
-        extra["pass_fds"] = (read_fd,)
+def run_backend(args, *, input_bytes=None, passphrase=None, entropy=None) -> bytes:
+    """Run the backend once. The passphrase and keygen's optional scribble
+    entropy (if any) are each handed over on their own private pipe, never on the
+    command line. Returns stdout; raises BackendError on failure."""
+    args = list(args)
+    read_fds = []
     try:
+        for flag, secret in (
+            ("--pass-fd", None if passphrase is None else passphrase.encode("utf-8")),
+            ("--entropy-fd", entropy),
+        ):
+            if secret is None:
+                continue
+            read_fd, write_fd = os.pipe()
+            read_fds.append(read_fd)
+            try:
+                os.write(write_fd, secret)
+            finally:
+                os.close(write_fd)
+            args += [flag, str(read_fd)]
         proc = subprocess.run(
             [BACKEND, *args],
             input=input_bytes,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            **extra,
+            pass_fds=tuple(read_fds),
         )
     except FileNotFoundError:
         raise BackendError(
@@ -90,7 +117,7 @@ def run_backend(args, *, input_bytes=None, passphrase=None) -> bytes:
             "or set VAULTSEND_BACKEND."
         )
     finally:
-        if read_fd is not None:
+        for read_fd in read_fds:
             try:
                 os.close(read_fd)
             except OSError:
@@ -410,6 +437,152 @@ class FileOperation:
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
+class ScribbleDialog(Adw.Dialog):
+    """The optional scribble at key creation (see entropy_meter.py).
+
+    Opting in is a commitment: the key is made from the scribble only once the
+    meter says it is done, and the only other way out is an explicit, confirmed
+    "Use system randomness only". The dialog can't be dismissed any other way
+    (Escape included): nothing else in the UI leads back to keygen, so a
+    dismissed dialog would leave first run with no key. `on_done` is called
+    exactly once, with the 64-byte digest or None.
+
+    Pointer positions are kept only to draw the trail (the newest MAX_POINTS)
+    and are cleared on finish. Neither they nor the digest are ever logged.
+    """
+
+    MAX_POINTS = 4000
+
+    def __init__(self, on_done):
+        super().__init__(title="Add your own randomness", content_width=560, content_height=520)
+        self._on_done = on_done
+        self._meter = EntropyMeter()
+        self._points = deque(maxlen=self.MAX_POINTS)  # (x, y), or None for a gap
+        self._pressure = 0.0
+        self._finished = False
+        self.set_can_close(False)
+
+        self._pad = Gtk.DrawingArea(hexpand=True, vexpand=True, content_height=260)
+        self._pad.add_css_class("card")
+        # Bounds come from the draw function, and from "resize" too so the
+        # coverage gate still works where the trail can't be drawn (no cairo).
+        self._pad.connect("resize", lambda _a, w, h: self._meter.set_bounds(w, h))
+        if cairo is not None:
+            self._pad.set_draw_func(self._draw)
+        motion = Gtk.EventControllerMotion()
+        motion.connect("motion", self._on_motion)
+        motion.connect("leave", self._on_leave)
+        self._pad.add_controller(motion)
+        stylus = Gtk.GestureStylus()
+        stylus.connect("down", self._on_stylus)
+        stylus.connect("motion", self._on_stylus)
+        stylus.connect("up", self._on_stylus_up)
+        self._pad.add_controller(stylus)
+
+        self._bar = Gtk.ProgressBar(show_text=True, text="Keep scribbling…")
+        skip = Gtk.Button(label="Use system randomness only")
+        skip.connect("clicked", self._ask_skip)
+        self._create = Gtk.Button(label="Create key", sensitive=False)
+        self._create.add_css_class("suggested-action")
+        self._create.connect("clicked", lambda _b: self._finish(use_scribble=True))
+        buttons = Gtk.Box(spacing=12, homogeneous=True)
+        buttons.append(skip)
+        buttons.append(self._create)
+
+        box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=12,
+            margin_top=6, margin_bottom=18, margin_start=18, margin_end=18,
+        )
+        box.append(Gtk.Label(
+            label="Move your mouse or pen around the box: quick, unpredictable loops all over it.",
+            wrap=True, xalign=0,
+        ))
+        box.append(self._pad)
+        box.append(self._bar)
+        box.append(buttons)
+        view = Adw.ToolbarView(content=box)
+        view.add_top_bar(Adw.HeaderBar(show_start_title_buttons=False, show_end_title_buttons=False))
+        self.set_child(view)
+
+    # -- input ----------------------------------------------------------------
+    def _on_motion(self, _ctl, x, y):
+        if self._finished:
+            return
+        self._meter.add(x, y, time.perf_counter_ns(), self._pressure)
+        if not self._points or self._points[-1] != (x, y):
+            self._points.append((x, y))
+        self._pad.queue_draw()
+        self._update_progress()
+
+    def _on_leave(self, _ctl):
+        if self._points and self._points[-1] is not None:
+            self._points.append(None)  # don't join the trail across the gap
+
+    def _on_stylus(self, gesture, x, y):
+        ok, pressure = gesture.get_axis(Gdk.AxisUse.PRESSURE)
+        self._pressure = pressure if ok else 0.0
+        # A pen also produces ordinary motion events. Whichever arrives second
+        # repeats a position: hashed, but the meter credits it nothing.
+        self._on_motion(gesture, x, y)
+
+    def _on_stylus_up(self, _gesture, _x, _y):
+        self._pressure = 0.0
+
+    def _update_progress(self):
+        m = self._meter
+        if m.done:
+            self._bar.set_fraction(1.0)
+            self._bar.set_text("That's enough")
+            self._create.set_sensitive(True)
+            return
+        self._bar.set_fraction(min(m.credited_bits / m.TARGET_BITS, 0.99))
+        if m.credited_bits >= m.TARGET_BITS and not m.covered_enough:
+            self._bar.set_text("Now cover more of the box…")
+        else:
+            self._bar.set_text("Keep scribbling…")
+
+    def _draw(self, area, cr, width, height):
+        self._meter.set_bounds(width, height)
+        color = area.get_color()
+        cr.set_source_rgba(color.red, color.green, color.blue, 0.6)
+        cr.set_line_width(2.0)
+        cr.set_line_cap(cairo.LineCap.ROUND)
+        cr.set_line_join(cairo.LineJoin.ROUND)
+        pen_up = True
+        for point in self._points:
+            if point is None:
+                pen_up = True
+            elif pen_up:
+                cr.move_to(*point)
+                pen_up = False
+            else:
+                cr.line_to(*point)
+        cr.stroke()
+
+    # -- leaving ----------------------------------------------------------------
+    def _ask_skip(self, _btn):
+        dlg = Adw.AlertDialog(
+            heading="Create the key without your scribble?",
+            body="Your key will be made from this computer's randomness alone, "
+            "as it is when the scribble option is off.",
+        )
+        dlg.add_response("back", "Keep scribbling")
+        dlg.add_response("skip", "Use system randomness only")
+        dlg.set_default_response("back")
+        dlg.set_close_response("back")
+        dlg.connect("response", lambda _d, r: self._finish(use_scribble=False) if r == "skip" else None)
+        dlg.present(self)
+
+    def _finish(self, use_scribble):
+        if self._finished or (use_scribble and not self._meter.done):
+            return
+        entropy = self._meter.digest() if use_scribble else None
+        self._finished = True
+        self._points.clear()
+        self.force_close()
+        self._on_done(entropy)
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="VaultSend")
@@ -697,15 +870,26 @@ class Window(Adw.ApplicationWindow):
 
     def first_run(self):
         self.ask_passphrase(
-            self._do_keygen,
+            self._create_key,
             heading="Create your key",
             body="Pick a passphrase. It protects your private key and is required to decrypt.",
             confirm=True,
         )
 
-    def _do_keygen(self, passphrase):
+    def _create_key(self, passphrase, use_scribble):
+        if not use_scribble:
+            self._do_keygen(passphrase)
+            return
+        # Opted in: the key is made from a finished scribble, or from system
+        # randomness alone only if the user explicitly backs out. The dialog
+        # can't be dismissed any other way, so first run can't end with no key.
+        ScribbleDialog(lambda entropy: self._do_keygen(passphrase, entropy)).present(self)
+
+    def _do_keygen(self, passphrase, entropy=None):
         try:
-            self.my_pubkey = run_backend(["keygen"], passphrase=passphrase).decode("utf-8").strip()
+            self.my_pubkey = (
+                run_backend(["keygen"], passphrase=passphrase, entropy=entropy).decode("utf-8").strip()
+            )
             self.toast("Your key is ready.")
         except BackendError as e:
             self.error(str(e))
@@ -928,16 +1112,31 @@ class Window(Adw.ApplicationWindow):
         dlg.connect("response", resp)
         dlg.present(self)
 
-    def ask_passphrase(self, on_ok, heading="Unlock your key", body="Enter your passphrase.", confirm=False):
+    def ask_passphrase(
+        self, on_ok, heading="Unlock your key", body="Enter your passphrase.", confirm=False, scribble=False
+    ):
+        """Ask for a passphrase and call on_ok(passphrase). With confirm=True
+        (creating a key) it is asked twice, held to MIN_PASSPHRASE_LEN, and the
+        dialog offers the opt-in scribble: on_ok(passphrase, use_scribble)."""
         dlg = Adw.AlertDialog(heading=heading, body=body)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         entry = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
         box.append(entry)
         entry2 = None
+        scribble_check = None
         if confirm:
             entry2 = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
             box.append(Gtk.Label(label="Repeat passphrase", xalign=0))
             box.append(entry2)
+            if EntropyMeter is not None:
+                scribble_check = Gtk.CheckButton(
+                    label="Add my own randomness by scribbling (optional)", active=scribble, margin_top=6
+                )
+                scribble_check.set_tooltip_text(
+                    "Mixes your scribbling into the new key, so it stays secure even if "
+                    "this computer's random number generator is weak."
+                )
+                box.append(scribble_check)
         dlg.set_extra_child(box)
         dlg.add_response("cancel", "Cancel")
         dlg.add_response("ok", "Continue")
@@ -949,6 +1148,7 @@ class Window(Adw.ApplicationWindow):
             if r != "ok":
                 return
             p = entry.get_text()
+            use_scribble = scribble_check is not None and scribble_check.get_active()
             problem = None
             if not p:
                 problem = "Passphrase can't be empty."
@@ -962,9 +1162,14 @@ class Window(Adw.ApplicationWindow):
                 # UI leads back to this dialog, so returning left the app with
                 # no key until it was restarted.
                 if confirm:
-                    self.ask_passphrase(on_ok, heading=heading, body=body, confirm=confirm)
+                    self.ask_passphrase(
+                        on_ok, heading=heading, body=body, confirm=confirm, scribble=use_scribble
+                    )
                 return
-            on_ok(p)
+            if confirm:
+                on_ok(p, use_scribble)
+            else:
+                on_ok(p)
 
         dlg.connect("response", resp)
         dlg.present(self)

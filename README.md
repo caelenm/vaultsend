@@ -23,9 +23,12 @@ It is built so that one person can read the whole thing in an afternoon. There
 are two parts and a hard line between them:
 
 - **`backend/`** — a tiny Rust command-line tool. It is the **only** component
-  that ever touches your private key. All cryptography is delegated to the `age`
-  crate; the backend itself contains no hand-written crypto, just plumbing and
-  process hardening (~443 lines, one file).
+  that ever touches your private key. All encryption is delegated to the `age`
+  crate, and the backend implements no cryptographic primitives itself. Beyond
+  plumbing and process hardening, its one crypto call of its own is a single
+  HKDF, from the RustCrypto `hkdf` crate already in `age`'s dependency tree,
+  that mixes the optional scribble into a new key (~640 lines plus tests, one
+  file).
 - **`frontend/`** — a GTK 4 / libadwaita app in Python. It draws the window and
   keeps your contact list. It **never sees your private key** — when a passphrase
   is needed it hands it to the backend over a private pipe and forgets it.
@@ -42,6 +45,14 @@ encrypt and look up your own address without typing a passphrase. The passphrase
 is therefore only ever needed to **decrypt**. Encrypting to several recipients
 does not weaken anything: age encrypts the body once under a single random key
 and just wraps a copy of that key to each recipient separately.
+
+When creating the key you can optionally also scribble on a pad; the backend
+then derives the key as HKDF-SHA256(OS randomness ‖ scribble digest), so it
+stays strong even if the operating system's random number generator is weak or
+compromised. That isn't expected on a healthy modern Linux system, where
+`getrandom` blocks until it is seeded, which is why the step is off by default.
+The scribble is used once and thrown away: it is not a second factor, and the
+key is stored and unlocked exactly the same either way.
 
 ## ⚠️ Security warning
 
@@ -106,9 +117,14 @@ applies on Linux for now — see Platform support below.
 - **Contacts.** A simple, exportable JSON address book of names and public
   keys. Nothing in it is secret, so it's safe to back up or sync however you
   like.
+- **Optional scribble at key creation.** Tick *Add my own randomness by
+  scribbling* when you create your key, then scribble on a pad until the bar
+  fills; the scribble is mixed into the new key alongside the system's own
+  randomness. It's off by default, never needed again afterwards, and once
+  you've opted in, the only way back to system randomness alone is to choose it.
 - **No network code, no plugins, one identity per user.** VaultSend doesn't
-  fetch keys from anywhere or phone home. What you see in the two source files
-  is the entire app.
+  fetch keys from anywhere or phone home. What you see in the three source
+  files is the entire app.
 - **Plaintext touches disk only when you ask.** Decrypting writes a file to
   disk only if you choose **Open file… → Decrypt** with an output path;
   decrypting pasted text keeps the result in memory and on screen, never on
@@ -200,7 +216,7 @@ list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
 The backend is usable on its own and easy to audit in isolation:
 
 ```
-vaultsend-backend keygen  --pass-fd N
+vaultsend-backend keygen  --pass-fd N [--entropy-fd M]   # M: exactly 64 bytes
 vaultsend-backend pubkey
 vaultsend-backend status                      # ready | locked | empty | corrupt
 vaultsend-backend recover-pubkey --pass-fd N  # rebuild pubkey from identity.age
@@ -209,7 +225,9 @@ vaultsend-backend decrypt --pass-fd N [--in PATH] [--out PATH]
 ```
 
 Secrets are never passed as arguments (those are visible to other processes):
-the passphrase is read from the file descriptor named by `--pass-fd`. File data
+the passphrase is read from the file descriptor named by `--pass-fd`, and
+keygen's optional user entropy (the 64-byte scribble digest; any other length is
+refused) from `--entropy-fd`. File data
 flows over stdin/stdout unless `--in`/`--out` are given. With `--out`, output is
 written to `PATH.vaultsend-part` and renamed to `PATH` only once complete, so
 the destination is never a partial file (and `--out` may safely name the input).
@@ -262,13 +280,17 @@ key on first launch, exactly as you were the very first time.
 
 ## Where to look when auditing
 
-- `backend/src/main.rs` — the six `cmd_*` functions are the whole story;
-  `cmd_encrypt` / `cmd_decrypt` are the crypto paths. `harden_process()` (top of
+- `backend/src/main.rs` — the six `cmd_*` functions, plus `derive_secret` /
+  `generate_identity` (how `keygen` makes a key, with or without the scribble),
+  are the whole story; `cmd_encrypt` / `cmd_decrypt` are the crypto paths. `harden_process()` (top of
   the file) is the process-hardening described in the security warning above;
   `read_passphrase` and the `--out` paths of `cmd_encrypt` / `cmd_decrypt` are
   where secret material is held in memory and where staged writes happen.
 - `frontend/app.py` — `run_backend()` is the entire trust boundary: it shows
-  exactly what is sent to the backend and how the passphrase is passed.
+  exactly what is sent to the backend and how the passphrase (and, at keygen,
+  the scribble digest) is passed. `frontend/entropy_meter.py` decides when a
+  scribble is good enough; the frontend only ever holds the scribble's digest,
+  never the private key or the OS randomness it is mixed with.
 
 ## Platform support
 

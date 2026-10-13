@@ -10,14 +10,25 @@ name = "vaultsend-backend"
 path = "src/main.rs"
 
 [dependencies]
-# age (str4d/rage) — the only cryptographic dependency. `armor` enables ASCII
-# armoring for the copy/paste text path. We touch no crypto ourselves.
+# age (str4d/rage) — does all of the encryption. `armor` enables ASCII armoring
+# for the copy/paste text path. We implement no crypto primitives ourselves; the
+# only other cryptographic call is the one HKDF below (optional keygen entropy).
 age = { version = "0.11", features = ["armor"] }
 
 # Explicit zeroizing of intermediate secret buffers (passphrase, decrypted key
 # text). Already present transitively via `secrecy`; named here so we can use it
 # directly. Cargo unifies it with the locked version, so the lock is unchanged.
 zeroize = "1"
+
+# Optional scribble entropy at keygen (see derive_secret / generate_identity).
+# All four are already in the tree as dependencies of `age`; they are named here
+# at the locked versions so the key can be derived as HKDF-SHA256(OS randomness ||
+# scribble digest) and handed to age in its own Bech32 encoding. Cargo unifies
+# them with the locked versions, so the lock gains no new packages.
+hkdf = "0.12"
+sha2 = "0.10"
+bech32 = "0.9"
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 # --- Pins so the tree builds on Rust 1.75 (older releases of age's localization
 # --- sub-tree; age itself targets rustc 1.65). Recorded in Cargo.lock too. ---
