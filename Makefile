@@ -16,4 +16,4 @@ appimage: build
 
 clean:
 	cd backend && cargo clean
-	rm -f appimage/VaultSend-x86_64.AppImage appimage/appimagetool
+	rm -f appimage/VaultSend-x86_64.AppImage appimage/appimagetool appimage/runtime-x86_64

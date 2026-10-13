@@ -13,7 +13,7 @@
 ```sh
 curl https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install.sh | bash
 ```
-This will download the necessary build dependencies, compile the program, pack it into an appimage, and add it to your launcher.
+This will download the necessary build dependencies, compile the latest release, pack it into an appimage, and add it to your launcher. Re-run it to update. To build a different tag or branch instead, set `VAULTSEND_REF`, e.g. `... | VAULTSEND_REF=main bash`.
 
 # Description
 A small, auditable desktop app for encrypting files and text to people you
@@ -146,7 +146,7 @@ cd appimage
 bash build-appimage.sh
 ```
 
-This copies the freshly built backend binary and the current frontend source into `VaultSend.AppDir`, downloads `appimagetool` on first run if it isn't already cached, and packs everything into `VaultSend-x86_64.AppImage` in that directory. Re-run it any time after changing the backend or frontend, since it always refreshes the bundled copies before packing.
+This copies the freshly built backend binary and the current frontend source into `VaultSend.AppDir`, downloads `appimagetool` and the AppImage runtime on first run if they aren't already cached (both pinned to a release and checked against a SHA-256), and packs everything into `VaultSend-x86_64.AppImage` in that directory. Re-run it any time after changing the backend or frontend, since it always refreshes the bundled copies before packing.
 
 ## Run
 ```sh

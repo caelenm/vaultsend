@@ -13,7 +13,7 @@ appimage/
 │   ├── vaultsend.desktop
 │   └── vaultsend.png
 ├── README-APPIMAGE.md
-└── .gitignore              # ignores build/, appimagetool, *.AppImage
+└── .gitignore              # ignores build/, appimagetool, runtime-x86_64, *.AppImage
 
 build/VaultSend.AppDir/      # (generated, git-ignored) staged at build time
 ```
@@ -56,7 +56,7 @@ sudo pacman -S python-gobject gtk4 libadwaita
 ## Build it
 
 On a real Linux machine (this can't be done in a sandboxed/offline build
-environment — it needs to fetch `appimagetool`):
+environment — it needs to fetch `appimagetool` and the AppImage runtime):
 
 ```sh
 cd appimage
@@ -68,8 +68,11 @@ This will:
    when nothing changed, and it guarantees the bundled binary is current).
 2. Stage a fresh `build/VaultSend.AppDir` from the backend binary, the frontend
    source, and `AppDir.template/`.
-3. Download `appimagetool` (a pinned release, checked against its SHA-256) if
-   not already present (cached as `./appimagetool`).
+3. Download `appimagetool` and the AppImage type2 runtime if not already
+   present (cached as `./appimagetool` and `./runtime-x86_64`). Both are pinned
+   to a tagged release and checked against a SHA-256 in the script; a mismatch
+   aborts the build. The runtime is passed with `--runtime-file`, so
+   appimagetool never downloads its own unpinned copy.
 4. Produce `VaultSend-x86_64.AppImage` in this directory.
 
 You never need to edit anything inside `build/` — it is regenerated each run.

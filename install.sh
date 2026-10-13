@@ -5,6 +5,7 @@
 #   install / update :  curl -fsSL https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install.sh | bash
 #   uninstall        :  curl -fsSL .../install.sh | bash -s -- --uninstall
 #   from a checkout  :  sh install.sh            (SKIP_DEPS=1 to skip the package step)
+#   other version    :  ... | VAULTSEND_REF=main bash   (any tag or branch; default: latest release)
 #
 # Re-running this is the supported way to update. Any previously installed copy
 # is removed first, so a stale AppImage, symlink, launcher or icon can never be
@@ -58,7 +59,7 @@ MODE=install
 for a in "$@"; do
   case "$a" in
     --uninstall|--remove) MODE=uninstall ;;
-    -h|--help) sed -n '2,9p' "$0" 2>/dev/null || echo "usage: install.sh [--uninstall]"; exit 0 ;;
+    -h|--help) sed -n '2,10p' "$0" 2>/dev/null || echo "usage: install.sh [--uninstall]"; exit 0 ;;
     *) warn "ignoring unknown option: $a" ;;
   esac
 done
@@ -156,10 +157,31 @@ fi
 
 # ---------------------------------------------------------------------------
 # 2. Fetch source (git, else curl tarball).
+#
+#    Builds the latest published release, not the tip of main, so installing or
+#    updating ships a version that was actually released rather than whatever
+#    was pushed last. VAULTSEND_REF overrides this with any tag or branch.
 # ---------------------------------------------------------------------------
+REF="${VAULTSEND_REF:-}"
+if [ -z "$REF" ]; then
+  # GitHub's "latest release" redirect skips drafts and pre-releases; without
+  # curl, fall back to the highest v* tag.
+  if have curl; then
+    REF=$(curl -fsSLI -o /dev/null -w '%{url_effective}' "$REPO/releases/latest" | sed -n 's#.*/releases/tag/##p') || REF=""
+  elif have git; then
+    REF=$(git ls-remote --tags --refs --sort=-v:refname "$REPO" 'v*' | head -n1 | sed 's#.*refs/tags/##') || REF=""
+  fi
+  [ -n "$REF" ] || { warn "Could not look up the latest release; set VAULTSEND_REF=<tag> and re-run."; exit 1; }
+fi
+# REF ends up in a URL and on git's command line, so accept only ref-shaped names.
+case "$REF" in
+  -*|*..*|*[!A-Za-z0-9._/-]*) warn "Invalid VAULTSEND_REF: $REF"; exit 1 ;;
+esac
+say "Building VaultSend $REF"
+
 DIR=$(mktemp -d); trap 'rm -rf "$DIR"' EXIT
-if have git; then git clone --depth 1 "$REPO" "$DIR/src"
-else mkdir "$DIR/src"; curl -fsSL "$REPO/archive/refs/heads/main.tar.gz" | tar xz --strip-components=1 -C "$DIR/src"; fi
+if have git; then git -c advice.detachedHead=false clone --depth 1 --branch "$REF" "$REPO" "$DIR/src"
+else mkdir "$DIR/src"; curl -fsSL "$REPO/archive/$REF.tar.gz" | tar xz --strip-components=1 -C "$DIR/src"; fi
 
 # ---------------------------------------------------------------------------
 # 3. Build. Done BEFORE removing the installed copy, so a build failure leaves

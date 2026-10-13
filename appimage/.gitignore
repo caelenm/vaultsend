@@ -1,9 +1,11 @@
 # Disposable build staging — assembled fresh from sources on every run.
 /build/
 
-# Cached appimagetool download.
+# Cached, hash-pinned build tool downloads.
 /appimagetool
 /appimagetool.download
+/runtime-x86_64
+/runtime-x86_64.download
 
 # Built AppImage artifacts.
 *.AppImage

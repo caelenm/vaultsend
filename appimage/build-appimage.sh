@@ -13,8 +13,9 @@
 # way a committed copy inside the AppDir would. The only things tracked in this
 # folder are this script, the static template, and the docs.
 #
-# Run on a real Linux machine with network access (it fetches appimagetool on
-# first run and caches it locally as ./appimagetool).
+# Run on a real Linux machine with network access (it fetches appimagetool and
+# the AppImage runtime on first run, both pinned and hash-checked, and caches
+# them locally as ./appimagetool and ./runtime-x86_64).
 set -eu
 
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
@@ -67,38 +68,50 @@ cp "$BACKEND_SRC"  "$APPDIR/usr/bin/vaultsend-backend"
 chmod +x "$APPDIR/usr/bin/vaultsend-backend"
 cp "$FRONTEND_SRC" "$APPDIR/usr/share/vaultsend/frontend/app.py"
 
-# 4. Fetch appimagetool if we don't have it (cached in ./ for reuse).
-#    Pinned to a tagged release and checked against its SHA-256: this binary is
-#    executed by install.sh's `curl | sh` path, so an unpinned "continuous"
-#    download would run whatever that URL served on the day. To upgrade, change
-#    both values together.
+# 4. Fetch appimagetool and the AppImage runtime (cached in ./ for reuse).
+#    Both are pinned to a tagged release and checked against their SHA-256:
+#    appimagetool is executed by install.sh's `curl | sh` path, and the runtime
+#    becomes the executable header of the AppImage we ship, so neither may be
+#    whatever a "continuous" URL happens to serve on the day. Passing the runtime
+#    with --runtime-file also stops appimagetool from downloading its own
+#    unpinned copy at pack time. To upgrade either, change its version and hash
+#    together.
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+RUNTIME_VERSION="20251108"
+RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
 
 sha256_of() {
     if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
     else shasum -a 256 "$1" | cut -d' ' -f1; fi
 }
 
-if [ ! -x ./appimagetool ] || [ "$(sha256_of ./appimagetool)" != "$APPIMAGETOOL_SHA256" ]; then
-    echo "Downloading appimagetool $APPIMAGETOOL_VERSION..."
-    rm -f appimagetool appimagetool.download
-    curl -fL -o appimagetool.download \
-        "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
-    got="$(sha256_of appimagetool.download)"
-    if [ "$got" != "$APPIMAGETOOL_SHA256" ]; then
-        rm -f appimagetool.download
-        echo "error: appimagetool checksum mismatch (expected $APPIMAGETOOL_SHA256, got $got)" >&2
+# fetch_pinned FILE SHA256 URL: download URL to FILE unless a cached FILE
+# already has the expected hash. A mismatch aborts the build.
+fetch_pinned() {
+    if [ -f "$1" ] && [ "$(sha256_of "$1")" = "$2" ]; then return 0; fi
+    echo "Downloading $1 from $3..."
+    rm -f "$1" "$1.download"
+    curl -fL -o "$1.download" "$3"
+    got="$(sha256_of "$1.download")"
+    if [ "$got" != "$2" ]; then
+        rm -f "$1.download"
+        echo "error: $1 checksum mismatch (expected $2, got $got)" >&2
         exit 1
     fi
-    mv appimagetool.download appimagetool
-    chmod +x appimagetool
-fi
+    mv "$1.download" "$1"
+}
+
+fetch_pinned appimagetool "$APPIMAGETOOL_SHA256" \
+    "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+fetch_pinned runtime-x86_64 "$RUNTIME_SHA256" \
+    "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-x86_64"
+chmod +x appimagetool
 
 # 5. Pack. appimagetool needs FUSE; fall back to extract-and-run without it.
 echo "Packing..."
-ARCH=x86_64 ./appimagetool "$APPDIR" "$OUTPUT" \
-    || ARCH=x86_64 ./appimagetool --appimage-extract-and-run "$APPDIR" "$OUTPUT"
+ARCH=x86_64 ./appimagetool --runtime-file runtime-x86_64 "$APPDIR" "$OUTPUT" \
+    || ARCH=x86_64 ./appimagetool --appimage-extract-and-run --runtime-file runtime-x86_64 "$APPDIR" "$OUTPUT"
 
 chmod +x "$OUTPUT"
 echo "Built: $HERE/$OUTPUT"
