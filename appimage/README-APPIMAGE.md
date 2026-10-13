@@ -22,7 +22,7 @@ At build time the script wipes `build/VaultSend.AppDir`, recreates it from
 scratch, and copies in:
 
 - the backend binary from `../backend/target/release/vaultsend-backend`,
-- the frontend source from `../frontend/app.py`,
+- the frontend source from `../frontend/app.py` and `../frontend/entropy_meter.py`,
 - the static assets from `AppDir.template/`.
 
 Because the packaged tree is rebuilt from the sources on every run, it can never
@@ -105,7 +105,9 @@ VaultSend.AppDir/
 └── usr/
     ├── bin/vaultsend-backend        # the Rust binary — only dynamic deps are
     │                                #   libc and libgcc, present everywhere
-    └── share/vaultsend/frontend/app.py
+    └── share/vaultsend/frontend/
+        ├── app.py
+        └── entropy_meter.py         # scribble meter for the optional keygen step
 ```
 
 `AppRun` is the entire trust boundary for what the AppImage does beyond what's

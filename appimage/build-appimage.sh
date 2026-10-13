@@ -5,7 +5,7 @@
 # into the AppImage is assembled fresh, at build time, from the real sources:
 #
 #     backend binary   <-  ../backend/target/release/vaultsend-backend
-#     frontend source  <-  ../frontend/app.py
+#     frontend source  <-  ../frontend/app.py, ../frontend/entropy_meter.py
 #     static assets    <-  ./AppDir.template/   (AppRun, .desktop, icon)
 #
 # The packaged tree is staged under ./build/ (git-ignored) and rebuilt from
@@ -24,6 +24,7 @@ cd "$HERE"
 TEMPLATE="AppDir.template"
 BACKEND_SRC="../backend/target/release/vaultsend-backend"
 FRONTEND_SRC="../frontend/app.py"
+ENTROPY_SRC="../frontend/entropy_meter.py"  # imported by app.py (optional scribble at keygen)
 
 # --- Staging: disposable build output, safe to delete at any time. ----------
 APPDIR="build/VaultSend.AppDir"
@@ -38,6 +39,7 @@ echo "Building backend..."
 # 2. Verify every source exists before staging anything.
 [ -f "$BACKEND_SRC" ]  || { echo "error: backend binary not found at $BACKEND_SRC" >&2; exit 1; }
 [ -f "$FRONTEND_SRC" ] || { echo "error: frontend not found at $FRONTEND_SRC" >&2; exit 1; }
+[ -f "$ENTROPY_SRC" ]  || { echo "error: entropy meter not found at $ENTROPY_SRC" >&2; exit 1; }
 [ -d "$TEMPLATE" ]     || { echo "error: AppDir template not found at $TEMPLATE" >&2; exit 1; }
 
 # 3. Assemble a fresh AppDir from scratch. Wiping it first guarantees no stale
@@ -66,6 +68,7 @@ cp "$TEMPLATE/vaultsend.png"     "$APPDIR/.DirIcon"
 cp "$BACKEND_SRC"  "$APPDIR/usr/bin/vaultsend-backend"
 chmod +x "$APPDIR/usr/bin/vaultsend-backend"
 cp "$FRONTEND_SRC" "$APPDIR/usr/share/vaultsend/frontend/app.py"
+cp "$ENTROPY_SRC"  "$APPDIR/usr/share/vaultsend/frontend/entropy_meter.py"
 
 # 4. Fetch appimagetool if we don't have it (cached in ./ for reuse).
 #    Pinned to a tagged release and checked against its SHA-256: this binary is
