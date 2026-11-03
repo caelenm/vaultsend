@@ -24,9 +24,9 @@ only; nothing has been pushed.
 Vaults are encrypted folders that change one file at a time: per-file age blobs bound
 by an age-encrypted manifest that pins each blob by SHA-256 and carries a generation
 counter. Everything in the plan is built, in the backend (`vault.rs`), the frontend
-(`app.py`) and tests. No new crate. The audited backend functions and `FileOperation`,
-`run_backend` and `spawn_backend` are byte-identical to `main`, checked by comparing
-each definition.
+(`app.py`) and tests, plus an **Open** button the owner asked for afterwards. No new
+crate. The audited backend functions and `FileOperation`, `run_backend` and
+`spawn_backend` are byte-identical to `main`, checked by comparing each definition.
 
 ---
 
@@ -47,35 +47,43 @@ updates.
 
 **Key-swap gap fixed rather than documented (2026-11-03).** See the threat model below.
 
+**Open button added (2026-11-03), reversing §0.6's "no 'open in app'".** The owner asked
+how files are meant to be used from inside a vault, then asked for an Open button with a
+plaintext warning acknowledged on first use. The rest of §0.6 holds: the frontend still
+never holds file plaintext, and a file is still fully verified in RAM before any of it is
+written. See the threat model below.
+
 ---
 
 ## Files touched
 
 ```
- CHANGES-VAULTS.md                                  |  437 ++++++++++++
- README.md                                          |   81 ++-
+ CHANGES-VAULTS.md                                  |  486 +++++++++++++
+ README.md                                          |  103 ++-
  VAULTS_PLAN.md                                     |  403 +++++++++++
  backend/Cargo.lock                                 |    4 +-
  backend/Cargo.toml                                 |   13 +-
  backend/src/main.rs                                |    8 +-
  backend/src/vault.rs                               | 1542 ++++++++++++++++++++++++++++++++++++++++
  docs/screenshots/vaults/01a-contacts-main.png      |  Bin 0 -> 40841 bytes
- docs/screenshots/vaults/01b-contacts-branch.png    |  Bin 0 -> 41911 bytes
+ docs/screenshots/vaults/01b-contacts-branch.png    |  Bin 0 -> 42208 bytes
  docs/screenshots/vaults/02-vaults-empty.png        |  Bin 0 -> 39245 bytes
- docs/screenshots/vaults/03-vaults-two.png          |  Bin 0 -> 36730 bytes
- docs/screenshots/vaults/04-create-dialog.png       |  Bin 0 -> 61583 bytes
- docs/screenshots/vaults/05-unlocked-nested.png     |  Bin 0 -> 47158 bytes
- docs/screenshots/vaults/06-rollback-warning.png    |  Bin 0 -> 53694 bytes
- docs/screenshots/vaults/07-tamper-error.png        |  Bin 0 -> 59123 bytes
- docs/screenshots/vaults/08-passphrase-menu.png     |  Bin 0 -> 45306 bytes
- docs/screenshots/vaults/09-key-changed-warning.png |  Bin 0 -> 68485 bytes
- frontend/app.py                                    |  923 +++++++++++++++++++++++-
- tests/test_frontend_helpers.py                     |  258 +++++++
- tests/vault_gui_check.sh                           |   29 +
- tests/vault_gui_driver.py                          |  733 +++++++++++++++++++
+ docs/screenshots/vaults/03-vaults-two.png          |  Bin 0 -> 36869 bytes
+ docs/screenshots/vaults/04-create-dialog.png       |  Bin 0 -> 61092 bytes
+ docs/screenshots/vaults/05-unlocked-nested.png     |  Bin 0 -> 47764 bytes
+ docs/screenshots/vaults/06-rollback-warning.png    |  Bin 0 -> 54236 bytes
+ docs/screenshots/vaults/07-tamper-error.png        |  Bin 0 -> 62387 bytes
+ docs/screenshots/vaults/08-passphrase-menu.png     |  Bin 0 -> 45891 bytes
+ docs/screenshots/vaults/09-key-changed-warning.png |  Bin 0 -> 69172 bytes
+ docs/screenshots/vaults/10-open-warning.png        |  Bin 0 -> 76764 bytes
+ docs/screenshots/vaults/11-open-changes-lost.png   |  Bin 0 -> 63308 bytes
+ frontend/app.py                                    | 1132 ++++++++++++++++++++++++++++-
+ tests/test_frontend_helpers.py                     |  322 +++++++++
+ tests/vault_gui_check.sh                           |   48 ++
+ tests/vault_gui_driver.py                          |  897 +++++++++++++++++++++++
  tests/vault_roundtrip.sh                           |  257 +++++++
  tests/verify_deps.sh                               |   75 ++
- 23 files changed, 4747 insertions(+), 16 deletions(-)
+ 25 files changed, 5274 insertions(+), 16 deletions(-)
 ```
 
 | File | What |
@@ -235,10 +243,37 @@ but has neither the vault key nor the secret that unlocks it:
 
 **Plaintext rule.** The frontend never holds file plaintext. A file is fully decrypted
 and verified in the backend's RAM before any of it is written, a folder extract does this
-for every file first, and plaintext reaches disk only at a path the user chose. The
-strace check in `vault_roundtrip.sh` confirms the ordering. RAM is held in zeroizing
+for every file first, and VaultSend writes plaintext to disk only at a path the user chose.
+The strace check in `vault_roundtrip.sh` confirms the ordering. RAM is held in zeroizing
 buffers, allocated once so they never leave a copy behind, and swap protection is the
 same best-effort `mlockall` as the rest of the backend.
+
+### Open (added at the owner's request)
+
+Open hands a decrypted file to another program, which is outside anything VaultSend can
+protect. What it does:
+
+- The backend extracts the file as usual, verified in RAM first, into a new `0700` folder
+  from `mkdtemp`, with the file itself `0600` and so never executable. The frontend only
+  handles the path, and detects edits from metadata without reading the file.
+- The folder must really be in memory. `$XDG_RUNTIME_DIR` is preferred, then `/dev/shm`, and
+  each is checked to be tmpfs or ramfs. If neither is, Open refuses and suggests Extract.
+- The copy is deleted on Lock, Lock now and close. Leftovers from a crash are removed at the
+  next launch: only real folders with our prefix owned by this user, never a symlink.
+- The first use warns about the plaintext risk and needs **I understand**, remembered in
+  `settings.json`. Cancel decrypts nothing and isn't remembered.
+
+What it can't do, and the warning and README say so:
+
+- **The other app can write its own plaintext to disk:** recovery files, thumbnails,
+  recent-file lists. This is the main risk, and VaultSend can't see or remove them.
+- **Other programs running as the user can read the copy,** which is the same-user threat
+  the backend's hardening defends the key against.
+- **tmpfs can reach disk** through swap or hibernation.
+- **Unsaved work in the other app is invisible to VaultSend.** It can only tell a copy has
+  changed once it's saved, so Lock can delete a file still being worked on.
+- **Opening runs the file's default app on its contents.** A shared vault's files are as
+  untrusted as any other download.
 
 ### The `key.age` swap (found during this work, fixed at the owner's request)
 
@@ -276,6 +311,10 @@ gets detected but can't be prevented, so keep backups.
 - On-disk metadata: file count, approximate per-file sizes, blob modified times. Names and
   folder structure stay hidden.
 - Extraction needs RAM of about 2× the file's size. A folder needs about its total size.
+  Open needs about 3×, since the copy stays in memory too.
+- Open handles one file at a time, and changes aren't saved back: Save As in the other app,
+  then add the file back. Sandboxed apps (Flatpak, Snap) may not be able to read the copy. If
+  VaultSend is killed, the copy stays in memory until its next launch, logout or reboot.
 - The frontend's passphrase cache is not swap-protected, and Python can't reliably wipe
   strings. Off by default, and the app says so the first time it's turned on.
 - Sharing a password vault means copying its folder (no single-file export yet), and a
@@ -296,6 +335,8 @@ Places this differs from, or adds to, what the plan says:
 | What | Why |
 |---|---|
 | `key_sha256` in `vaults.json`, and `--key-sha256` | Owner's decision, above. |
+| An **Open** button, reversing §0.6's "no 'open in app'" | Owner's decision, above. |
+| A "Changes will be lost" prompt on Lock, Lock now and close | Not asked for. An edited copy is about to be deleted and has nowhere else to go, and this catches it for saved edits. |
 | A `flock` on the `VAULT` file | The plan's garbage collection deletes unreferenced blobs, which would include another process's uncommitted ones. Exclusive for changes, shared for reads, released by the kernel however the process dies. |
 | `vault-add` accepts repeated `--src` | Several files are then one unlock and one generation. Otherwise each dropped file would pay a full scrypt. |
 | Folder extract builds under `<out>.vaultsend-part`, then renames | `--out` is only ever absent or complete, and a cancel has one unambiguous thing to clean up. |
@@ -326,15 +367,19 @@ Run from the final tree:
 | `tests/verify_deps.sh` | All 8 crates match `Cargo.lock` and crates.io; no `[[package]]` added |
 | `tests/vault_roundtrip.sh` | 89 passed, 0 failed; 90 of 90 where `strace` is available |
 | strace proof | The last blob is opened before the output path is first touched |
-| `tests/test_frontend_helpers.py` | 30 passed, on both GTK versions below |
-| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 89 passed, 0 failed |
-| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 89 passed, 0 failed |
+| `tests/test_frontend_helpers.py` | 36 passed, on both GTK versions below |
+| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 119 passed, 0 failed |
+| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 119 passed, 0 failed |
+
+The backend hasn't changed since those Rust, dependency and round-trip results, because Open
+needed no backend change; the binary hash is the same. The Python and GUI runs are on the
+final frontend.
 
 **The version floor.** libadwaita 1.5.0 is exactly the app's floor, and the whole run-through
 passes on it. GTK 4.10 itself wasn't tested, but it isn't reachable with that floor anyway:
 Ubuntu's libadwaita 1.5 package requires GTK ≥ 4.13.4, so 4.14 is close to the real minimum.
-On Ubuntu the run logs a GTK warning that the file-chooser portal is too old. No portal runs
-in the test environment, and the chooser fell back and worked.
+On Ubuntu the run logs GTK warnings that the file-chooser and open-file portals are too old.
+No portal runs in the test environment, and GTK fell back and worked.
 
 **Not run:** the AppImage wasn't rebuilt. `build-appimage.sh` copies the same two files as
 before, the release binary and `app.py`, and its build command is unchanged.
@@ -347,6 +392,7 @@ before, the release binary and `app.py`, and its build command is unchanged.
 - A FIFO in place of `VAULT` or `key.age` could hang the window at startup.
 - A warning toast containing a path with `&` would have failed to display.
 - A vault with one file said "1 files".
+- The first Open warning's heading was too long and triggered a GTK layout warning.
 
 ---
 
@@ -390,6 +436,8 @@ looked at before committing.
 | `07-tamper-error.png` | The error after extracting from a tampered vault; nothing was written. |
 | `08-passphrase-menu.png` | The Remember passphrase submenu. |
 | `09-key-changed-warning.png` | Added: the warning for a swapped `key.age`, shown before any secret is asked for. |
+| `10-open-warning.png` | Added: the plaintext warning on first Open, with I understand and Cancel. The Open button is in the action bar behind it. |
+| `11-open-changes-lost.png` | Added: Lock with an edited copy, naming the file. |
 
 ---
 
@@ -409,10 +457,11 @@ Every test uses throwaway `HOME` and XDG dirs under `mktemp -d` in `/tmp` (ext4)
 key and config were never touched.
 
 **The GUI run-through drives the real window** with real dialogs and the real backend,
-including real GTK file choosers, but through its widgets rather than a mouse. Two things it
-can't show: a real drag from a file manager (it calls the drop handler directly), and how the
-app behaves on a real desktop under a window manager, since Xvfb has none. Those are worth a
-manual check.
+including real GTK file choosers, but through its widgets rather than a mouse. For Open it
+launches through the real GTK and desktop-file path, but the "default app" is a stand-in
+script registered in the throwaway dirs. What it can't show: a real drag from a file manager
+(it calls the drop handler directly), Open with real apps, and how the app behaves on a real
+desktop under a window manager, since Xvfb has none. Those are worth a manual check.
 
 To re-run, from a shell with Rust on the `PATH` and GTK available:
 

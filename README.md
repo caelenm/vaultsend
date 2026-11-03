@@ -53,7 +53,8 @@ version is detected before it is decrypted. The vault's own key is stored in
 `key.age`, encrypted either to your key or to a password you choose (never both:
 age allows a passphrase only as the sole recipient). Plaintext from a vault is
 fully decrypted and verified in the backend's memory before a single byte is
-written, and it is only ever written where you explicitly extract it. On this
+written, and it is only ever written where you explicitly extract it, or to a private
+in-memory folder if you use **Open**. On this
 device, VaultSend also remembers each vault's generation and the hash of its
 `key.age`, and warns if a vault goes backwards or its key is replaced.
 
@@ -61,6 +62,15 @@ device, VaultSend also remembers each vault's generation and the hash of its
 memory for the time you chose. It is never written to disk, but that memory, unlike
 the backend's, is not locked out of swap, and Python cannot reliably wipe strings.
 It is off by default.
+
+**Open takes a file outside what VaultSend can protect.** The copy itself goes into
+memory (`$XDG_RUNTIME_DIR`, or `/dev/shm`; if neither is really in RAM, Open refuses
+rather than use the disk). But the app that opens it may save its own unencrypted
+copies to disk, such as recovery files, thumbnails and recent-file lists, and VaultSend
+can't see or remove those. While the copy exists, other programs running as you can read
+it, and memory can be written to swap or a hibernation image. VaultSend warns you about
+this the first time and asks you to acknowledge it. If that isn't acceptable for a file,
+don't open it on this machine.
 
 ## ⚠️ Security warning
 
@@ -126,8 +136,8 @@ applies on Linux for now — see Platform support below.
   keys. Nothing in it is secret, so it's safe to back up or sync however you
   like.
 - **Vaults.** Keep a whole folder encrypted and change it one file at a time. Add
-  files and folders, extract them where you choose, delete them, and verify the
-  whole vault for tampering. Open one with your own key, or with a password if you
+  files and folders, open a file in its default app from a copy held in memory,
+  extract files where you choose, delete them, and verify the whole vault for tampering. Open one with your own key, or with a password if you
   want to share it. Names and folder structure stay hidden; see the limitations
   below for what a vault does reveal.
 - **Remember passphrase.** Optionally keep your passphrase in memory for 5 minutes,
@@ -206,6 +216,7 @@ environment variable, the sibling `backend/target/release/` build, then `PATH`.
 | Your list of vaults (no secrets) | `~/.config/vaultsend/vaults.json` |
 | Settings, such as Remember passphrase (never the passphrase) | `~/.config/vaultsend/settings.json` |
 | New vaults, unless you choose elsewhere | `~/.local/share/vaultsend/vaults/<name>.vsvault` |
+| Files you've opened from a vault, until you lock it or close the app (in memory) | `$XDG_RUNTIME_DIR/vaultsend-open-*`, or `/dev/shm/vaultsend-open-*` |
 
 (`XDG_DATA_HOME` / `XDG_CONFIG_HOME` are honored if set.) Contacts are just a
 list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
@@ -231,6 +242,11 @@ The last two are what let this device notice a rolled-back vault or a replaced k
   this vault* extracts it all. Removing a vault from the list only forgets it; its
   files stay where they are. **Add existing vault…** re-attaches a vault after a
   restore, or one someone shared with you.
+- **Opening a file from a vault:** select it and click **Open**. It opens in its default
+  app from a copy in memory, which is deleted when you lock the vault or close VaultSend.
+  Changes aren't saved back to the vault: to keep them, use **Save As** in that app, then
+  add the file back with **Replace**. If a copy was edited, VaultSend asks before deleting
+  it, but it can't see edits you haven't saved yet, so save first.
 
 
 
@@ -333,6 +349,8 @@ expected in that one case.
 - `frontend/app.py` — `run_backend()` is the entire trust boundary: it shows
   exactly what is sent to the backend and how the passphrase is passed.
   `PassphraseCache` and `with_vault_secret` are the rest of what touches a secret.
+  `vault_open` and `memory_folder` are the one place a decrypted file is handed to
+  another program.
 
 ## Platform support
 
@@ -355,6 +373,10 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
   before this device first added it isn't detected.
 - Extracting needs RAM of about twice the file's size, because it is fully decrypted
   and verified before anything is written. A folder needs roughly its total size.
+  **Open** needs about three times, since the copy stays in memory too.
+- **Open** handles one file at a time. Sandboxed apps (Flatpak, Snap) may not be able to
+  read the copy. If VaultSend is killed, the copy stays in memory until its next launch,
+  logout or reboot.
 - File and folder names in a vault must be valid UTF-8; adding one that isn't fails
   and names it.
 - A password can't be changed yet, and there's no single-file export: sharing a
