@@ -273,12 +273,20 @@ fn lock_vault(dir: &str, exclusive: bool) -> R<File> {
 /// Decrypt key.age and return the vault's identity. scrypt runs here, once per
 /// operation rather than once per file. The VAULT file's mode is only a hint for
 /// which secret to try: a wrong mode just fails to decrypt, as an ordinary error.
-fn unlock(dir: &str, pass_fd: i32) -> R<x25519::Identity> {
+///
+/// `pinned` is the SHA-256 of key.age the frontend remembers for this vault. age has
+/// no sender authentication and a user's public key is public, so anyone who can
+/// write here could wrap a key of their own to the user. It is checked on the exact
+/// bytes about to be used, before the secret is even read.
+fn unlock(dir: &str, pass_fd: i32, pinned: Option<&str>) -> R<x25519::Identity> {
     let hint = fs::read_to_string(format!("{dir}/{VAULT_FILE}"))
         .map_err(|e| format!("reading {VAULT_FILE}: {e}"))?;
     let mode = hint.strip_prefix(VAULT_MAGIC).and_then(|r| r.strip_prefix("\nmode "));
     let wrapped = fs::read(format!("{dir}/{KEY_FILE}"))
         .map_err(|e| format!("reading this vault's {KEY_FILE}: {e}"))?;
+    if pinned.is_some_and(|p| hex(&Sha256::digest(&wrapped)) != p) {
+        return Err(format!("this vault's {KEY_FILE} has changed since this device last opened it"));
+    }
     let dec = age::Decryptor::new(&wrapped[..])
         .map_err(|_| format!("this vault's {KEY_FILE} is damaged"))?;
     let mut stream = match mode {
@@ -371,9 +379,9 @@ struct Vault {
 }
 
 impl Vault {
-    fn open(dir: &str, pass_fd: i32, exclusive: bool) -> R<Vault> {
+    fn open(dir: &str, pass_fd: i32, pinned: Option<&str>, exclusive: bool) -> R<Vault> {
         let lock = lock_vault(dir, exclusive)?;
-        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd)?, _lock: Some(lock) })
+        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd, pinned)?, _lock: Some(lock) })
     }
 
     /// `wrap` already holds key.age's wrapped file key, so scrypt (for a password
@@ -719,7 +727,7 @@ fn parse_opts(args: &[String]) -> R<Opts<'_>> {
     while let Some(name) = it.next() {
         match name {
             "--replace" => o.replace = true,
-            "--dir" | "--mode" | "--pass-fd" | "--src" | "--dest" | "--entry" | "--out" => {
+            "--dir" | "--mode" | "--pass-fd" | "--key-sha256" | "--src" | "--dest" | "--entry" | "--out" => {
                 o.pairs.push((name, it.next().ok_or_else(|| format!("{name} needs a value"))?))
             }
             other => return Err(format!("unknown option '{other}'")),
@@ -777,7 +785,7 @@ fn print_out(text: &str) -> R<()> {
 pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
     let o = parse_opts(args)?;
     let dir = o.need("--dir")?;
-    let open = |exclusive| Vault::open(dir, o.pass_fd()?, exclusive);
+    let open = |exclusive| Vault::open(dir, o.pass_fd()?, o.get("--key-sha256"), exclusive);
     match cmd {
         "vault-create" => cmd_create(dir, &o),
         "vault-list" => print_out(&open(false)?.listing()?),
@@ -910,7 +918,7 @@ mod tests {
         run("vault-add", &args(&["--dir", &dir, "--pass-fd", &fd(), "--src", &t.path("src/tree")])).unwrap();
 
         // vault-list goes to stdout, so check its source directly.
-        let v = Vault::open(&dir, pass_fd(pass), false).unwrap();
+        let v = Vault::open(&dir, pass_fd(pass), None, false).unwrap();
         let listing = v.listing().unwrap();
         assert!(listing.starts_with("generation 1\n"), "{listing}");
         assert!(listing.contains("D tree/empty-folder\n"), "{listing}");
@@ -959,7 +967,7 @@ mod tests {
         let own = t.path("own.vsvault");
         run("vault-create", &args(&["--dir", &pw, "--mode", "password", "--pass-fd", &pass_fd(VAULT_PASS).to_string()])).unwrap();
         run("vault-create", &args(&["--dir", &own, "--mode", "self"])).unwrap();
-        let open_err = |d: &str, p: &str| Vault::open(d, pass_fd(p), false).err().unwrap();
+        let open_err = |d: &str, p: &str| Vault::open(d, pass_fd(p), None, false).err().unwrap();
 
         assert!(open_err(&pw, "not the vault password").contains("wrong password"));
         assert!(open_err(&own, "not the identity pass").contains("wrong passphrase"));
@@ -980,6 +988,33 @@ mod tests {
         fs::write(format!("{own}/key.age"), b"garbage").unwrap();
         flip(&own, "self");
         assert!(open_err(&own, ID_PASS).contains("damaged"));
+    }
+
+    /// The attack the pin exists for: someone who can write to a `self` vault's folder
+    /// wraps a key of their own to the user's public key. The user's passphrase still
+    /// opens it, so without the pin nothing would stand in the way.
+    #[test]
+    fn a_swapped_key_file_is_refused_when_pinned() {
+        let t = TempDir::new();
+        let (dir, forged) = (t.path("mine.vsvault"), t.path("forged.vsvault"));
+        run("vault-create", &args(&["--dir", &dir, "--mode", "self"])).unwrap();
+        run("vault-create", &args(&["--dir", &forged, "--mode", "self"])).unwrap();
+        let key = format!("{dir}/key.age");
+        let pin = hex(&Sha256::digest(fs::read(&key).unwrap()));
+
+        assert!(Vault::open(&dir, pass_fd(ID_PASS), Some(&pin), false).is_ok());
+        fs::copy(format!("{forged}/key.age"), &key).unwrap();
+        // Without a pin the swap goes unnoticed: the passphrase unlocks the new key.
+        assert!(Vault::open(&dir, pass_fd(ID_PASS), None, false).is_ok());
+        let err = Vault::open(&dir, pass_fd(ID_PASS), Some(&pin), false).err().unwrap();
+        assert!(err.contains("has changed"), "{err}");
+
+        // Through the CLI too, for a mutating command, and nothing is changed.
+        let fd = pass_fd(ID_PASS).to_string();
+        let src = t.write("secret.txt", b"would be readable by whoever swapped the key");
+        let err = run("vault-add", &args(&["--dir", &dir, "--pass-fd", &fd, "--key-sha256", &pin, "--src", &src])).unwrap_err();
+        assert!(err.contains("has changed"), "{err}");
+        assert_eq!(fs::read_dir(format!("{dir}/blobs")).unwrap().count(), 0);
     }
 
     #[test]

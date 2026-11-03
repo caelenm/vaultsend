@@ -1,11 +1,15 @@
 # VaultSend — Vaults: change record
 
 Living record for `feature/vaults` (spec: `VAULTS_PLAN.md`). Local branch only;
-nothing has been pushed. Status: **paused at the fallback gate, see below.**
+nothing has been pushed.
 
 ---
 
-## Fallback gate: `vault.rs` is over budget — owner decision needed
+## Fallback gate: `vault.rs` went over budget — owner kept option B
+
+**Decision (owner, 2026-11-03): keep option B, budget raised to ~800 lines, and fix
+the `self`-vault key-swap gap below rather than documenting it.** The analysis that
+led to it is kept here as the record.
 
 The plan (§1) says: if `backend/src/vault.rs` exceeds ~550 lines excluding
 `#[cfg(test)]`, stop, write up why here, and ask whether to fall back to option A.
@@ -79,22 +83,33 @@ output the same staging. That second part is my judgment, not a measurement.
 
 ---
 
-## Security finding for the threat model (independent of the gate)
+## Security finding: key swap in `self` vaults (fixed at the owner's request)
 
 Age has no sender authentication, and a user's public key is public by design. So
-anyone who can write to a **`self`-mode** vault's folder can replace `key.age` with
+anyone who can write to a **`self`-mode** vault's folder could replace `key.age` with
 one wrapping a vault key they know, plus a matching manifest.
 
-- The user's passphrase still unlocks it, and the generation check can be satisfied
-  by choosing a high number.
+- The user's passphrase would still unlock it, and the generation check could be
+  satisfied by choosing a high number.
 - The listing would look wrong, since the attacker can't read the old contents.
-- But any file the user then adds is encrypted to a key the attacker holds.
+- But any file the user then added would be encrypted to a key the attacker holds.
 
-`password` vaults are not affected: forging `key.age` needs the password. The plan
-doesn't cover this. Not addressed in the code so far, and I have not improvised a
-fix. A small option if you want one: remember `SHA-256(key.age)` per vault in
-`vaults.json` and warn if it changes, the same device-local idea as the generation
-check, at about 10 lines. Otherwise it goes in the known limitations.
+`password` vaults weren't exposed in the same way: forging `key.age` needs the password.
+
+**The fix pins `key.age` by SHA-256, in two layers.** The plan didn't cover this; the
+owner asked for it.
+
+- **Frontend:** `vaults.json` gains a `key_sha256` per vault, recorded when the vault
+  is created or added. Before asking for a secret, it compares the current `key.age`
+  and shows a warning if it changed. Applies to both modes, since `key.age` never
+  legitimately changes in 0.2.0.
+- **Backend:** every command that opens a vault accepts `--key-sha256 HEX` and refuses
+  if the bytes of `key.age` it just read don't match, before reading the secret. A
+  frontend-only check could be beaten by swapping the file after the check.
+
+Limits: like the generation check this is per-device, and it trusts what it first saw.
+A vault swapped before this device first added it isn't detected, and neither is one
+reached with `vaults.json` deleted.
 
 ---
 
