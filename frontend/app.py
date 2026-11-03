@@ -1278,10 +1278,12 @@ class Window(Adw.ApplicationWindow):
         you = Gtk.CheckButton(label=f"You ({short(self.my_pubkey)})", active=True, sensitive=False)
         box.append(you)
         for c in self.contacts:
-            cb = Gtk.CheckButton(label=f"{c['name']} ({short(c['pubkey'])})")
+            # Wrapped: clipped, a long name would hide the key that confirms who this is.
+            cb = Gtk.CheckButton()
+            cb.set_child(Gtk.Label(label=f"{c['name']} ({short(c['pubkey'])})", wrap=True, wrap_mode=2, xalign=0))
             box.append(cb)
             checks.append((cb, c["pubkey"]))
-        scroller = Gtk.ScrolledWindow(propagate_natural_height=True)
+        scroller = Gtk.ScrolledWindow(propagate_natural_height=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_min_content_height(80)
         scroller.set_max_content_height(260)
         scroller.set_child(box)
@@ -1309,7 +1311,7 @@ class Window(Adw.ApplicationWindow):
         entry2 = None
         if confirm:
             entry2 = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
-            box.append(Gtk.Label(label="Repeat passphrase", xalign=0))
+            box.append(Gtk.Label(label="Repeat it", xalign=0))  # a passphrase, or a vault's password
             box.append(entry2)
         dlg.set_extra_child(box)
         dlg.add_response("cancel", "Cancel")
@@ -1328,7 +1330,7 @@ class Window(Adw.ApplicationWindow):
             elif confirm and len(p) < MIN_PASSPHRASE_LEN:
                 problem = f"Use at least {MIN_PASSPHRASE_LEN} characters — a few random words works well."
             elif confirm and entry2 is not None and p != entry2.get_text():
-                problem = "Those passphrases don't match."
+                problem = "Those don't match."
             if problem:
                 self.error(problem)
                 # Creating a key: ask again. On first run nothing else in the
