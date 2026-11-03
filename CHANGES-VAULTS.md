@@ -61,8 +61,8 @@ written. See the threat model below.
 ## Files touched
 
 ```
- CHANGES-VAULTS.md                                 |  594 +++++++++++++++
- README.md                                         |  118 ++-
+ CHANGES-VAULTS.md                                 |  602 ++++++++++++++++
+ README.md                                         |  131 +++-
  VAULTS_PLAN.md                                    |  403 +++++++++++
  backend/Cargo.lock                                |    4 +-
  backend/Cargo.toml                                |   13 +-
@@ -80,14 +80,14 @@ written. See the threat model below.
  docs/screenshots/vaults/09-forged-key-refused.png |  Bin 0 -> 49504 bytes
  docs/screenshots/vaults/10-open-warning.png       |  Bin 0 -> 74662 bytes
  docs/screenshots/vaults/11-open-changes-lost.png  |  Bin 0 -> 61813 bytes
- frontend/app.py                                   | 1145 ++++++++++++++++++++++++++++-
+ frontend/app.py                                   | 1155 ++++++++++++++++++++++++++++-
  tests/test_frontend_helpers.py                    |  342 +++++++++
  tests/vault_attack.py                             | 1367 +++++++++++++++++++++++++++++++++++
  tests/vault_gui_check.sh                          |   48 ++
  tests/vault_gui_driver.py                         | 1091 ++++++++++++++++++++++++++++
  tests/vault_roundtrip.sh                          |  316 ++++++++
  tests/verify_deps.sh                              |   75 ++
- 26 files changed, 7100 insertions(+), 26 deletions(-)
+ 26 files changed, 7123 insertions(+), 34 deletions(-)
 ```
 
 | File | What |
@@ -132,7 +132,7 @@ builds only.
 
 `vaultsend-backend`'s version, plus `rand` and `sha2` in its dependency list. No `[[package]]` added.
 
-### `frontend/app.py` (ten lines)
+### `frontend/app.py`
 
 | Line on `main` | Becomes | Why |
 |---|---|---|
@@ -149,6 +149,10 @@ builds only.
 | `self.toasts.add_toast(Adw.Toast.new(text))` in `toast` | `Adw.Toast(use_markup=False, title=text)` | Bug: a message containing `&`, such as an error naming a path, didn't appear at all |
 | `self.toasts.add_toast(Adw.Toast.new(text))` in `error` | `self.toast(text)` | The same |
 | `row = Adw.ActionRow(title=c["name"], …)` in `_refresh_contacts` | `plain_row(…)` | Bug: a contact with `&` in the name showed a blank name |
+| `box.append(Gtk.Label(label="Repeat passphrase", xalign=0))` | `"Repeat it"` | The same dialog chooses a vault's password |
+| `problem = "Those passphrases don't match."` | `"Those don't match."` | The same |
+| `cb = Gtk.CheckButton(label=…)` in `pick_recipients` | A wrapping label as its child | A long contact name was clipped, hiding the key that confirms who it is |
+| `scroller = Gtk.ScrolledWindow(propagate_natural_height=True)` in `pick_recipients` | Adds `hscrollbar_policy=NEVER` | So that label wraps |
 | The body of `save_contacts` (ten lines) | `save_json(CONTACTS_FILE, contacts)` | The same code, now one copy, and it writes `0600`. `contacts.json` was readable by other accounts on a shared machine |
 
 New lines also went into `Window.__init__`, `Window.error` (forgets a rejected
@@ -261,8 +265,12 @@ but has neither the vault key nor the secret that unlocks it:
 and verified in the backend's RAM before any of it is written, a folder extract does this
 for every file first, and VaultSend writes plaintext to disk only at a path the user chose.
 The strace check in `vault_roundtrip.sh` confirms the ordering. RAM is held in zeroizing
-buffers, allocated once so they never leave a copy behind, and swap protection is the
-same best-effort `mlockall` as the rest of the backend.
+buffers, allocated once so they never leave a copy behind. Swap protection is the same
+`mlockall` as the rest of the backend, which is weaker than "best-effort" suggests. Measured
+under WSL, with a hard limit of 64 KB: `mlockall(MCL_CURRENT)` fails outright and `VmLck` stays
+at 0 kB. `MCL_FUTURE` is used only when the limit is unlimited, so scrypt's buffer and decrypted
+files aren't locked on a typical system either. `harden_process` is audited and unchanged, and
+the README now says plainly that these can reach swap.
 
 ### Open (added at the owner's request)
 
@@ -426,16 +434,16 @@ Run from the final tree:
 | `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 149 passed, 0 failed |
 | `tests/vault_attack.py`, with the `age` tool | 215 passed, 0 failed |
 
-All of these ran on the final code. The exceptions: the round trip's strace variant last ran
-one small frontend change earlier, and the attack suite's slow sections (crashes, a full disk,
-races, scale) ran on the same code just before it was committed. Its other sections re-ran on
-the commit, 156 of 156. These are from separate scripts that aren't in the repo:
+The Rust, dependency, round-trip and attack results are from `fe80c05`, and the backend hasn't
+changed since. The Python and GUI runs are on the final frontend, which after `fe80c05` only
+changed the wording of one dialog and how a long contact name wraps. These are from separate
+scripts that aren't in the repo, and ran on `fe80c05`:
 
 | Check | Result |
 |---|---|
-| A real window manager (openbox), with real pointer and keyboard | 33 of 33, before the last two layout corrections: real file choosers, a real drag between windows, Open in GNOME Text Editor and eog |
-| `main`'s binary and this branch's, in both directions | 29 of 29, before the last fixes: keys, files and text; `install.sh --uninstall` leaves keys, contacts and vaults alone |
-| Every screen in 13 display variants, on both GTK versions | No script problems. Looked at: light, right-to-left, high-contrast dark, large text and a small window, before the button row changed. After it: the file list only |
+| A real window manager (openbox), with real pointer and keyboard | 33 of 33: real file choosers, a real drag between windows, Open in GNOME Text Editor and eog |
+| `main`'s binary and this branch's, in both directions | 29 of 29: keys, files and text; `install.sh --uninstall` leaves keys, contacts and vaults alone |
+| Every screen in 13 display variants, on both GTK versions | No script problems. Looked at on `fe80c05`: a small window, dark, and right-to-left on the version floor. In a window narrow enough to wrap the buttons, a toast briefly covers the upper row |
 | Every command line of a full GUI run, through a logging shim | 51 command lines, no secret on any, none in any environment |
 | The AppDir as `build-appimage.sh` assembles it, launched through `AppRun` | First run works on both GTK versions; a clear message without GTK bindings |
 

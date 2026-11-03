@@ -108,10 +108,15 @@ or a crash dump while the backend is briefly holding it. Concretely:
   (`PR_SET_DUMPABLE(0)`) on Linux, so another process running as your user
   cannot read its memory via `/proc/<pid>/mem` or `ptrace`, regardless of the
   system's Yama `ptrace_scope` setting.
-- Secret-holding memory is locked out of swap (`mlockall`) where the OS
-  permits it, and intermediate secret buffers (the passphrase, the decrypted
-  key text) are held in zeroizing storage so they're wiped on drop rather than
-  left in freed heap.
+- Intermediate secret buffers (the passphrase, the decrypted key text) are held
+  in zeroizing storage so they're wiped on drop rather than left in freed heap.
+- Locking memory out of swap (`mlockall`) is attempted, but **don't count on it**.
+  It locks everything or nothing, and needs a limit that ordinary users often
+  can't raise. Where the limit is low (it was 64 KB where this was measured, in
+  WSL), nothing gets locked, and later allocations such as scrypt's and a decrypted
+  file's aren't locked unless the limit is unlimited. So secrets and decrypted
+  files can reach swap or a hibernation image: use encrypted swap, or none. To see
+  your own limit, run `ulimit -l`.
 - The identity file is created atomically at `0600` (no window at a wider
   permission, no clobber race), and a decrypted output file is staged to a
   temp file and only renamed into place after the entire ciphertext has
