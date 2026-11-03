@@ -61,32 +61,33 @@ written. See the threat model below.
 ## Files touched
 
 ```
- CHANGES-VAULTS.md                                 |  523 ++++++++++++++
- README.md                                         |  109 ++-
+ CHANGES-VAULTS.md                                 |  594 +++++++++++++++
+ README.md                                         |  118 ++-
  VAULTS_PLAN.md                                    |  403 +++++++++++
  backend/Cargo.lock                                |    4 +-
  backend/Cargo.toml                                |   13 +-
  backend/src/main.rs                               |    8 +-
- backend/src/vault.rs                              | 1574 +++++++++++++++++++++++++++++++++++++++++
+ backend/src/vault.rs                              | 1602 +++++++++++++++++++++++++++++++++++++++++
  docs/screenshots/vaults/01a-contacts-main.png     |  Bin 0 -> 40841 bytes
- docs/screenshots/vaults/01b-contacts-branch.png   |  Bin 0 -> 41547 bytes
+ docs/screenshots/vaults/01b-contacts-branch.png   |  Bin 0 -> 41523 bytes
  docs/screenshots/vaults/02-vaults-empty.png       |  Bin 0 -> 39245 bytes
- docs/screenshots/vaults/03-vaults-two.png         |  Bin 0 -> 36869 bytes
- docs/screenshots/vaults/04-create-dialog.png      |  Bin 0 -> 61648 bytes
- docs/screenshots/vaults/05-unlocked-nested.png    |  Bin 0 -> 47769 bytes
- docs/screenshots/vaults/06-rollback-warning.png   |  Bin 0 -> 54236 bytes
- docs/screenshots/vaults/07-tamper-error.png       |  Bin 0 -> 59810 bytes
- docs/screenshots/vaults/08-passphrase-menu.png    |  Bin 0 -> 45891 bytes
- docs/screenshots/vaults/09-forged-key-refused.png |  Bin 0 -> 49490 bytes
- docs/screenshots/vaults/10-open-warning.png       |  Bin 0 -> 75282 bytes
- docs/screenshots/vaults/11-open-changes-lost.png  |  Bin 0 -> 62480 bytes
- frontend/app.py                                   | 1102 ++++++++++++++++++++++++++++-
- tests/test_frontend_helpers.py                    |  323 +++++++++
+ docs/screenshots/vaults/03-vaults-two.png         |  Bin 0 -> 37865 bytes
+ docs/screenshots/vaults/04-create-dialog.png      |  Bin 0 -> 62234 bytes
+ docs/screenshots/vaults/05-unlocked-nested.png    |  Bin 0 -> 46347 bytes
+ docs/screenshots/vaults/06-rollback-warning.png   |  Bin 0 -> 54211 bytes
+ docs/screenshots/vaults/07-tamper-error.png       |  Bin 0 -> 58498 bytes
+ docs/screenshots/vaults/08-passphrase-menu.png    |  Bin 0 -> 45934 bytes
+ docs/screenshots/vaults/09-forged-key-refused.png |  Bin 0 -> 49504 bytes
+ docs/screenshots/vaults/10-open-warning.png       |  Bin 0 -> 74662 bytes
+ docs/screenshots/vaults/11-open-changes-lost.png  |  Bin 0 -> 61813 bytes
+ frontend/app.py                                   | 1145 ++++++++++++++++++++++++++++-
+ tests/test_frontend_helpers.py                    |  342 +++++++++
+ tests/vault_attack.py                             | 1367 +++++++++++++++++++++++++++++++++++
  tests/vault_gui_check.sh                          |   48 ++
- tests/vault_gui_driver.py                         | 1010 ++++++++++++++++++++++++++
- tests/vault_roundtrip.sh                          |  316 +++++++++
+ tests/vault_gui_driver.py                         | 1091 ++++++++++++++++++++++++++++
+ tests/vault_roundtrip.sh                          |  316 ++++++++
  tests/verify_deps.sh                              |   75 ++
- 25 files changed, 5492 insertions(+), 16 deletions(-)
+ 26 files changed, 7100 insertions(+), 26 deletions(-)
 ```
 
 | File | What |
@@ -99,6 +100,7 @@ written. See the threat model below.
 | `tests/vault_roundtrip.sh` | §5.2: end-to-end CLI test, tamper suite, optional strace proof. |
 | `tests/test_frontend_helpers.py` | §4.6: frontend helpers. |
 | `tests/vault_gui_check.sh`, `vault_gui_driver.py` | Not in the plan: a repeatable §5.3 run-through in the real window, which also takes the screenshots. |
+| `tests/vault_attack.py` | Not in the plan: crashes, a full disk, races, symlink traps, hostile vaults, forged seals, fuzzed arguments, and the format checked against the `age` tool. |
 | `docs/screenshots/vaults/` | §5.3. |
 | `README.md` | §6. |
 | `CHANGES-VAULTS.md` | This file. |
@@ -144,12 +146,18 @@ builds only.
 | `for name, fn in (("show-key", …), ("about", …)):` | adds `lock-now` | §4.5 |
 | `self.ask_passphrase(lambda p: self._save_then(` in `decrypt_file` | `with_passphrase("identity", …)` | §4.5 |
 | `self.ask_passphrase(lambda p: self._decrypt_text(text, p))` | `with_passphrase("identity", …)` | §4.5 |
+| `self.toasts.add_toast(Adw.Toast.new(text))` in `toast` | `Adw.Toast(use_markup=False, title=text)` | Bug: a message containing `&`, such as an error naming a path, didn't appear at all |
+| `self.toasts.add_toast(Adw.Toast.new(text))` in `error` | `self.toast(text)` | The same |
+| `row = Adw.ActionRow(title=c["name"], …)` in `_refresh_contacts` | `plain_row(…)` | Bug: a contact with `&` in the name showed a blank name |
+| The body of `save_contacts` (ten lines) | `save_json(CONTACTS_FILE, contacts)` | The same code, now one copy, and it writes `0600`. `contacts.json` was readable by other accounts on a shared machine |
 
 New lines also went into `Window.__init__`, `Window.error` (forgets a rejected
 passphrase; every identity decrypt reports through it), the menu in `_build_content`,
-and `VaultSend` (clears the cache on shutdown). All are §4.5. `ask_passphrase` itself
-is unchanged. Key creation and recovery still call it directly, so those are never cached.
-The stylesheet in `_load_css` also gained rules for the vault file list.
+and `VaultSend` (clears the cache on shutdown). All are §4.5. `ask_passphrase` gained one line,
+`dlg.set_focus(entry)`, because the prompt opened with nothing focused, so typing went nowhere
+until the field was clicked. Key creation and recovery still call it directly, so those are
+never cached. `Window.__init__` also turns off GTK's recent-files list. The stylesheet in
+`_load_css` also gained rules for the vault file list and for where toasts sit.
 
 ### `README.md` (three lines)
 
@@ -310,7 +318,9 @@ private key can make or open one. What follows from that:
   person chose, so more cost protects nothing. `set_max_work_factor` holds unlocking to the
   same value, so a planted `key.age` can't stall the app with an expensive one.
 - **A `password` vault was never exposed this way,** because forging its `key.age` needs the
-  password.
+  password. Its unlock is also held to the one work factor `vault-create` uses, 2^18. It used
+  to accept up to 2^22, so a shared vault could force about 17 seconds and 4 GB of memory, with
+  the window frozen, before the password was even tested.
 
 The private key now has a second use, as scrypt's input as well as for X25519. The fixed
 prefix keeps the two apart and scrypt is one-way, so this should be sound, but this specific
@@ -320,8 +330,8 @@ construction hasn't had an independent review.
 
 The same as the rest of VaultSend, plus what someone with write access can still do:
 
-- **Destroy a vault,** by deleting or corrupting it, or stall an operation by putting a FIFO
-  in it. Damage gets detected but can't be prevented, so keep backups.
+- **Destroy a vault,** by deleting or corrupting it. Damage gets detected but can't be
+  prevented, so keep backups.
 - **Put back an older genuine copy.** It opens, and the generation check warns only on a
   device that saw the newer version.
 - **Put another of the owner's own vaults in its place.** It opens as that vault. Nothing
@@ -353,6 +363,20 @@ The same as the rest of VaultSend, plus what someone with write access can still
   the window for the length of one scrypt.
 - A cancelled or failed `add` leaves encrypted orphan blobs if the backend is killed; the
   next change collects them, and `vault-check` reports them until then.
+- A folder extract killed partway leaves the files written so far in `<out>.vaultsend-part`,
+  decrypted, until the same extract is run again. A killed process can't clean up after itself.
+- Names from inside a vault appear on the backend's command line (`--entry`, `--dest`) while an
+  operation runs, so another account on the machine can see them in `ps` unless `/proc` is
+  mounted with `hidepid`. Secrets never do. A logging shim recorded every command line of a whole
+  GUI run, and no passphrase or password was on any of them or in any environment.
+- What a real app does with an opened file is outside VaultSend's control, and this was measured
+  rather than assumed. After locking and closing everything, GNOME Text Editor had kept the whole
+  document, including edits that were never saved, in
+  `~/.local/share/org.gnome.TextEditor/drafts/`, and the file's name in its recent lists and in
+  the desktop's `recently-used.xbel`. VaultSend's own warning covers this; it can't prevent it.
+- A file name containing a right-to-left override character displays reversed, so `‮gpj.exe`
+  shows as `exe.jpg`. It can only come from a vault someone else made. Opened copies are `0600`,
+  so nothing runs as a program, and the app that opens one goes by its real name and contents.
 
 ---
 
@@ -380,7 +404,8 @@ Places this differs from, or adds to, what the plan says:
 | A file with a name colliding on extract is an error | `open_private_new` would replace it, and "A" and "a" are one file on a case-insensitive disk. |
 | Clippy gate runs on Rust 1.85.0 | On untouched `main`, `clippy -D warnings` under 1.75.0 already fails on `File::open(&p)` in `identity_is_valid`, a lint later narrowed. That line is audited, so it stays. Build and tests run on both. |
 | `tests/vault_gui_check.sh` and `vault_gui_driver.py` | Not asked for. They make the Phase 4 run-through and §5.3 repeatable. |
-| `vault.rs` is 817 lines without its tests | Budget ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed. Removing the hash check gave back less than `seal_secret` and its constants added. |
+| `tests/vault_attack.py` | Not asked for. It makes the attacks on the backend repeatable. |
+| `vault.rs` is 831 lines without its tests | Over the budget of ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed, which took it to 817, and refusing FIFOs added the rest. |
 
 ---
 
@@ -390,18 +415,34 @@ Run from the final tree:
 
 | Check | Result |
 |---|---|
-| `cargo test --locked`, Rust 1.75.0 and 1.85.0 | 29 passed, 0 failed, on both |
+| `cargo test --locked`, Rust 1.75.0 and 1.85.0 | 30 passed, 0 failed, on both |
 | `cargo clippy --locked --all-targets -- -D warnings`, 1.85.0 | Clean |
 | `cargo build --release --locked`, 1.75.0 | OK |
 | `tests/verify_deps.sh` | All 8 crates match `Cargo.lock` and crates.io; no `[[package]]` added |
 | `tests/vault_roundtrip.sh` | 103 passed, 0 failed; 104 of 104 where `strace` is available |
 | strace proof | The last blob is opened before the output path is first touched |
-| `tests/test_frontend_helpers.py` | 37 passed, on both GTK versions below |
-| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 141 passed, 0 failed |
-| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 141 passed, 0 failed |
+| `tests/test_frontend_helpers.py` | 38 passed, on both GTK versions below |
+| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 149 passed, 0 failed |
+| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 149 passed, 0 failed |
+| `tests/vault_attack.py`, with the `age` tool | 215 passed, 0 failed |
 
-All of these ran on one tree, after `key.age` was sealed. The GUI count includes 5 checks for
-moving a selection out of a folder being closed.
+All of these ran on the final code. The exceptions: the round trip's strace variant last ran
+one small frontend change earlier, and the attack suite's slow sections (crashes, a full disk,
+races, scale) ran on the same code just before it was committed. Its other sections re-ran on
+the commit, 156 of 156. These are from separate scripts that aren't in the repo:
+
+| Check | Result |
+|---|---|
+| A real window manager (openbox), with real pointer and keyboard | 33 of 33, before the last two layout corrections: real file choosers, a real drag between windows, Open in GNOME Text Editor and eog |
+| `main`'s binary and this branch's, in both directions | 29 of 29, before the last fixes: keys, files and text; `install.sh --uninstall` leaves keys, contacts and vaults alone |
+| Every screen in 13 display variants, on both GTK versions | No script problems. Looked at: light, right-to-left, high-contrast dark, large text and a small window, before the button row changed. After it: the file list only |
+| Every command line of a full GUI run, through a logging shim | 51 command lines, no secret on any, none in any environment |
+| The AppDir as `build-appimage.sh` assembles it, launched through `AppRun` | First run works on both GTK versions; a clear message without GTK bindings |
+
+Rows that long: 10,000 rows lay out in about 4 seconds on GTK 4.18 and 9 on 4.14. Scale in the
+backend: 20,000 files add in 52 seconds, verify in 3 and extract in 75. A 1.5 GiB file extracts
+in 12 seconds with a 3 GiB peak. Running out of memory ends the backend with a signal, not a
+tidy error, and nothing is written.
 
 **The version floor.** libadwaita 1.5.0 is exactly the app's floor, and the whole run-through
 passes on it. GTK 4.10 itself wasn't tested, but it isn't reachable with that floor anyway:
@@ -409,8 +450,10 @@ Ubuntu's libadwaita 1.5 package requires GTK ≥ 4.13.4, so 4.14 is close to the
 On Ubuntu the run logs GTK warnings that the file-chooser and open-file portals are too old.
 No portal runs in the test environment, and GTK fell back and worked.
 
-**Not run:** the AppImage wasn't rebuilt. `build-appimage.sh` copies the same two files as
-before, the release binary and `app.py`, and its build command is unchanged.
+**Not run:** the AppImage wasn't packed, because that step downloads `appimagetool`.
+`build-appimage.sh` copies the same two files as before, the release binary and `app.py`, and
+its build command is unchanged. A mainstream desktop such as GNOME or KDE wasn't tried, nor was
+Wayland: openbox on X11 is the only real window manager tested.
 
 **Bugs these tests and the Phase 7 review found, all fixed:**
 
@@ -430,6 +473,30 @@ before, the release binary and `app.py`, and its build command is unchanged.
   No test caught this and the first review of `05-unlocked-nested.png` missed it; it showed
   up in a recording of the real window. The checks for it are now in the GUI run-through,
   and five of them fail on a copy of the app with the fix taken out.
+- A row stayed selected when its folder closed, so Open, Extract, Delete and Add files could act
+  on something out of sight. The selection now returns to "Everything in this vault". Two checks
+  fail with the fix taken out.
+
+**Found by the wider pass described in "How this was tested", all fixed:**
+
+- A FIFO at `VAULT`, `key.age`, `manifest.age` or a blob hung the backend forever, and since
+  unlocking runs in the foreground, the window with it. Anyone able to write to a shared folder
+  could do that. Vault files are now read only if they're regular files.
+- A hostile password vault could claim a costly scrypt work factor (see the threat model).
+- The passphrase prompt opened with nothing focused, so typing went nowhere until the field was
+  clicked. On `main` too.
+- After a drag from another app, the keyboard stayed with that app while the passphrase prompt
+  opened here, so a passphrase typed straight away went to the other app, perhaps its search box.
+  A drop now brings this window forward.
+- GTK logged every file chosen in a dialog to the desktop's shared `recently-used.xbel`, by name,
+  and kept the record after the file had gone. On `main` too. Turned off for this app.
+- `vaults.json`, `settings.json` and `contacts.json` were readable by other accounts on the
+  machine. All three are now `0600`, from the next time each is saved.
+- Any message containing `&` didn't appear at all, because toasts parse markup, so an error naming
+  such a path was silent. A contact with `&` in the name showed a blank name. Both on `main` too.
+- A toast sat on top of the action buttons for its five seconds, so a click on Open was lost.
+- The vault's row of buttons set the window's minimum width, on every page: 842 pixels, against
+  455 on `main`. They now wrap when they have to, which makes it 584.
 
 ---
 
@@ -438,7 +505,7 @@ before, the release binary and `app.py`, and its build command is unchanged.
 | | SHA-256 |
 |---|---|
 | Baseline binary, `main` @ `ecab899`, rustc 1.75.0 | `9bd8360a7eac449c92192591dc757df918b110b8f4973ced33ec5d8c029aafb1` |
-| This branch's binary, rustc 1.75.0 | `e22d389cc33b0a8c0bbe9d74b0371261ac8c631b25633850f9f18deae427acc4` |
+| This branch's binary, rustc 1.75.0 | `88342e06783d235ae8bd0378f5395cb1b6f3870a8c32b697d18755e12f0040dd` |
 
 Registry `.crate` files, each matching both `Cargo.lock` and the checksum crates.io
 publishes (`tests/verify_deps.sh`):
@@ -512,6 +579,10 @@ bash tests/verify_deps.sh
 
 ```bash
 bash tests/vault_roundtrip.sh
+```
+
+```bash
+python3 tests/vault_attack.py backend/target/release/vaultsend-backend
 ```
 
 ```bash

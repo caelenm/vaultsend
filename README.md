@@ -71,7 +71,9 @@ It is off by default.
 memory (`$XDG_RUNTIME_DIR`, or `/dev/shm`; if neither is really in RAM, Open refuses
 rather than use the disk). But the app that opens it may save its own unencrypted
 copies to disk, such as recovery files, thumbnails and recent-file lists, and VaultSend
-can't see or remove those. While the copy exists, other programs running as you can read
+can't see or remove those. GNOME Text Editor, for one, was tested and keeps the whole document
+in `~/.local/share/org.gnome.TextEditor/drafts/`, even edits you never saved, after everything
+is closed and locked. While the copy exists, other programs running as you can read
 it, and memory can be written to swap or a hibernation image. VaultSend warns you about
 this the first time and asks you to acknowledge it. If that isn't acceptable for a file,
 don't open it on this machine.
@@ -216,9 +218,9 @@ environment variable, the sibling `backend/target/release/` build, then `PATH`.
 |------|------|
 | Encrypted private key (`0600`) | `~/.local/share/vaultsend/identity.age` |
 | Public key (clear) | `~/.local/share/vaultsend/pubkey` |
-| Contacts (plain, exportable JSON) | `~/.config/vaultsend/contacts.json` |
-| Your list of vaults (no secrets) | `~/.config/vaultsend/vaults.json` |
-| Settings, such as Remember passphrase (never the passphrase) | `~/.config/vaultsend/settings.json` |
+| Contacts (plain, exportable JSON, `0600`) | `~/.config/vaultsend/contacts.json` |
+| Your list of vaults (no secrets, `0600`) | `~/.config/vaultsend/vaults.json` |
+| Settings, such as Remember passphrase (never the passphrase, `0600`) | `~/.config/vaultsend/settings.json` |
 | New vaults, unless you choose elsewhere | `~/.local/share/vaultsend/vaults/<name>.vsvault` |
 | Files you've opened from a vault, until you lock it or close the app (in memory) | `$XDG_RUNTIME_DIR/vaultsend-open-*`, or `/dev/shm/vaultsend-open-*` |
 
@@ -385,6 +387,11 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
   logout or reboot.
 - File and folder names in a vault must be valid UTF-8; adding one that isn't fails
   and names it.
+- Names from inside a vault appear on the backend's command line while an operation runs, so
+  another account on the same machine can see them in `ps` unless `/proc` is mounted with
+  `hidepid`. Passphrases and passwords never do.
+- A folder extract that is killed partway leaves the files written so far, decrypted, in
+  `<name>.vaultsend-part`. Running the same extract again clears them.
 - A password can't be changed yet, and there's no single-file export: sharing a
   password vault means copying its folder.
 - No third-party security audit has been performed. See the security warning
