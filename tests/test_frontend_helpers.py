@@ -188,6 +188,17 @@ class Names(unittest.TestCase):
         self.assertEqual(app.short_path("/x.vsvault"), "/x.vsvault")
         self.assertEqual(app.short_path(home + "er/x.vsvault"), "/…/x.vsvault")
 
+    def test_entry_indent_follows_depth(self):
+        self.assertEqual(app.entry_indent("top"), 0)
+        self.assertEqual(app.entry_indent("a/b"), app.INDENT_STEP)
+        self.assertEqual(app.entry_indent("a/b/c.txt"), 2 * app.INDENT_STEP)
+
+    def test_entry_indent_is_capped(self):
+        most = app.INDENT_LEVELS * app.INDENT_STEP
+        self.assertEqual(app.entry_indent("a/" * app.INDENT_LEVELS + "x"), most)
+        self.assertEqual(app.entry_indent("a/" * (app.INDENT_LEVELS + 1) + "x"), most)
+        self.assertEqual(app.entry_indent("a/" * 1000 + "x"), most)
+
 
 class Listing(unittest.TestCase):
     def test_unescapes_for_display(self):

@@ -19,7 +19,10 @@ REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO / "frontend"))
 
 import app  # noqa: E402
-from gi.repository import Adw, Gio, GLib, Gtk  # noqa: E402
+import gi  # noqa: E402
+
+gi.require_version("Graphene", "1.0")
+from gi.repository import Adw, Gio, GLib, Graphene, Gtk  # noqa: E402
 
 # The app uses Gtk.FileDialog; only this driver reaches into the chooser it opens.
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -138,13 +141,42 @@ def click_vault(vault):
     win.vault_list.emit("row-activated", row)
 
 
-def select(path):
-    """Click a row's radio button. They run in display order after "Everything"."""
+def radio_of(path):
+    """A row's radio button. They run in display order after "Everything"."""
     radios = [w for w in walk(win.file_list) if isinstance(w, Gtk.CheckButton)]
     paths = [app.ROOT_ENTRY, *win.vault_entries]
     assert len(radios) == len(paths), f"{len(radios)} radios for {len(paths)} rows"
-    radios[paths.index(path)].set_active(True)
+    return radios[paths.index(path)]
+
+
+def select(path):
+    """Click a row's radio button."""
+    radio_of(path).set_active(True)
     assert win.selected_entry == path, f"selected {win.selected_entry!r}, wanted {path!r}"
+
+
+def left_edge(path):
+    """Where a row's radio button really is on screen."""
+    ok, point = radio_of(path).compute_point(win, Graphene.Point())
+    assert ok, f"{path!r} isn't on screen"
+    return point.x
+
+
+def arrow_color(path):
+    """The colour of a folder's own arrow, the first one under its row."""
+    row = radio_of(path).get_ancestor(Adw.ExpanderRow)
+    arrow = next(w for w in walk(row) if "expander-row-arrow" in w.get_css_classes())
+    return arrow.get_color().to_string()
+
+
+def real_click(widget):
+    """Click with the real pointer. The window is at 0,0, with no window manager to move it."""
+    native = widget.get_native()
+    centre = Graphene.Point().init(widget.get_width() / 2, widget.get_height() / 2)
+    ok, point = widget.compute_point(native, centre)
+    assert ok, f"{widget} isn't on screen"
+    x, y = native.get_surface_transform()
+    subprocess.run(["xdotool", "mousemove", str(round(point.x + x)), str(round(point.y + y)), "click", "1"], check=True)
 
 
 def visible_vault_page():
@@ -346,6 +378,58 @@ def script():
     win._show_files(list(win.vault_entries.values()))
     yield SETTLE
     shot("05-unlocked-nested")
+
+    # -- The list shows how deep each row is, and each folder's own state ------------
+    top = left_edge("My Documents")
+    subfolder = left_edge("My Documents/taxes")
+    deeper = left_edge("My Documents/taxes/2025")
+    check(top == left_edge(app.ROOT_ENTRY) == left_edge("letter.txt"), "top-level rows line up")
+    check(top < subfolder < deeper, "each folder level sits further in")
+    check(left_edge("My Documents/taxes/return.pdf") == deeper, "a file lines up with the folders beside it")
+    check(left_edge("My Documents/notes.txt") == subfolder, "and so does one higher up")
+
+    photos = radio_of("My Documents/photos")
+    photos_row = photos.get_ancestor(Adw.ExpanderRow)
+    real_click(photos)
+    yield SETTLE
+    check(win.selected_entry == "My Documents/photos", "clicking a folder's radio selects it")
+    check(not photos_row.get_expanded(), "without opening it")
+    closed_color = arrow_color("My Documents/photos")
+    real_click(photos.get_ancestor(Adw.ActionRow))
+    yield SETTLE
+    check(photos_row.get_expanded() and "My Documents/photos" in win.expanded, "clicking the rest of its row opens it")
+    check(arrow_color("My Documents/photos") != closed_color, "and its arrow changes")
+    check(win.selected_entry == "My Documents/photos", "the selection stays")
+    real_click(photos.get_ancestor(Adw.ActionRow))
+    yield SETTLE
+    check(not photos_row.get_expanded() and "My Documents/photos" not in win.expanded, "clicking again closes it")
+
+    def folder(path):
+        return {"path": path, "is_dir": True, "size": 0}
+
+    listing = list(win.vault_entries.values())
+    was_expanded = win.expanded
+    win.expanded = {"open", "open/open"}
+    win._show_files([folder("closed"), folder("open"), folder("open/closed"), folder("open/open"), folder("open/open/closed")])
+    yield SETTLE
+    check(arrow_color("open/closed") == arrow_color("closed"), "a closed folder inside an open one has a closed arrow")
+    check(arrow_color("open/open/closed") == arrow_color("closed"), "at any depth")
+    check(arrow_color("open/open") == arrow_color("open") != arrow_color("closed"), "an open folder has an open arrow at any depth")
+
+    # A very deep path keeps its indent within reason, and leaves the window alone.
+    width = win.get_width()
+    levels = ["/".join(f"level {n}" for n in range(depth + 1)) for depth in range(40)]
+    long_name = levels[-1] + "/" + "a long file name " * 12
+    win.expanded = set(levels)
+    win._show_files([folder(path) for path in levels] + [{"path": long_name, "is_dir": False, "size": 1}])
+    yield from wait_for(lambda: radio_of(long_name).get_width() > 0, "the deep listing to be laid out")
+    yield SETTLE
+    check(win.get_width() == width, "a very deep path doesn't widen the window")
+    check(left_edge(levels[app.INDENT_LEVELS]) == left_edge(long_name) > left_edge(levels[app.INDENT_LEVELS - 1]), "and its indent stops at the cap")
+
+    win.expanded = was_expanded
+    win._show_files(listing)
+    yield SETTLE
 
     # -- Name clash: Replace / Cancel ------------------------------------------------
     single.write_text("a second version of the letter\n")

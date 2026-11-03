@@ -47,6 +47,8 @@ VAULTS_DIR = DATA_DIR / "vaults"  # where a new vault goes unless you choose els
 VAULT_SUFFIX = ".vsvault"
 ROOT_ENTRY = "/"  # backend's name for the whole vault (ROOT_ENTRY in vault.rs)
 OPEN_PREFIX = "vaultsend-open-"  # folders holding opened copies, cleared after a crash
+INDENT_STEP = 20  # pixels a row in a vault's file list sits in, per folder level
+INDENT_LEVELS = 6  # no further: the list can't scroll sideways, so more would widen the window
 
 APP_VERSION = "0.2.0"
 
@@ -411,6 +413,10 @@ def short_path(path: str) -> str:
     return path if len(parts) <= 3 else f"{parts[0]}/…/{parts[-1]}"
 
 
+def entry_indent(path: str) -> int:
+    return min(path.count("/"), INDENT_LEVELS) * INDENT_STEP
+
+
 def memory_candidates() -> list:
     # $XDG_RUNTIME_DIR is private to this user and cleared at logout, so it comes first.
     # /dev/shm is shared, but mkdtemp makes a 0700 folder with an unguessable name in it.
@@ -735,6 +741,21 @@ class Window(Adw.ApplicationWindow):
         .vaultsend-delete:active {
             color: #e01b24;
             background-color: alpha(#e01b24, 0.12);
+        }
+        /* libadwaita styles every arrow below an open row as open, so a closed folder
+           inside an open one would look open. Give it the theme's closed arrow back. */
+        list.nested row.expander:not(:checked) > box > list > row image.expander-row-arrow {
+            -gtk-icon-transform: rotate(0.5turn);
+            opacity: 0.55;
+            color: inherit;
+        }
+        list.nested row.expander:not(:checked) > box > list > row image.expander-row-arrow:dir(rtl) {
+            -gtk-icon-transform: rotate(-0.5turn);
+        }
+        /* Each nested list is shaded on top of its parent's, which a very deep vault would
+           take too dark to read. Stop one level past INDENT_LEVELS, as the indent does. */
+        list.nested list.nested list.nested list.nested list.nested list.nested list.nested {
+            background: none;
         }
         """
         provider = Gtk.CssProvider()
@@ -1740,7 +1761,7 @@ class Window(Adw.ApplicationWindow):
         folders = {}
         for e in entries:
             parent, _, name = e["path"].rpartition("/")
-            radio = Gtk.CheckButton(valign=Gtk.Align.CENTER)
+            radio = Gtk.CheckButton(valign=Gtk.Align.CENTER, margin_start=entry_indent(e["path"]))
             radio.set_group(everything)
             radio.connect("toggled", self._on_entry_toggled, e["path"])
             if e["is_dir"]:
