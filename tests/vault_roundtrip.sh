@@ -107,11 +107,7 @@ for MODE in self password; do
     mkdir -p "$W"
 
     echo "== 2. [$MODE] create, add, list, extract: extracted tree identical"
-    if [ "$MODE" = self ]; then
-        check "vault-create" "$BIN" vault-create --dir "$V" --mode self
-    else
-        check "vault-create" "$BIN" vault-create --dir "$V" --mode password --pass-fd 3 3<<<"$SECRET"
-    fi
+    check "vault-create" "$BIN" vault-create --dir "$V" --mode "$MODE" --pass-fd 3 3<<<"$SECRET"
     check "VAULT file says $MODE" grep -qx "mode $MODE" "$V/VAULT"
     check "vault-add the tree" vault vault-add --src "$SRC"
     [ -z "$(find "$V" -type f -perm /077)" ] && ok "every vault file is 0600" || bad "a vault file is group/world accessible"
@@ -191,14 +187,11 @@ for MODE in self password; do
     refuses_and_writes_nothing "flipped byte in the manifest" "$W/t6" vault vault-extract --entry / --out "$W/t6"
     restore
 
-    # The key.age pin: a swapped key is refused before any secret is read.
-    PIN=$(sha256sum "$V/key.age" | awk '{print $1}')
-    "$BIN" vault-create --dir "$W/forged.vsvault" --mode "$MODE" --pass-fd 3 3<<<"$SECRET"
-    cp "$W/forged.vsvault/key.age" "$V/key.age"
-    refuses_and_writes_nothing "swapped key.age with the pin" "$W/t7" \
-        vault vault-extract --key-sha256 "$PIN" --entry / --out "$W/t7"
+    # key.age from another of the owner's own vaults is genuine, but can't read this one.
+    "$BIN" vault-create --dir "$W/other.vsvault" --mode "$MODE" --pass-fd 3 3<<<"$SECRET"
+    cp "$W/other.vsvault/key.age" "$V/key.age"
+    refuses_and_writes_nothing "key.age from another vault" "$W/t7" vault vault-extract --entry / --out "$W/t7"
     restore
-    check "the same pin passes on the real key.age" vault vault-list --key-sha256 "$PIN" >/dev/null
 
     echo "== 6. [$MODE] vault-check after repair"
     check "vault-check is clean on the good vault" vault vault-check >/dev/null
@@ -231,8 +224,74 @@ mkdir "$T/exists"
 vault vault-extract --entry tree --out "$T/exists" 2>"$T/err"
 check "folder extract refuses an existing path" [ $? != 0 ]
 check "and leaves it untouched" [ -z "$(ls -A "$T/exists")" ]
-check "create refuses a non-empty folder" bash -c '! "$0" vault-create --dir "$1" --mode self 2>/dev/null' "$BIN" "$T/links"
+refuses_a_full_folder() { ! "$BIN" vault-create --dir "$1" --mode self --pass-fd 3 3<<<"$ID_PASS" 2>/dev/null; }
+check "create refuses a non-empty folder" refuses_a_full_folder "$T/links"
 check "and leaves it untouched" [ -e "$T/links/real.txt" ]
+
+# ---------------------------------------------------------------------------
+echo "== forgeries: write access to the folder and only the owner's public key"
+# ---------------------------------------------------------------------------
+SECRET=$ID_PASS
+V="$T/self.vsvault"
+SEALED="$T/sealed-key.age"
+cp "$V/key.age" "$SEALED"
+check "key.age is sealed" grep -qa '^-> scrypt ' "$SEALED"
+check "and not wrapped to the public key" bash -c '! grep -qa "^-> X25519 " "$0"' "$SEALED"
+BLOBS_BEFORE=$(tree_digest "$V")
+
+# What used to open: a key wrapped to the owner's public key. "does not open with your
+# key" shows it stopped at the seal, before the contents were even looked at.
+printf 'a key the attacker knows' | "$BIN" encrypt -r "$PUBKEY" --out "$T/forged-key.age"
+cp "$T/forged-key.age" "$V/key.age"
+forged_is_refused() {
+    local what=$1; shift
+    if "$@" 2>"$T/err" >/dev/null; then
+        bad "$what: should have failed"
+    elif grep -q 'does not open with your key' "$T/err"; then
+        ok "$what  [$(head -c 90 "$T/err")]"
+    else
+        bad "$what: wrong error: $(cat "$T/err")"
+    fi
+}
+forged_is_refused "forged key.age: vault-list" vault vault-list
+forged_is_refused "forged key.age: vault-check" vault vault-check
+forged_is_refused "forged key.age: vault-extract" vault vault-extract --entry / --out "$T/forged-out"
+check "and it wrote nothing" [ ! -e "$T/forged-out" ]
+forged_is_refused "forged key.age: vault-add" vault vault-add --src "$T/links/real.txt" --dest stolen
+cp "$SEALED" "$V/key.age"
+[ "$(tree_digest "$V")" = "$BLOBS_BEFORE" ] && ok "the vault is byte-identical afterwards" || bad "the vault changed"
+
+# Making a self vault takes the private key, not just the public one.
+check "a self vault can't be made without the passphrase" bash -c '! "$0" vault-create --dir "$1" --mode self 2>/dev/null' "$BIN" "$T/nopass.vsvault"
+check "and nothing is created" [ ! -e "$T/nopass.vsvault" ]
+
+# Another person's seal: a real vault, made properly, by someone else with the same passphrase.
+OTHER="$T/stranger"
+mkdir -p "$OTHER"
+XDG_DATA_HOME="$OTHER" "$BIN" keygen --pass-fd 3 3<<<"$ID_PASS" >/dev/null
+XDG_DATA_HOME="$OTHER" "$BIN" vault-create --dir "$T/theirs.vsvault" --mode self --pass-fd 3 3<<<"$ID_PASS"
+XDG_DATA_HOME="$OTHER" check "the stranger opens their own vault" "$BIN" vault-list --dir "$T/theirs.vsvault" --pass-fd 3 3<<<"$ID_PASS" >/dev/null
+V="$T/theirs.vsvault"
+forged_is_refused "a stranger's vault doesn't open for the owner" vault vault-list
+V="$T/self.vsvault"
+XDG_DATA_HOME="$OTHER" forged_is_refused "the owner's vault doesn't open for a stranger" vault vault-list
+
+# scrypt costly enough to stall the app is refused by its work factor, not paid for.
+cp "$T/password.vsvault/key.age" "$V/key.age"
+forged_is_refused "a password vault's key.age in a self vault" vault vault-list
+cp "$SEALED" "$V/key.age"
+
+# The other way round: the VAULT file is only a hint, and flipping it opens nothing.
+cp "$V/VAULT" "$T/VAULT.real"
+printf 'vaultsend-vault 1\nmode password\n' >"$V/VAULT"
+refuses_and_writes_nothing "mode flipped to password" "$T/flip-out" vault vault-extract --entry / --out "$T/flip-out"
+cp "$T/VAULT.real" "$V/VAULT"
+
+# Only the private key matters: no state on this device is involved.
+SECOND="$T/second-device"
+mkdir -p "$SECOND"
+cp -a "$XDG_DATA_HOME/." "$SECOND/"
+XDG_DATA_HOME="$SECOND" XDG_CONFIG_HOME="$T/second-config" check "the same key on another device opens it" vault vault-list >/dev/null
 
 # ---------------------------------------------------------------------------
 echo "== 7. (optional) strace: output opened only after every blob was read"

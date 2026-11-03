@@ -45,7 +45,7 @@ class ConfigFiles(unittest.TestCase):
 
 
 class Registry(ConfigFiles):
-    GOOD = {"name": "A", "path": "/a", "mode": "password", "last_generation": 3, "key_sha256": "ab"}
+    GOOD = {"name": "A", "path": "/a", "mode": "password", "last_generation": 3}
 
     def test_round_trip(self):
         app.save_json(app.VAULTS_FILE, [self.GOOD])
@@ -66,12 +66,12 @@ class Registry(ConfigFiles):
 
     def test_bad_fields_get_safe_defaults(self):
         for generation in (-1, "7", 1.5, True, None):
-            self.write(app.VAULTS_FILE, json.dumps([{"name": "x", "path": "/p", "mode": "odd", "last_generation": generation, "key_sha256": 5}]))
-            self.assertEqual(app.load_vaults(), [{"name": "x", "path": "/p", "mode": "self", "last_generation": 0, "key_sha256": ""}], generation)
+            self.write(app.VAULTS_FILE, json.dumps([{"name": "x", "path": "/p", "mode": "odd", "last_generation": generation}]))
+            self.assertEqual(app.load_vaults(), [{"name": "x", "path": "/p", "mode": "self", "last_generation": 0}], generation)
 
-    def test_registry_written_before_key_pinning_still_loads(self):
-        self.write(app.VAULTS_FILE, json.dumps([{"name": "x", "path": "/p", "mode": "self", "last_generation": 2}]))
-        self.assertEqual(app.load_vaults()[0]["key_sha256"], "")
+    def test_a_key_hash_from_an_older_build_is_dropped(self):
+        self.write(app.VAULTS_FILE, json.dumps([{"name": "x", "path": "/p", "mode": "self", "last_generation": 2, "key_sha256": "ab"}]))
+        self.assertEqual(app.load_vaults(), [{"name": "x", "path": "/p", "mode": "self", "last_generation": 2}])
 
 
 class Settings(ConfigFiles):
@@ -316,17 +316,7 @@ class VaultFiles(unittest.TestCase):
     def test_a_fifo_does_not_hang(self):
         # A hang would fail this by never finishing: the window would freeze the same way.
         os.mkfifo(self.dir / "VAULT")
-        os.mkfifo(self.dir / "key.age")
         self.assertIsNone(app.read_vault_mode(self.dir))
-        self.assertEqual(app.key_fingerprint(self.dir), "")
-
-    def test_key_fingerprint(self):
-        self.assertEqual(app.key_fingerprint(self.dir), "")
-        (self.dir / "key.age").write_bytes(b"abc")
-        self.assertEqual(
-            app.key_fingerprint(self.dir),
-            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
-        )
 
 
 if __name__ == "__main__":

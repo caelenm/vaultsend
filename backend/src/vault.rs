@@ -4,8 +4,8 @@
 //
 //   MyVault.vsvault/
 //     VAULT          "vaultsend-vault 1\nmode self|password\n"  (not secret; a prompt hint)
-//     key.age        the vault's own X25519 identity, encrypted to the user's public key
-//                    (self) or to a password at scrypt 2^18 (password)
+//     key.age        the vault's own X25519 identity, sealed with a secret only the user's
+//                    private key can produce (self) or a password at scrypt 2^18 (password)
 //     manifest.age   the file list, encrypted to the vault's public key
 //     blobs/<aa>/<32-hex-id>.age   one per file, encrypted to the vault's public key
 //
@@ -21,20 +21,24 @@ use std::iter::once;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
-use age::secrecy::ExposeSecret;
+use age::secrecy::{ExposeSecret, SecretString};
 use age::x25519;
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    commit_staged, encrypt_to, load_identity, open_private_new, pubkey_path, read_passphrase,
-    staging_path, R, SCRYPT_LOG_N, SCRYPT_MAX_LOG_N,
+    commit_staged, encrypt_to, load_identity, open_private_new, read_passphrase, staging_path,
+    R, SCRYPT_LOG_N, SCRYPT_MAX_LOG_N,
 };
 
 const VAULT_FILE: &str = "VAULT";
 const VAULT_MAGIC: &str = "vaultsend-vault 1";
 const KEY_FILE: &str = "key.age";
+const SEAL_PREFIX: &str = "vaultsend-vault-key-1:";
+/// scrypt cost of a `self` vault's seal. Its input is a private key rather than something
+/// a person chose, so there is nothing for a higher cost to protect.
+const SEAL_LOG_N: u8 = 10;
 const MANIFEST_FILE: &str = "manifest.age";
 const MANIFEST_MAGIC: &str = "vaultsend-manifest 1";
 const BLOBS_DIR: &str = "blobs";
@@ -270,30 +274,38 @@ fn lock_vault(dir: &str, exclusive: bool) -> R<File> {
     Ok(file)
 }
 
+/// What seals a `self` vault's key.age. age has no sender authentication and a public
+/// key is public, so a key wrapped to it could have come from anyone, and a vault built
+/// around it would open normally. Only the holder of the private key can compute this,
+/// so only they can make a key.age that opens here.
+fn seal_secret(identity: &x25519::Identity) -> SecretString {
+    let private = identity.to_string();
+    let private = private.expose_secret();
+    // Exact capacity: SecretString won't reallocate it, so no copy is left behind.
+    let mut text = String::with_capacity(SEAL_PREFIX.len() + private.len());
+    text.push_str(SEAL_PREFIX);
+    text.push_str(private);
+    SecretString::from(text)
+}
+
 /// Decrypt key.age and return the vault's identity. scrypt runs here, once per
 /// operation rather than once per file. The VAULT file's mode is only a hint for
 /// which secret to try: a wrong mode just fails to decrypt, as an ordinary error.
-///
-/// `pinned` is the SHA-256 of key.age the frontend remembers for this vault. age has
-/// no sender authentication and a user's public key is public, so anyone who can
-/// write here could wrap a key of their own to the user. It is checked on the exact
-/// bytes about to be used, before the secret is even read.
-fn unlock(dir: &str, pass_fd: i32, pinned: Option<&str>) -> R<x25519::Identity> {
+fn unlock(dir: &str, pass_fd: i32) -> R<x25519::Identity> {
     let hint = fs::read_to_string(format!("{dir}/{VAULT_FILE}"))
         .map_err(|e| format!("reading {VAULT_FILE}: {e}"))?;
     let mode = hint.strip_prefix(VAULT_MAGIC).and_then(|r| r.strip_prefix("\nmode "));
     let wrapped = fs::read(format!("{dir}/{KEY_FILE}"))
         .map_err(|e| format!("reading this vault's {KEY_FILE}: {e}"))?;
-    if pinned.is_some_and(|p| hex(&Sha256::digest(&wrapped)) != p) {
-        return Err(format!("this vault's {KEY_FILE} has changed since this device last opened it"));
-    }
     let dec = age::Decryptor::new(&wrapped[..])
         .map_err(|_| format!("this vault's {KEY_FILE} is damaged"))?;
     let mut stream = match mode {
         Some("self\n") => {
             let identity = load_identity(pass_fd)?;
-            dec.decrypt(once(&identity as &dyn age::Identity))
-                .map_err(|_| format!("this vault does not open with your key ({KEY_FILE} is for another key, or damaged)"))?
+            let mut sealed = age::scrypt::Identity::new(seal_secret(&identity));
+            sealed.set_max_work_factor(SEAL_LOG_N);
+            dec.decrypt(once(&sealed as &dyn age::Identity))
+                .map_err(|_| format!("this vault does not open with your key ({KEY_FILE} wasn't made with your private key, or is damaged)"))?
         }
         Some("password\n") => {
             let mut scrypt_id = age::scrypt::Identity::new(read_passphrase(pass_fd)?);
@@ -384,9 +396,9 @@ struct Vault {
 }
 
 impl Vault {
-    fn open(dir: &str, pass_fd: i32, pinned: Option<&str>, exclusive: bool) -> R<Vault> {
+    fn open(dir: &str, pass_fd: i32, exclusive: bool) -> R<Vault> {
         let lock = lock_vault(dir, exclusive)?;
-        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd, pinned)?, _lock: Some(lock) })
+        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd)?, _lock: Some(lock) })
     }
 
     /// `wrap` already holds key.age's wrapped file key, so scrypt (for a password
@@ -732,7 +744,7 @@ fn parse_opts(args: &[String]) -> R<Opts<'_>> {
     while let Some(name) = it.next() {
         match name {
             "--replace" => o.replace = true,
-            "--dir" | "--mode" | "--pass-fd" | "--key-sha256" | "--src" | "--dest" | "--entry" | "--out" => {
+            "--dir" | "--mode" | "--pass-fd" | "--src" | "--dest" | "--entry" | "--out" => {
                 o.pairs.push((name, it.next().ok_or_else(|| format!("{name} needs a value"))?))
             }
             other => return Err(format!("unknown option '{other}'")),
@@ -763,9 +775,10 @@ fn cmd_create(dir: &str, o: &Opts) -> R<()> {
     let mode = o.need("--mode")?;
     let wrap = match mode {
         "self" => {
-            let public = fs::read_to_string(pubkey_path()?).map_err(|_| "no identity yet — run keygen first".to_string())?;
-            let own = public.trim().parse::<x25519::Recipient>().map_err(|e| format!("reading your public key: {e}"))?;
-            age::Encryptor::with_recipients(once(&own as &dyn age::Recipient))
+            let identity = load_identity(o.pass_fd()?)?;
+            let mut recipient = age::scrypt::Recipient::new(seal_secret(&identity));
+            recipient.set_work_factor(SEAL_LOG_N);
+            age::Encryptor::with_recipients(once(&recipient as &dyn age::Recipient))
         }
         "password" => {
             let password = read_passphrase(o.pass_fd()?)?;
@@ -790,7 +803,7 @@ fn print_out(text: &str) -> R<()> {
 pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
     let o = parse_opts(args)?;
     let dir = o.need("--dir")?;
-    let open = |exclusive| Vault::open(dir, o.pass_fd()?, o.get("--key-sha256"), exclusive);
+    let open = |exclusive| Vault::open(dir, o.pass_fd()?, exclusive);
     match cmd {
         "vault-create" => cmd_create(dir, &o),
         "vault-list" => print_out(&open(false)?.listing()?),
@@ -902,14 +915,7 @@ mod tests {
 
     fn roundtrip_cli(t: &TempDir, mode: &str, pass: &str) {
         let dir = t.path("vault.vsvault");
-        match mode {
-            "self" => run("vault-create", &args(&["--dir", &dir, "--mode", "self"])).unwrap(),
-            _ => run(
-                "vault-create",
-                &args(&["--dir", &dir, "--mode", "password", "--pass-fd", &pass_fd(pass).to_string()]),
-            )
-            .unwrap(),
-        }
+        run("vault-create", &args(&["--dir", &dir, "--mode", mode, "--pass-fd", &pass_fd(pass).to_string()])).unwrap();
         let random: Vec<u8> = (0..200_000u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
         let boundary = vec![7u8; 65536];
         t.write("src/tree/nested/deep/random.bin", &random);
@@ -923,7 +929,7 @@ mod tests {
         run("vault-add", &args(&["--dir", &dir, "--pass-fd", &fd(), "--src", &t.path("src/tree")])).unwrap();
 
         // vault-list goes to stdout, so check its source directly.
-        let v = Vault::open(&dir, pass_fd(pass), None, false).unwrap();
+        let v = Vault::open(&dir, pass_fd(pass), false).unwrap();
         let listing = v.listing().unwrap();
         assert!(listing.starts_with("generation 1\n"), "{listing}");
         assert!(listing.contains("D tree/empty-folder\n"), "{listing}");
@@ -971,8 +977,8 @@ mod tests {
         let pw = t.path("pw.vsvault");
         let own = t.path("own.vsvault");
         run("vault-create", &args(&["--dir", &pw, "--mode", "password", "--pass-fd", &pass_fd(VAULT_PASS).to_string()])).unwrap();
-        run("vault-create", &args(&["--dir", &own, "--mode", "self"])).unwrap();
-        let open_err = |d: &str, p: &str| Vault::open(d, pass_fd(p), None, false).err().unwrap();
+        run("vault-create", &args(&["--dir", &own, "--mode", "self", "--pass-fd", &pass_fd(ID_PASS).to_string()])).unwrap();
+        let open_err = |d: &str, p: &str| Vault::open(d, pass_fd(p), false).err().unwrap();
 
         assert!(open_err(&pw, "not the vault password").contains("wrong password"));
         assert!(open_err(&own, "not the identity pass").contains("wrong passphrase"));
@@ -995,49 +1001,75 @@ mod tests {
         assert!(open_err(&own, ID_PASS).contains("damaged"));
     }
 
-    /// The attack the pin exists for: someone who can write to a `self` vault's folder
-    /// wraps a key of their own to the user's public key. The user's passphrase still
-    /// opens it, so without the pin nothing would stand in the way.
+    /// The attack sealing exists for: someone who can write to the folder builds a
+    /// complete, valid vault around a key they know, wrapped to the user's public key,
+    /// which is all age would ask of them. Without the seal it opens and passes every
+    /// check, and whatever the user adds next is readable by whoever built it.
     #[test]
-    fn a_swapped_key_file_is_refused_when_pinned() {
+    fn a_vault_forged_from_the_public_key_is_refused() {
         let t = TempDir::new();
-        let (dir, forged) = (t.path("mine.vsvault"), t.path("forged.vsvault"));
-        run("vault-create", &args(&["--dir", &dir, "--mode", "self"])).unwrap();
-        run("vault-create", &args(&["--dir", &forged, "--mode", "self"])).unwrap();
-        let key = format!("{dir}/key.age");
-        let pin = hex(&Sha256::digest(fs::read(&key).unwrap()));
+        let dir = t.path("forged.vsvault");
+        let public = fs::read_to_string(crate::pubkey_path().unwrap()).unwrap();
+        let own = public.trim().parse::<x25519::Recipient>().unwrap();
+        let wrap = age::Encryptor::with_recipients(once(&own as &dyn age::Recipient)).unwrap();
+        let forged = Vault::create(&dir, "self", wrap).unwrap();
+        add(&forged, &t.write("planted.txt", b"planted by the forger"));
+        assert_eq!(generation(&forged), 1);
+        let blobs = fs::read_dir(format!("{dir}/blobs")).unwrap().count();
 
-        assert!(Vault::open(&dir, pass_fd(ID_PASS), Some(&pin), false).is_ok());
-        fs::copy(format!("{forged}/key.age"), &key).unwrap();
-        // Without a pin the swap goes unnoticed: the passphrase unlocks the new key.
-        assert!(Vault::open(&dir, pass_fd(ID_PASS), None, false).is_ok());
-        let err = Vault::open(&dir, pass_fd(ID_PASS), Some(&pin), false).err().unwrap();
-        assert!(err.contains("has changed"), "{err}");
+        let err = Vault::open(&dir, pass_fd(ID_PASS), false).err().unwrap();
+        assert!(err.contains("does not open with your key"), "{err}");
 
         // Through the CLI too, for a mutating command, and nothing is changed.
         let fd = pass_fd(ID_PASS).to_string();
-        let src = t.write("secret.txt", b"would be readable by whoever swapped the key");
-        let err = run("vault-add", &args(&["--dir", &dir, "--pass-fd", &fd, "--key-sha256", &pin, "--src", &src])).unwrap_err();
-        assert!(err.contains("has changed"), "{err}");
-        assert_eq!(fs::read_dir(format!("{dir}/blobs")).unwrap().count(), 0);
+        let src = t.write("secret.txt", b"would be readable by the forger");
+        let err = run("vault-add", &args(&["--dir", &dir, "--pass-fd", &fd, "--src", &src])).unwrap_err();
+        assert!(err.contains("does not open with your key"), "{err}");
+        assert_eq!(fs::read_dir(format!("{dir}/blobs")).unwrap().count(), blobs);
+    }
+
+    /// key.age from another of the user's own vaults is genuine, so it unseals, but it
+    /// can't read this vault's manifest.
+    #[test]
+    fn a_key_file_from_another_vault_cannot_read_this_one() {
+        let t = TempDir::new();
+        let (dir, other) = (t.path("mine.vsvault"), t.path("other.vsvault"));
+        for d in [&dir, &other] {
+            run("vault-create", &args(&["--dir", d, "--mode", "self", "--pass-fd", &pass_fd(ID_PASS).to_string()])).unwrap();
+        }
+        fs::copy(format!("{other}/key.age"), format!("{dir}/key.age")).unwrap();
+        let v = Vault::open(&dir, pass_fd(ID_PASS), false).unwrap();
+        assert!(v.load_manifest().err().unwrap().contains("manifest"));
     }
 
     #[test]
     fn create_rules() {
         let t = TempDir::new();
+        let fd = || pass_fd(ID_PASS).to_string();
         let d = t.path("short.vsvault");
         let short = pass_fd("too short").to_string();
         let err = run("vault-create", &args(&["--dir", &d, "--mode", "password", "--pass-fd", &short])).unwrap_err();
         assert!(err.contains("at least 10"), "{err}");
         assert!(!Path::new(&d).exists());
 
+        // A self vault takes the private key, so it can't be made from the public key alone.
+        let err = run("vault-create", &args(&["--dir", &d, "--mode", "self"])).unwrap_err();
+        assert!(err.contains("--pass-fd"), "{err}");
+        let wrong = pass_fd("not the identity passphrase").to_string();
+        let err = run("vault-create", &args(&["--dir", &d, "--mode", "self", "--pass-fd", &wrong])).unwrap_err();
+        assert!(err.contains("wrong passphrase"), "{err}");
+        assert!(!Path::new(&d).exists());
+
         t.write("full/file", b"x");
-        assert!(run("vault-create", &args(&["--dir", &t.path("full"), "--mode", "self"])).unwrap_err().contains("not empty"));
+        assert!(run("vault-create", &args(&["--dir", &t.path("full"), "--mode", "self", "--pass-fd", &fd()])).unwrap_err().contains("not empty"));
         assert_eq!(fs::read(t.path("full/file")).unwrap(), b"x");
 
         fs::create_dir(t.path("empty")).unwrap();
-        run("vault-create", &args(&["--dir", &t.path("empty"), "--mode", "self"])).unwrap();
+        run("vault-create", &args(&["--dir", &t.path("empty"), "--mode", "self", "--pass-fd", &fd()])).unwrap();
         assert_eq!(fs::read_to_string(t.path("empty/VAULT")).unwrap(), "vaultsend-vault 1\nmode self\n");
+        // Sealed, and not wrapped to the public key.
+        let key = fs::read(t.path("empty/key.age")).unwrap();
+        assert!(key.windows(9).any(|w| w == b"-> scrypt") && !key.windows(9).any(|w| w == b"-> X25519"));
         assert!(run("vault-create", &args(&["--dir", &d, "--mode", "other"])).is_err());
         for name in ["key.age", "manifest.age", "VAULT"] {
             assert_eq!(fs::metadata(t.path(&format!("empty/{name}"))).unwrap().permissions().mode() & 0o777, 0o600);

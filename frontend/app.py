@@ -11,7 +11,6 @@ decrypts it, verifies it and writes it straight to the location you choose, or, 
 Open, to a private in-memory folder that another app reads it from.
 """
 
-import hashlib
 import json
 import os
 import shutil
@@ -298,8 +297,7 @@ def save_json(path, value) -> None:
 
 def load_vaults() -> list:
     """The vaults this device knows about. Besides name and location, each entry
-    remembers two values for spotting tampering: the highest generation seen
-    (rollback) and the hash of its key.age (a swapped key)."""
+    remembers the highest generation seen, for spotting a rollback."""
     try:
         data = json.loads(VAULTS_FILE.read_text("utf-8"))
     except (OSError, ValueError):
@@ -311,13 +309,11 @@ def load_vaults() -> list:
         if not (isinstance(v, dict) and isinstance(v.get("name"), str) and isinstance(v.get("path"), str)):
             continue
         generation = v.get("last_generation")
-        key = v.get("key_sha256")
         vaults.append({
             "name": v["name"],
             "path": v["path"],
             "mode": "password" if v.get("mode") == "password" else "self",
             "last_generation": generation if type(generation) is int and generation >= 0 else 0,
-            "key_sha256": key if isinstance(key, str) else "",
         })
     return vaults
 
@@ -372,16 +368,6 @@ def read_vault_mode(path):
         "vaultsend-vault 1\nmode self\n": "self",
         "vaultsend-vault 1\nmode password\n": "password",
     }.get(text)
-
-
-def key_fingerprint(path) -> str:
-    """SHA-256 of a vault's key.age, or "" if it can't be read. key.age is
-    encrypted, so hashing it here touches no secret."""
-    file = Path(path, "key.age")
-    try:
-        return hashlib.sha256(file.read_bytes()).hexdigest() if file.is_file() else ""
-    except OSError:
-        return ""
 
 
 def parse_listing(text: str):
@@ -1629,21 +1615,22 @@ class Window(Adw.ApplicationWindow):
                 "If you lose it, the files can't be recovered.",
                 confirm=True,
             )
-        else:
-            self._create_vault(name, path, mode, None)
-
-    def _create_vault(self, name, path, mode, password):
-        if mode == "self" and self.my_pubkey is None:
+        elif self.my_pubkey is None:
             self.error("Your key isn't ready yet.")
-            return
+        else:
+            # Sealing the vault's key takes your private key, not just the public one.
+            self.with_passphrase("identity", lambda p: self._create_vault(name, path, mode, p))
+
+    def _create_vault(self, name, path, mode, secret):
         try:
-            run_backend(["vault-create", "--dir", path, "--mode", mode], passphrase=password)
+            run_backend(["vault-create", "--dir", path, "--mode", mode], passphrase=secret)
         except BackendError as e:
+            if "wrong passphrase" in str(e):
+                self.cache.forget("identity")
             self._vault_error("Couldn't create the vault", str(e))
             return
         vault = self._remember_vault(name, path, mode)
-        if password is not None:
-            self.cache.put(self._secret_key(vault), password)
+        self.cache.put(self._secret_key(vault), secret)
         self.toast("Vault created.")
 
     def _add_existing_vault(self, path):
@@ -1658,11 +1645,7 @@ class Window(Adw.ApplicationWindow):
         self._remember_vault(name, path, mode)
 
     def _remember_vault(self, name, path, mode):
-        # The key pinned here is trusted as found, the same as any first use.
-        vault = {
-            "name": name, "path": path, "mode": mode,
-            "last_generation": 0, "key_sha256": key_fingerprint(path),
-        }
+        vault = {"name": name, "path": path, "mode": mode, "last_generation": 0}
         self.vaults.append(vault)
         save_json(VAULTS_FILE, self.vaults)
         self.select_vault(vault)
@@ -1805,51 +1788,17 @@ class Window(Adw.ApplicationWindow):
         self._vault_error(f"Problem with “{vault['name']}”", message)
 
     def with_vault_secret(self, vault, on_ok):
-        """The way into every operation: check the vault's key file hasn't been
-        swapped, and only then ask for (or recall) the secret."""
-        def ask():
-            if vault["mode"] == "self":
-                self.with_passphrase("identity", on_ok)
-            else:
-                self.with_passphrase(
-                    self._secret_key(vault), on_ok,
-                    heading="Unlock vault", body=f"Enter the password for “{vault['name']}”.",
-                )
-
-        current = key_fingerprint(vault["path"])
-        if not vault["key_sha256"] and current:
-            vault["key_sha256"] = current  # added before keys were remembered
-            save_json(VAULTS_FILE, self.vaults)
-        if current in ("", vault["key_sha256"]):  # unreadable: the backend will say so
-            ask()
-            return
-        dlg = Adw.AlertDialog(
-            heading="This vault's key has changed",
-            body=f"The key file in “{vault['name']}” isn't the one this device remembers, and it "
-            "never changes in normal use. Someone with access to the folder may have replaced "
-            "it, and anything you add could then be readable by them.\n\nContinue only if you "
-            "know why it changed, for example if you put a different vault in this folder.",
-        )
-        dlg.add_response("cancel", "Cancel")
-        dlg.add_response("trust", "Trust the new key")
-        dlg.set_response_appearance("trust", Adw.ResponseAppearance.DESTRUCTIVE)
-        dlg.set_default_response("cancel")
-        dlg.set_close_response("cancel")
-
-        def resp(_d, r):
-            if r == "trust":
-                vault["key_sha256"] = current
-                save_json(VAULTS_FILE, self.vaults)
-                ask()
-
-        dlg.connect("response", resp)
-        dlg.present(self)
+        """The way into every operation: ask for (or recall) the vault's secret."""
+        if vault["mode"] == "self":
+            self.with_passphrase("identity", on_ok)
+        else:
+            self.with_passphrase(
+                self._secret_key(vault), on_ok,
+                heading="Unlock vault", body=f"Enter the password for “{vault['name']}”.",
+            )
 
     def _vault_args(self, vault, command, *rest):
-        # The pin also goes to the backend, which checks it against the exact bytes
-        # it decrypts: the check above can't see a swap made after it ran.
-        pin = ["--key-sha256", vault["key_sha256"]] if vault["key_sha256"] else []
-        return [command, "--dir", vault["path"], *pin, *rest]
+        return [command, "--dir", vault["path"], *rest]
 
     def vault_unlock(self):
         vault = self.vault

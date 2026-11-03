@@ -228,13 +228,17 @@ def build_source_tree():
     return src
 
 
-def forge_key_file(vault):
-    """What an attacker with write access could do: a key wrapped to the user's public
-    key, made by the backend so that it is perfectly valid."""
-    forged = WORK / "forged.vsvault"
-    shutil.rmtree(forged, ignore_errors=True)
-    subprocess.run([app.BACKEND, "vault-create", "--dir", str(forged), "--mode", "self"], check=True)
-    return (forged / "key.age").read_bytes()
+def forge_key_file():
+    """All an attacker with write access can do: wrap something to the user's public key.
+    The contents don't matter, because it never unseals. The unit tests try the complete
+    forgery, with a real key, manifest and files."""
+    forged = WORK / "forged-key.age"
+    forged.unlink(missing_ok=True)
+    subprocess.run(
+        [app.BACKEND, "encrypt", "-r", win.my_pubkey, "--out", str(forged)],
+        input=b"a key the attacker knows", check=True,
+    )
+    return forged.read_bytes()
 
 
 def script():
@@ -264,12 +268,27 @@ def script():
     check(find_check(dlg, "Default").get_active(), "default location is the default")
     shot("04-create-dialog")
     respond("Create")
+    yield SETTLE
+    check(bool([w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)]), "creating with my key asks for the passphrase")
+    enter_passphrase("not the identity passphrase")
+    yield SETTLE
+    check("wrong passphrase" in dialog_text(), "a wrong passphrase is reported")
+    check(not win.vaults and not (app.VAULTS_DIR / "Personal.vsvault").exists(), "and creates nothing")
+    respond("Close")
+    yield SETTLE
+    win.on_add_clicked()
+    yield SETTLE
+    next(w for w in walk(dialog()) if type(w) is Gtk.Entry).set_text("Personal")
+    respond("Create")
+    yield SETTLE
+    enter_passphrase(ID_PASS)
     yield from wait_for(lambda: win.vaults, "the vault to appear")
     yield SETTLE
     own = win.vaults[0]
     check(own["path"] == str(app.VAULTS_DIR / "Personal.vsvault"), "created at the default location")
     check(app.read_vault_mode(own["path"]) == "self", "VAULT file says self")
-    check(own["key_sha256"] == app.key_fingerprint(own["path"]) != "", "key.age pinned at creation")
+    sealed = Path(own["path"], "key.age").read_bytes()
+    check(b"-> scrypt" in sealed and b"-> X25519" not in sealed, "key.age is sealed, not wrapped to the public key")
     check(registry(own)["last_generation"] == 0, "registry written")
     check(visible_vault_page() and locked(), "new vault shows locked")
 
@@ -740,42 +759,52 @@ def script():
     own["last_generation"] = newest
     app.save_json(app.VAULTS_FILE, win.vaults)
 
-    # -- A swapped key.age: warned before any secret is asked for --------------------
+    # -- A forged key.age: refused outright, with nothing to click through ------------
     key_path = Path(own["path"], "key.age")
     real_key = key_path.read_bytes()
-    pin = own["key_sha256"]
-    key_path.write_bytes(forge_key_file(own))
+    key_path.write_bytes(forge_key_file())
     win.vault_lock()
     win.vault_unlock()
     yield SETTLE
-    check("key has changed" in dialog().get_heading(), "a swapped key warns before any prompt")
-    check(not [w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)], "no passphrase is asked for yet")
-    shot("09-key-changed-warning")
-    respond("Cancel")
-    yield SETTLE
-    check(win.get_visible_dialog() is None and locked(), "Cancel stops there")
-    check(registry(own)["key_sha256"] == pin, "Cancel keeps the pin")
-    # The backend refuses too, for a swap made after the frontend's check has passed.
-    try:
-        app.run_backend(win._vault_args(own, "vault-list"), passphrase=ID_PASS)
-        refusal = ""
-    except app.BackendError as e:
-        refusal = str(e)
-    check("has changed" in refusal, "backend refuses the swapped key by itself")
-    win.vault_unlock()
-    yield SETTLE
-    respond("Trust the new key")
-    yield SETTLE
-    check(registry(own)["key_sha256"] == app.key_fingerprint(own["path"]), "Trust updates the pin")
     enter_passphrase(ID_PASS)
     yield SETTLE
-    # The forged key opens with the passphrase but can't read the real manifest.
-    check("manifest is damaged or was replaced" in dialog().get_body(), "a forged key can't read the real vault")
+    check("does not open with your key" in dialog().get_body(), "a forged key.age is refused")
+    labels = [w.get_label() for w in walk(dialog()) if isinstance(w, Gtk.Button) and w.get_label()]
+    check(labels == ["Close"], "and the only way out of that is Close")
+    shot("09-forged-key-refused")
     respond("Close")
     yield SETTLE
+    check(locked(), "the vault stays locked")
     key_path.write_bytes(real_key)
-    own["key_sha256"] = pin
-    app.save_json(app.VAULTS_FILE, win.vaults)
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    check(not locked(), "the real key.age opens it again")
+    win.vault_lock()
+    yield SETTLE
+
+    # The same on a device with no memory of the vault: nothing here relies on that.
+    forged_path = WORK / "Forged.vsvault"
+    shutil.copytree(own["path"], forged_path)
+    (forged_path / "key.age").write_bytes(forge_key_file())
+    win._add_existing_vault(str(forged_path))
+    yield SETTLE
+    forged = next(v for v in win.vaults if v["path"] == str(forged_path))
+    check(win.vault is forged and locked(), "a forged vault can be listed, locked")
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    check("does not open with your key" in dialog().get_body(), "but is refused on a device new to it")
+    respond("Close")
+    yield SETTLE
+    win._confirm_forget_vault(forged)
+    yield SETTLE
+    respond("Remove from list")
+    yield SETTLE
+    click_vault(own)
+    yield SETTLE
 
     # -- Remember passphrase ---------------------------------------------------------
     win.activate_action("win.remember", GLib.Variant("s", "5m"))
