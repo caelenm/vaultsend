@@ -12,6 +12,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = tempfile.mkdtemp(prefix="vaultsend-frontend-test-", dir="/tmp")
 os.environ["XDG_CONFIG_HOME"] = f"{ROOT}/config"
@@ -74,15 +75,19 @@ class Registry(ConfigFiles):
 
 
 class Settings(ConfigFiles):
-    DEFAULT = {"remember": "off", "cache_explained": False}
+    DEFAULT = {"remember": "off", "cache_explained": False, "open_explained": False}
 
     def test_defaults(self):
         self.assertEqual(app.load_settings(), self.DEFAULT)
 
     def test_round_trip(self):
-        value = {"remember": "20m", "cache_explained": True}
+        value = {"remember": "20m", "cache_explained": True, "open_explained": True}
         app.save_json(app.SETTINGS_FILE, value)
         self.assertEqual(app.load_settings(), value)
+
+    def test_settings_from_before_open_existed_still_warn(self):
+        self.write(app.SETTINGS_FILE, '{"remember": "5m", "cache_explained": true}')
+        self.assertFalse(app.load_settings()["open_explained"])
 
     def test_garbled(self):
         for text in ("{not json", "[]", "null", '{"remember": "forever"}', '{"remember": ["5m"]}', '{"remember": 5}'):
@@ -220,6 +225,65 @@ class Listing(unittest.TestCase):
         for text in ("", "nonsense\n", "generation x\n"):
             with self.assertRaises(ValueError):
                 app.parse_listing(text)
+
+
+class OpenedCopies(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(dir=ROOT))
+
+    def test_only_a_folder_really_in_memory_is_used(self):
+        with mock.patch.object(app, "memory_candidates", lambda: ["/disk", "/ram", "/also-ram"]), \
+                mock.patch.object(app, "is_in_memory", lambda p: p != "/disk"):
+            self.assertEqual(app.memory_folder(), "/ram")
+        # The point of the check: no in-memory folder means no folder, never a disk one.
+        with mock.patch.object(app, "memory_candidates", lambda: ["/disk"]), \
+                mock.patch.object(app, "is_in_memory", lambda p: False):
+            self.assertIsNone(app.memory_folder())
+
+    def test_candidates_prefer_the_private_runtime_dir(self):
+        with mock.patch.dict(os.environ, {"XDG_RUNTIME_DIR": "/run/user/1"}):
+            self.assertEqual(app.memory_candidates(), ["/run/user/1", "/dev/shm"])
+        with mock.patch.dict(os.environ):
+            os.environ.pop("XDG_RUNTIME_DIR", None)
+            self.assertEqual(app.memory_candidates(), ["/dev/shm"])
+
+    def test_in_memory_detection(self):
+        self.assertFalse(app.is_in_memory("/proc"))
+        self.assertFalse(app.is_in_memory("/no/such/folder"))
+        with open("/proc/mounts") as mounts:
+            tmpfs = [line.split()[1] for line in mounts if line.split()[2] == "tmpfs"]
+        tmpfs = [m for m in tmpfs if os.path.isdir(m)]
+        if not tmpfs:
+            self.skipTest("no tmpfs is mounted here")
+        self.assertTrue(app.is_in_memory(tmpfs[0]), tmpfs[0])
+
+    def test_clearing_leftovers_touches_only_our_folders(self):
+        ours = self.dir / f"{app.OPEN_PREFIX}abc"
+        ours.mkdir()
+        (ours / "secret.txt").write_text("left by a crash")
+        other_folder = self.dir / "someone-elses"
+        other_folder.mkdir()
+        (other_folder / "keep.txt").write_text("keep")
+        a_file = self.dir / f"{app.OPEN_PREFIX}a-file"
+        a_file.write_text("keep")
+        link = self.dir / f"{app.OPEN_PREFIX}a-link"
+        link.symlink_to(other_folder)
+        with mock.patch.object(app, "memory_candidates", lambda: [str(self.dir), "/no/such/folder"]):
+            app.clear_stale_copies()
+        self.assertFalse(ours.exists())
+        self.assertEqual((other_folder / "keep.txt").read_text(), "keep")
+        self.assertTrue(a_file.exists())
+        self.assertTrue(link.is_symlink())
+
+    def test_stamp_notices_an_edit_without_reading_the_file(self):
+        f = self.dir / "copy"
+        f.write_text("original")
+        before = app.file_stamp(f)
+        self.assertEqual(app.file_stamp(f), before)
+        f.write_text("edited, and longer")
+        self.assertNotEqual(app.file_stamp(f), before)
+        f.unlink()
+        self.assertIsNone(app.file_stamp(f))
 
 
 class VaultFiles(unittest.TestCase):

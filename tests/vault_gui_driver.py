@@ -28,6 +28,9 @@ SHOTS = Path(sys.argv[1])
 WORK = Path(sys.argv[2])
 ID_PASS = os.environ["VS_ID_PASS"]
 VAULT_PASS = "gui test vault password"
+VIEWER_LOG = Path(os.environ["VS_VIEWER_LOG"])
+assert app.memory_folder(), "needs an in-memory $XDG_RUNTIME_DIR or /dev/shm"
+STALE_COPY = Path(app.memory_folder(), app.OPEN_PREFIX + "left-by-a-crash")
 
 SETTLE = 700  # ms for dialogs and rows to finish animating
 passed = 0
@@ -204,6 +207,7 @@ def forge_key_file(vault):
 
 def script():
     yield 1800
+    check(not STALE_COPY.exists(), "a crash's leftover copy is cleared at launch")
     # -- Contacts mode: unchanged apart from the toggle ------------------------------
     shot("01b-contacts-branch")
     check(win.content_stack.get_visible_child_name() == "send", "starts on the send page")
@@ -452,6 +456,115 @@ def script():
     check(not (WORK / "out" / "cancelled").exists(), "a cancelled extract produces nothing")
     check(not stale.exists(), "and its staging folder is removed")
 
+    # -- Open: a warning once, a copy in memory, the file's real default app ----------
+    def opened_folders():
+        return list(Path(app.memory_folder()).glob(app.OPEN_PREFIX + "*"))
+
+    def viewer_calls():
+        return VIEWER_LOG.read_text().splitlines() if VIEWER_LOG.exists() else []
+
+    select("My Documents")
+    win.vault_open()
+    yield SETTLE
+    check("Select a file to open." in toasts, "Open needs a file, not a folder")
+    check(win.get_visible_dialog() is None, "and asks for nothing")
+
+    select("letter.txt")
+    win.vault_open()
+    yield SETTLE
+    check("unencrypted copies" in dialog().get_body(), "first Open warns about plaintext")
+    check(not [w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)], "before asking for a secret")
+    shot("10-open-warning")
+    respond("Cancel")
+    yield SETTLE
+    check(not opened_folders() and not win.opened, "Cancel decrypts nothing")
+    check(not json.loads(app.SETTINGS_FILE.read_text() if app.SETTINGS_FILE.exists() else "{}").get("open_explained"), "and isn't remembered")
+
+    win.vault_open()
+    yield SETTLE
+    respond("I understand")
+    yield SETTLE
+    check(json.loads(app.SETTINGS_FILE.read_text())["open_explained"] is True, "I understand is remembered")
+    enter_passphrase(ID_PASS)
+    yield from wait_for(lambda: len(viewer_calls()) == 1, "the default app to be launched")
+    yield from idle()
+    copy = Path(viewer_calls()[0])
+    check(Path(str(VIEWER_LOG) + ".content").read_text() == single.read_text(), "the default app got the decrypted file")
+    check(copy.name == "letter.txt", "under its own name, so the right app opens it")
+    check(app.is_in_memory(copy.parent), "in a folder that is really in memory")
+    check(copy.stat().st_mode & 0o777 == 0o600 and copy.parent.stat().st_mode & 0o777 == 0o700, "private, and not executable")
+    check(not list(Path(copy.parent).glob("*.vaultsend-part")), "with no staging file left")
+
+    select("letter.txt")
+    win.vault_open()
+    yield SETTLE
+    check(bool([w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)]), "second Open doesn't warn again")
+    enter_passphrase(ID_PASS)
+    yield from wait_for(lambda: len(viewer_calls()) == 2, "the second launch")
+    yield from idle()
+    check(len(opened_folders()) == 2, "each Open makes its own copy")
+
+    # Unchanged copies just go; an edited one asks first.
+    win.vault_lock()
+    yield SETTLE
+    check(win.get_visible_dialog() is None and locked(), "Lock with unedited copies needs no confirmation")
+    check(not opened_folders() and not win.opened, "and deletes them")
+
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    select("letter.txt")
+    win.vault_open()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield from wait_for(lambda: len(viewer_calls()) == 3, "the third launch")
+    yield from idle()
+    copy = Path(viewer_calls()[2])
+    copy.write_text("edited in the other app, longer than before\n")
+    win.vault_lock()
+    yield SETTLE
+    check("letter.txt" in dialog().get_body() and dialog().get_heading() == "Changes will be lost", "Lock warns about an edited copy")
+    shot("11-open-changes-lost")
+    respond("Cancel")
+    yield SETTLE
+    check(not locked() and copy.exists(), "Cancel keeps the vault unlocked and the copy")
+    win.vault_lock()
+    yield SETTLE
+    respond("Delete changes")
+    yield SETTLE
+    check(locked() and not copy.exists() and not opened_folders(), "Delete changes locks and deletes it")
+
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+
+    # A type with no default app: says so, and leaves nothing.
+    select("My Documents/taxes/return.pdf")
+    win.vault_open()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield from idle()  # past the progress dialog, which is a dialog too
+    yield from wait_for(lambda: win.get_visible_dialog() is not None, "the no-app error")
+    yield SETTLE
+    check(dialog().get_heading() == "Couldn't open that file", "no default app is reported")
+    check(not opened_folders() and not win.opened, "and its copy is deleted at once")
+    respond("Close")
+    yield SETTLE
+
+    # No in-memory folder: refuses rather than falling back to disk.
+    real_memory_folder = app.memory_folder
+    app.memory_folder = lambda: None
+    select("letter.txt")
+    win.vault_open()
+    yield SETTLE
+    check(dialog().get_heading() == "Can't open this file", "no in-memory folder is refused")
+    check(not [w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)], "without asking for a secret")
+    respond("Close")
+    yield SETTLE
+    app.memory_folder = real_memory_folder
+
     # -- Tamper: extract fails, says why, writes nothing -----------------------------
     blobs = sorted(Path(own["path"], "blobs").rglob("*.age"))
     victim = blobs[0]
@@ -483,6 +596,26 @@ def script():
     respond("Close")
     yield SETTLE
     victim.write_bytes(good)
+
+    # Open follows the same rule: nothing reaches the app, or memory, unverified.
+    originals = {b: b.read_bytes() for b in blobs}
+    for blob in blobs:
+        damaged = bytearray(originals[blob])
+        damaged[len(damaged) // 2] ^= 1
+        blob.write_bytes(damaged)
+    launches = len(viewer_calls())
+    select("letter.txt")
+    win.vault_open()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield from idle()
+    check("failed verification" in dialog_text(), "Open refuses a tampered file")
+    check(len(viewer_calls()) == launches, "and no app is launched")
+    check(not opened_folders() and not win.opened, "and no copy is left")
+    respond("Close")
+    yield SETTLE
+    for blob, data in originals.items():
+        blob.write_bytes(data)
 
     # -- Rollback warning ------------------------------------------------------------
     backup = WORK / "backup.vsvault"
@@ -686,6 +819,34 @@ def script():
     config = app.VAULTS_FILE.read_text() + app.SETTINGS_FILE.read_text()
     check(ID_PASS not in config and VAULT_PASS not in config, "no secret in any config file")
 
+    # -- Closing the window: an edited copy asks first, and nothing stays in memory ---
+    win.vaults_toggle.emit("clicked")
+    click_vault(own)
+    yield SETTLE
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    select("letter.txt")
+    win.vault_open()
+    yield SETTLE
+    launches = len(viewer_calls())
+    enter_passphrase(ID_PASS)
+    yield from wait_for(lambda: len(viewer_calls()) == launches + 1, "the last launch")
+    yield from idle()
+    Path(viewer_calls()[-1]).write_text("edited again, and again longer than before\n")
+    win.close()
+    yield SETTLE
+    check(dialog().get_heading() == "Changes will be lost", "closing warns about an edited copy")
+    respond("Cancel")
+    yield SETTLE
+    check(win.get_visible() and len(opened_folders()) == 1, "Cancel keeps the window and the copy")
+    win.close()
+    yield SETTLE
+    respond("Delete changes")
+    # The window closes and the app quits here; main() checks that the copies went too.
+    yield SETTLE
+
 
 def run(gen):
     def step():
@@ -714,6 +875,8 @@ def run(gen):
 def main():
     global application, win
     WORK.mkdir(parents=True, exist_ok=True)
+    STALE_COPY.mkdir()
+    (STALE_COPY / "secret.txt").write_text("from a run that never got to clean up")
     application = app.VaultSend()
 
     def started(_app):
@@ -725,6 +888,7 @@ def main():
     application.connect_after("activate", started)
     app.Adw.init()
     application.run([])
+    check(not list(Path(app.memory_folder()).glob(app.OPEN_PREFIX + "*")), "no opened copy survives the app closing")
     print(f"\n{passed} passed, {failed} failed")
     sys.exit(1 if failed or passed == 0 else 0)
 

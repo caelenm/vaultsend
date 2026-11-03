@@ -7,7 +7,8 @@ This process never sees your private key. It only:
 
 The private key lives, passphrase-encrypted, where only the backend reads it.
 File plaintext from a vault never passes through this process either: the backend
-decrypts it, verifies it and writes it straight to the location you choose.
+decrypts it, verifies it and writes it straight to the location you choose, or, for
+Open, to a private in-memory folder that another app reads it from.
 """
 
 import hashlib
@@ -16,6 +17,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 from urllib.parse import unquote
@@ -44,6 +46,7 @@ DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "sha
 VAULTS_DIR = DATA_DIR / "vaults"  # where a new vault goes unless you choose elsewhere
 VAULT_SUFFIX = ".vsvault"
 ROOT_ENTRY = "/"  # backend's name for the whole vault (ROOT_ENTRY in vault.rs)
+OPEN_PREFIX = "vaultsend-open-"  # folders holding opened copies, cleared after a crash
 
 APP_VERSION = "0.2.0"
 
@@ -331,7 +334,7 @@ REMEMBER_SECONDS = {value: seconds for value, _, seconds in REMEMBER_CHOICES}
 
 
 def load_settings() -> dict:
-    settings = {"remember": "off", "cache_explained": False}
+    settings = {"remember": "off", "cache_explained": False, "open_explained": False}
     try:
         data = json.loads(SETTINGS_FILE.read_text("utf-8"))
     except (OSError, ValueError):
@@ -340,6 +343,7 @@ def load_settings() -> dict:
         if isinstance(data.get("remember"), str) and data["remember"] in REMEMBER_SECONDS:
             settings["remember"] = data["remember"]
         settings["cache_explained"] = data.get("cache_explained") is True
+        settings["open_explained"] = data.get("open_explained") is True
     return settings
 
 
@@ -405,6 +409,53 @@ def short_path(path: str) -> str:
         path = "~" + path[len(home):]
     parts = path.split("/")
     return path if len(parts) <= 3 else f"{parts[0]}/…/{parts[-1]}"
+
+
+def memory_candidates() -> list:
+    # $XDG_RUNTIME_DIR is private to this user and cleared at logout, so it comes first.
+    # /dev/shm is shared, but mkdtemp makes a 0700 folder with an unguessable name in it.
+    return [p for p in (os.environ.get("XDG_RUNTIME_DIR"), "/dev/shm") if p]
+
+
+def is_in_memory(path) -> bool:
+    try:
+        info = Gio.File.new_for_path(str(path)).query_filesystem_info("filesystem::type", None)
+    except GLib.Error:
+        return False
+    return info.get_attribute_string("filesystem::type") in ("tmpfs", "ramfs")
+
+
+def memory_folder():
+    """Where Open may put a decrypted copy, or None. Checked rather than assumed, so a
+    copy can never quietly land on disk because a folder turned out not to be in RAM."""
+    return next((p for p in memory_candidates() if is_in_memory(p)), None)
+
+
+def clear_stale_copies() -> None:
+    """Remove opened copies left behind by a crash. Only real folders of ours with our
+    prefix: never a symlink, and never another user's in the shared /dev/shm."""
+    for base in memory_candidates():
+        try:
+            with os.scandir(base) as entries:
+                for entry in entries:
+                    if (
+                        entry.name.startswith(OPEN_PREFIX)
+                        and entry.is_dir(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_uid == os.getuid()
+                    ):
+                        shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def file_stamp(path):
+    """Enough to notice an edit without reading the file: this process must never hold
+    a vault file's plaintext, even to hash it."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
 
 
 class PassphraseCache:
@@ -656,6 +707,9 @@ class Window(Adw.ApplicationWindow):
         self.vault_entries = None  # its listing by path, or None while locked
         self.selected_entry = ROOT_ENTRY  # what Extract and Delete act on
         self.expanded = set()  # folders left open, kept across re-listing
+        self.opened = []  # decrypted copies given to other apps; see vault_open()
+        clear_stale_copies()
+        self.connect("close-request", self._on_close_request)
         self.settings = load_settings()
         self.cache = PassphraseCache()
         self.cache.set_lifetime(REMEMBER_SECONDS[self.settings["remember"]])
@@ -1368,10 +1422,14 @@ class Window(Adw.ApplicationWindow):
         save_json(SETTINGS_FILE, self.settings)
 
     def on_lock_now(self, *_):
-        self.cache.clear()
-        if self.vault:
-            self._show_locked()
-        self.toast("Locked. Passphrases forgotten.")
+        def lock():
+            self.cache.clear()
+            self._discard_copies()
+            if self.vault:
+                self._show_locked()
+            self.toast("Locked. Passphrases forgotten and opened files deleted.")
+
+        self._confirm_discard(None, lock)
 
     # -- Vault list -----------------------------------------------------------
     def _refresh_vaults(self):
@@ -1632,6 +1690,7 @@ class Window(Adw.ApplicationWindow):
             ("Add files…", self.vault_add_files),
             ("Add folder…", self.vault_add_folder),
             (None, None),
+            ("Open", self.vault_open),
             ("Extract…", self.vault_extract),
             ("Delete", self.vault_delete),
             ("Lock", self.vault_lock),
@@ -1812,12 +1871,14 @@ class Window(Adw.ApplicationWindow):
         save_json(VAULTS_FILE, self.vaults)
         self._show_files(entries)
 
-    def _run_vault_op(self, vault, passphrase, args, *, heading, subject, note, partial=None, relist=False):
+    def _run_vault_op(self, vault, passphrase, args, *, heading, subject, note, partial=None, relist=False, after=None):
         def done(failure):
             if failure is not None:
                 self._vault_failed(vault, failure)
             elif relist and self.vault is vault:
                 self._list_vault(vault, passphrase)  # same secret, so no second prompt
+            if after:
+                after()
 
         self._start_op(VaultOperation(
             self, self._vault_args(vault, *args), passphrase=passphrase,
@@ -1930,8 +1991,155 @@ class Window(Adw.ApplicationWindow):
         ))
 
     def vault_lock(self):
-        self.cache.forget(self._secret_key(self.vault))
-        self._show_locked()
+        vault = self.vault
+
+        def lock():
+            self.cache.forget(self._secret_key(vault))
+            self._discard_copies(vault)
+            self._show_locked()
+
+        self._confirm_discard(vault, lock)
+
+    # -- Opening a file in another app ----------------------------------------
+    def vault_open(self):
+        """The backend decrypts a copy into a private in-memory folder, and the file's
+        default app opens it from there. This process only ever handles its path.
+
+        Once another app has the file, this one can't vouch for it: the app can write
+        its own copies to disk. So the first use says so and asks for an acknowledgement."""
+        vault, entry = self.vault, self.selected_entry
+        selected = self.vault_entries.get(entry)
+        if selected is None or selected["is_dir"]:
+            self.error("Select a file to open.")
+            return
+        if self.settings["open_explained"]:
+            self._open_entry(vault, entry)
+            return
+        dlg = Adw.AlertDialog(
+            heading="Opening outside the vault",
+            body="VaultSend will decrypt a copy into memory and open it in another app. That app "
+            "may save its own unencrypted copies to your disk, such as recovery files and "
+            "thumbnails, and VaultSend can't remove those.\n\nThe copy is deleted when you lock "
+            "the vault or close VaultSend. Changes aren't saved back to the vault.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("understand", "I understand")
+        dlg.set_response_appearance("understand", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r == "understand":
+                self.settings["open_explained"] = True
+                save_json(SETTINGS_FILE, self.settings)
+                self._open_entry(vault, entry)
+
+        dlg.connect("response", resp)
+        dlg.present(self)
+
+    def _open_entry(self, vault, entry):
+        base = memory_folder()
+        if base is None:
+            self._vault_error(
+                "Can't open this file",
+                "This system has no in-memory folder to put it in, and VaultSend won't write it to "
+                "disk by itself. Use Extract… to save it somewhere you choose.",
+            )
+            return
+        if self.current_op is not None:
+            self.error("Another file is still being processed.")
+            return
+        name = os.path.basename(entry)
+
+        def extract(secret):
+            try:
+                folder = tempfile.mkdtemp(prefix=OPEN_PREFIX, dir=base)
+            except OSError as e:
+                self._vault_error("Can't open this file", str(e))
+                return
+            # Tracked from here on, so it is deleted however this goes.
+            copy = {"vault": vault["path"], "name": name, "folder": folder,
+                    "path": os.path.join(folder, name), "stamp": None}
+            self.opened.append(copy)
+
+            def extracted():
+                copy["stamp"] = file_stamp(copy["path"])
+                if copy["stamp"] is None:  # failed or cancelled: the reason is already shown
+                    self._discard_copy(copy)
+                else:
+                    self._launch_copy(copy)
+
+            self._run_vault_op(
+                vault, secret, ["vault-extract", "--entry", entry, "--out", copy["path"]],
+                heading="Opening…", subject=name, note="Opening in its default app.",
+                partial=copy["path"] + STAGING_SUFFIX, after=extracted,
+            )
+
+        self.with_vault_secret(vault, extract)
+
+    def _launch_copy(self, copy):
+        def done(launcher, res):
+            try:
+                launcher.launch_finish(res)
+            except GLib.Error:
+                self._discard_copy(copy)
+                self._vault_error(
+                    "Couldn't open that file",
+                    "No app on this system could open it. Use Extract… to save it somewhere you "
+                    "choose instead.",
+                )
+
+        Gtk.FileLauncher(file=Gio.File.new_for_path(copy["path"])).launch(self, None, done)
+
+    def _copies(self, vault=None):
+        return [c for c in self.opened if vault is None or c["vault"] == vault["path"]]
+
+    def _discard_copy(self, copy):
+        shutil.rmtree(copy["folder"], ignore_errors=True)
+        self.opened.remove(copy)
+
+    def _discard_copies(self, vault=None):
+        for copy in self._copies(vault):
+            self._discard_copy(copy)
+
+    def _edited_copies(self, vault=None):
+        return [
+            c["name"] for c in self._copies(vault)
+            if c["stamp"] is not None and file_stamp(c["path"]) != c["stamp"]
+        ]
+
+    def _confirm_discard(self, vault, then):
+        """Run `then`, which deletes opened copies, asking first if any have been edited,
+        because that work has nowhere else to go. Edits still unsaved in another app can't
+        be seen from here; the warning before the first Open covers those."""
+        edited = self._edited_copies(vault)
+        if not edited:
+            then()
+            return
+        dlg = Adw.AlertDialog(
+            heading="Changes will be lost",
+            body="These opened files have changed, and changes aren't saved back to the vault:\n"
+            + "\n".join(edited[:5]) + ("\n…" if len(edited) > 5 else "")
+            + "\n\nTo keep them, use Save As in that app to save elsewhere, then add the file back.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("discard", "Delete changes")
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: then() if r == "discard" else None)
+        dlg.present(self)
+
+    def _on_close_request(self, _window):
+        if not self._edited_copies():
+            return False  # nothing to lose; do_shutdown deletes the copies
+
+        def close():
+            self._discard_copies()
+            self.close()
+
+        self._confirm_discard(None, close)
+        return True
 
 
 class VaultSend(Adw.Application):
@@ -1948,6 +2156,7 @@ class VaultSend(Adw.Application):
     def do_shutdown(self):
         if self.window:
             self.window.cache.clear()
+            self.window._discard_copies()
         Adw.Application.do_shutdown(self)
 
 
