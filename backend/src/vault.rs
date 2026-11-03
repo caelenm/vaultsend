@@ -359,6 +359,11 @@ fn write_tree(root: &str, tree: &[(&str, Option<Zeroizing<Vec<u8>>>)]) -> R<()> 
         match data {
             None => private_dir(&path, false)?,
             Some(data) => {
+                // open_private_new would replace it, and on a case-insensitive disk
+                // "A" and "a" are the same file: one would silently go missing.
+                if fs::symlink_metadata(&path).is_ok() {
+                    return Err(format!("{path}: two names in the vault collide on this disk"));
+                }
                 let mut file = open_private_new(&path)?;
                 file.write_all(data).map_err(|e| format!("writing {path}: {e}"))?;
                 file.sync_all().map_err(|e| format!("flushing {path}: {e}"))?;
@@ -1453,6 +1458,15 @@ mod tests {
         assert!(!Path::new(&staging_path(&out)).exists());
         assert!(v.extract("tree", &out).unwrap_err().contains("already exists"));
         assert_eq!(fs::metadata(&out).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn colliding_names_are_an_error_not_a_silent_loss() {
+        let t = TempDir::new();
+        // Two entries landing on one file, as "A" and "a" do on a case-insensitive disk.
+        let data = Some(Zeroizing::new(b"y".to_vec()));
+        let items = [("Name", data.clone()), ("Name", data)];
+        assert!(write_tree(&t.path("root"), &items).unwrap_err().contains("collide"));
     }
 
     #[test]
