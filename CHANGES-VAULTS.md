@@ -45,7 +45,10 @@ sizable addition (21 lines), prevents silent data loss. Option A would have adde
 `tar` and its dependencies, a third-party parser of hostile input, and lost partial
 updates.
 
-**Key-swap gap fixed rather than documented (2026-11-03).** See the threat model below.
+**`key.age` sealed with the private key (2026-11-03), replacing §2's wrap to the public
+key.** The owner's rule: once made, a vault opens only for whoever holds the private key.
+The first fix for the key swap, a per-device hash with a warning, only noticed a swap on a
+device that had seen the vault, and could be clicked through. See the threat model below.
 
 **Open button added (2026-11-03), reversing §0.6's "no 'open in app'".** The owner asked
 how files are meant to be used from inside a vault, then asked for an Open button with a
@@ -58,32 +61,32 @@ written. See the threat model below.
 ## Files touched
 
 ```
- CHANGES-VAULTS.md                                  |  493 +++++++++++++
- README.md                                          |  103 ++-
- VAULTS_PLAN.md                                     |  403 +++++++++++
- backend/Cargo.lock                                 |    4 +-
- backend/Cargo.toml                                 |   13 +-
- backend/src/main.rs                                |    8 +-
- backend/src/vault.rs                               | 1542 ++++++++++++++++++++++++++++++++++++++++
- docs/screenshots/vaults/01a-contacts-main.png      |  Bin 0 -> 40841 bytes
- docs/screenshots/vaults/01b-contacts-branch.png    |  Bin 0 -> 41547 bytes
- docs/screenshots/vaults/02-vaults-empty.png        |  Bin 0 -> 39245 bytes
- docs/screenshots/vaults/03-vaults-two.png          |  Bin 0 -> 36869 bytes
- docs/screenshots/vaults/04-create-dialog.png       |  Bin 0 -> 61648 bytes
- docs/screenshots/vaults/05-unlocked-nested.png     |  Bin 0 -> 47769 bytes
- docs/screenshots/vaults/06-rollback-warning.png    |  Bin 0 -> 54236 bytes
- docs/screenshots/vaults/07-tamper-error.png        |  Bin 0 -> 59810 bytes
- docs/screenshots/vaults/08-passphrase-menu.png     |  Bin 0 -> 45891 bytes
- docs/screenshots/vaults/09-key-changed-warning.png |  Bin 0 -> 69172 bytes
- docs/screenshots/vaults/10-open-warning.png        |  Bin 0 -> 75282 bytes
- docs/screenshots/vaults/11-open-changes-lost.png   |  Bin 0 -> 62480 bytes
- frontend/app.py                                    | 1153 +++++++++++++++++++++++++++++-
- tests/test_frontend_helpers.py                     |  333 +++++++++
- tests/vault_gui_check.sh                           |   48 ++
- tests/vault_gui_driver.py                          |  981 +++++++++++++++++++++++++
- tests/vault_roundtrip.sh                           |  257 +++++++
- tests/verify_deps.sh                               |   75 ++
- 25 files changed, 5397 insertions(+), 16 deletions(-)
+ CHANGES-VAULTS.md                                 |  523 ++++++++++++++
+ README.md                                         |  109 ++-
+ VAULTS_PLAN.md                                    |  403 +++++++++++
+ backend/Cargo.lock                                |    4 +-
+ backend/Cargo.toml                                |   13 +-
+ backend/src/main.rs                               |    8 +-
+ backend/src/vault.rs                              | 1574 +++++++++++++++++++++++++++++++++++++++++
+ docs/screenshots/vaults/01a-contacts-main.png     |  Bin 0 -> 40841 bytes
+ docs/screenshots/vaults/01b-contacts-branch.png   |  Bin 0 -> 41547 bytes
+ docs/screenshots/vaults/02-vaults-empty.png       |  Bin 0 -> 39245 bytes
+ docs/screenshots/vaults/03-vaults-two.png         |  Bin 0 -> 36869 bytes
+ docs/screenshots/vaults/04-create-dialog.png      |  Bin 0 -> 61648 bytes
+ docs/screenshots/vaults/05-unlocked-nested.png    |  Bin 0 -> 47769 bytes
+ docs/screenshots/vaults/06-rollback-warning.png   |  Bin 0 -> 54236 bytes
+ docs/screenshots/vaults/07-tamper-error.png       |  Bin 0 -> 59810 bytes
+ docs/screenshots/vaults/08-passphrase-menu.png    |  Bin 0 -> 45891 bytes
+ docs/screenshots/vaults/09-forged-key-refused.png |  Bin 0 -> 49490 bytes
+ docs/screenshots/vaults/10-open-warning.png       |  Bin 0 -> 75282 bytes
+ docs/screenshots/vaults/11-open-changes-lost.png  |  Bin 0 -> 62480 bytes
+ frontend/app.py                                   | 1102 ++++++++++++++++++++++++++++-
+ tests/test_frontend_helpers.py                    |  323 +++++++++
+ tests/vault_gui_check.sh                          |   48 ++
+ tests/vault_gui_driver.py                         | 1010 ++++++++++++++++++++++++++
+ tests/vault_roundtrip.sh                          |  316 +++++++++
+ tests/verify_deps.sh                              |   75 ++
+ 25 files changed, 5492 insertions(+), 16 deletions(-)
 ```
 
 | File | What |
@@ -158,7 +161,7 @@ The backend's line count, "forgets it" (now qualified by Remember passphrase), a
 ## New CLI commands
 
 ```
-vault-create  --dir P --mode self
+vault-create  --dir P --mode self --pass-fd N
 vault-create  --dir P --mode password --pass-fd N
 vault-list    --dir P --pass-fd N
 vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
@@ -167,9 +170,8 @@ vault-extract --dir P --pass-fd N --entry VAULTPATH --out PATH
 vault-check   --dir P --pass-fd N
 ```
 
-Every command that opens a vault also accepts `--key-sha256 HEX`. `--pass-fd` carries
-the identity passphrase for a `self` vault and the vault password for a `password`
-vault. `--entry /` means the whole vault.
+`--pass-fd` carries the identity passphrase for a `self` vault and the vault password
+for a `password` vault. `--entry /` means the whole vault.
 
 ---
 
@@ -180,9 +182,10 @@ A vault is a directory (default suffix `.vsvault`):
 ```
 MyVault.vsvault/
   VAULT          plaintext, not secret:  "vaultsend-vault 1\nmode self|password\n"
-  key.age        the vault's own X25519 identity, age-encrypted:
-                   mode self     -> to the user's own pubkey (unlock = identity passphrase)
-                   mode password -> age scrypt recipient, work factor 2^18 (SCRYPT_LOG_N)
+  key.age        the vault's own X25519 identity, age-encrypted with one scrypt stanza:
+                   mode self     -> "vaultsend-vault-key-1:" + the user's private key,
+                                    work factor 2^10 (SEAL_LOG_N); unlock = identity passphrase
+                   mode password -> the password, work factor 2^18 (SCRYPT_LOG_N)
   manifest.age   age-encrypted to the vault's public key (see below)
   blobs/<aa>/<32-hex-random-id>.age   one per file, age-encrypted to the vault's public key
 ```
@@ -191,6 +194,9 @@ MyVault.vsvault/
 it: a wrong mode just fails to decrypt `key.age`, as a clear error. age requires a
 passphrase (scrypt) stanza to be the only stanza, so a vault is key-unlocked or
 password-unlocked, never both.
+
+The format hasn't been released. A `self` vault made by an earlier build of this branch has
+a `key.age` wrapped to the public key, so it's refused like any forgery and must be recreated.
 
 ### Manifest (plaintext inside `manifest.age`, UTF-8, `\n` line endings)
 
@@ -240,7 +246,8 @@ but has neither the vault key nor the secret that unlocks it:
   pinned hash catches it, before decryption, with nothing written.
 - **Rolling back the whole vault:** caught by the generation check, on a device that saw
   the newer version.
-- **Swapping `key.age` (below):** caught on a device that has seen the vault.
+- **Forging `key.age`, or a whole vault (below):** refused on every device, with nothing to
+  click through.
 
 **Plaintext rule.** The frontend never holds file plaintext. A file is fully decrypted
 and verified in the backend's RAM before any of it is written, a folder extract does this
@@ -276,39 +283,59 @@ What it can't do, and the warning and README say so:
 - **Opening runs the file's default app on its contents.** A shared vault's files are as
   untrusted as any other download.
 
-### The `key.age` swap (found during this work, fixed at the owner's request)
+### Forged vaults (found during this work, closed at the owner's request)
 
-age has no sender authentication, and a user's public key is public by design. So anyone
-who could write to a **`self`** vault's folder could replace `key.age` with one wrapping a
-vault key they know, plus a matching manifest. The user's passphrase would still unlock
-it, and the generation check could be satisfied by picking a high number. The listing
-would look wrong, since the attacker can't read the old contents. But any file the user
-then added would be encrypted to a key the attacker holds. A `password` vault isn't
-exposed the same way, because forging its `key.age` needs the password.
+age has no sender authentication, and a user's public key is public by design. While a
+`self` vault's `key.age` was wrapped to that public key, anyone who could write to the folder
+could replace the whole vault with one built around a key they knew. Run against that build,
+with only the public key, the attack worked on a device new to the vault: it opened with the
+owner's passphrase, Verify all passed, a planted file extracted, and a file the owner then
+added could be read by the attacker. The real files stayed safe throughout, since a forged
+key can't read them. A per-device hash of `key.age` caught this only where the vault had been
+seen before, and **Trust the new key** let you past it.
 
-The fix pins `key.age` by SHA-256 in two layers, for both modes, because `key.age` never
-legitimately changes in 0.2.0:
+So a `self` vault's `key.age` is now sealed with a secret derived from the private key:
+age's own scrypt stanza, with `"vaultsend-vault-key-1:"` plus the private key as its input
+(`seal_secret`). There's no new crate and no hand-written cryptography. Only the holder of the
+private key can make or open one. What follows from that:
 
-- **Frontend:** `vaults.json` gains `key_sha256`, recorded when a vault is created or
-  added. Before asking for any secret, `with_vault_secret` compares the current file and
-  shows a warning if it changed.
-- **Backend:** `--key-sha256` makes `unlock` refuse if the bytes of `key.age` it just read
-  don't match, before reading the secret. A frontend-only check could be beaten by swapping
-  the file after it ran.
+- **A forged `key.age` simply fails to decrypt,** in the backend, on every device, before
+  anything else in the vault is read. No memory of the vault is involved, so the same private
+  key on a second device opens it with no setup.
+- **The hash, `--key-sha256`, the warning and the Trust button are gone.** There's nothing
+  left to trust or click through.
+- **Making a `self` vault needs the passphrase,** because it needs the private key. It was
+  the ability to make one from the public key alone that allowed the forgery.
+- **The work factor is 2^10.** The input is a 256-bit random key rather than something a
+  person chose, so more cost protects nothing. `set_max_work_factor` holds unlocking to the
+  same value, so a planted `key.age` can't stall the app with an expensive one.
+- **A `password` vault was never exposed this way,** because forging its `key.age` needs the
+  password.
+
+The private key now has a second use, as scrypt's input as well as for X25519. The fixed
+prefix keeps the two apart and scrypt is one-way, so this should be sound, but this specific
+construction hasn't had an independent review.
 
 ### Not defended against
 
-The same as the rest of VaultSend, plus: someone with write access can always *destroy* a
-vault, by deleting or corrupting it, or stall an operation by putting a FIFO in it. Damage
-gets detected but can't be prevented, so keep backups.
+The same as the rest of VaultSend, plus what someone with write access can still do:
+
+- **Destroy a vault,** by deleting or corrupting it, or stall an operation by putting a FIFO
+  in it. Damage gets detected but can't be prevented, so keep backups.
+- **Put back an older genuine copy.** It opens, and the generation check warns only on a
+  device that saw the newer version.
+- **Put another of the owner's own vaults in its place.** It opens as that vault. Nothing
+  added to it is readable by them.
+- **Plant a `password` vault with a password they know.** It only opens if the owner types
+  that password; the owner's passphrase is refused.
 
 ---
 
 ## Known limitations
 
-- Whole-vault rollback and a swapped `key.age` are detected only on a device that saw the
-  vault before. The memory lives in `vaults.json`: a vault swapped before this device first
-  added it isn't detected, and neither is one reached with `vaults.json` deleted.
+- Whole-vault rollback is detected only on a device that saw the newer version. The memory
+  lives in `vaults.json`: a vault rolled back before this device first added it isn't
+  detected, and neither is one reached with `vaults.json` deleted.
 - On-disk metadata: file count, approximate per-file sizes, blob modified times. Names and
   folder structure stay hidden.
 - Extraction needs RAM of about 2× the file's size. A folder needs about its total size.
@@ -335,7 +362,7 @@ Places this differs from, or adds to, what the plan says:
 
 | What | Why |
 |---|---|
-| `key_sha256` in `vaults.json`, and `--key-sha256` | Owner's decision, above. |
+| A `self` vault's `key.age` is sealed with the private key, not wrapped to the public key (§2) | Owner's decision, above. So `vault-create --mode self` takes `--pass-fd`, and the app asks for the passphrase when making one. |
 | An **Open** button, reversing §0.6's "no 'open in app'" | Owner's decision, above. |
 | A "Changes will be lost" prompt on Lock, Lock now and close | Not asked for. An edited copy is about to be deleted and has nowhere else to go, and this catches it for saved edits. |
 | A `flock` on the `VAULT` file | The plan's garbage collection deletes unreferenced blobs, which would include another process's uncommitted ones. Exclusive for changes, shared for reads, released by the kernel however the process dies. |
@@ -353,7 +380,7 @@ Places this differs from, or adds to, what the plan says:
 | A file with a name colliding on extract is an error | `open_private_new` would replace it, and "A" and "a" are one file on a case-insensitive disk. |
 | Clippy gate runs on Rust 1.85.0 | On untouched `main`, `clippy -D warnings` under 1.75.0 already fails on `File::open(&p)` in `identity_is_valid`, a lint later narrowed. That line is audited, so it stays. Build and tests run on both. |
 | `tests/vault_gui_check.sh` and `vault_gui_driver.py` | Not asked for. They make the Phase 4 run-through and §5.3 repeatable. |
-| `vault.rs` is 804 lines without its tests | Budget ~800, after the owner raised it from ~550. |
+| `vault.rs` is 817 lines without its tests | Budget ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed. Removing the hash check gave back less than `seal_secret` and its constants added. |
 
 ---
 
@@ -363,19 +390,18 @@ Run from the final tree:
 
 | Check | Result |
 |---|---|
-| `cargo test --locked`, Rust 1.75.0 and 1.85.0 | 28 passed, 0 failed, on both |
+| `cargo test --locked`, Rust 1.75.0 and 1.85.0 | 29 passed, 0 failed, on both |
 | `cargo clippy --locked --all-targets -- -D warnings`, 1.85.0 | Clean |
 | `cargo build --release --locked`, 1.75.0 | OK |
 | `tests/verify_deps.sh` | All 8 crates match `Cargo.lock` and crates.io; no `[[package]]` added |
-| `tests/vault_roundtrip.sh` | 89 passed, 0 failed; 90 of 90 where `strace` is available |
+| `tests/vault_roundtrip.sh` | 103 passed, 0 failed; 104 of 104 where `strace` is available |
 | strace proof | The last blob is opened before the output path is first touched |
-| `tests/test_frontend_helpers.py` | 38 passed, on both GTK versions below |
-| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 134 passed, 0 failed |
-| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 134 passed, 0 failed |
+| `tests/test_frontend_helpers.py` | 37 passed, on both GTK versions below |
+| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 141 passed, 0 failed |
+| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 141 passed, 0 failed |
 
-The backend hasn't changed since those Rust, dependency and round-trip results, because
-neither Open nor the file-list fix needed a backend change; the binary hash is the same. The
-Python and GUI runs are on the final frontend.
+All of these ran on one tree, after `key.age` was sealed. The GUI count includes 5 checks for
+moving a selection out of a folder being closed.
 
 **The version floor.** libadwaita 1.5.0 is exactly the app's floor, and the whole run-through
 passes on it. GTK 4.10 itself wasn't tested, but it isn't reachable with that floor anyway:
@@ -391,7 +417,11 @@ before, the release binary and `app.py`, and its build command is unchanged.
 - The Contacts/Vaults toggle didn't switch views. A toggle group deactivates the old button
   before activating the new one, and the handler was on the wrong button.
 - On extract, names colliding on a case-insensitive disk would silently drop a file.
-- A FIFO in place of `VAULT` or `key.age` could hang the window at startup.
+- A FIFO in place of `VAULT` could hang the window at startup.
+- A vault forged from the public key opened normally on a device new to it (see the threat
+  model). The first fix only warned about it, and the owner asked for it to be closed after
+  seeing that warning in a recording. A complete forgery is now in the unit tests, and a forged
+  `key.age` in `vault_roundtrip.sh` and the GUI run-through.
 - A warning toast containing a path with `&` would have failed to display.
 - A vault with one file said "1 files".
 - The first Open warning's heading was too long and triggered a GTK layout warning.
@@ -408,7 +438,7 @@ before, the release binary and `app.py`, and its build command is unchanged.
 | | SHA-256 |
 |---|---|
 | Baseline binary, `main` @ `ecab899`, rustc 1.75.0 | `9bd8360a7eac449c92192591dc757df918b110b8f4973ced33ec5d8c029aafb1` |
-| This branch's binary, rustc 1.75.0 | `ceec2ef9c4505c640ca70f8735347ed4e48d012e438f71a1c74790a4b36cadc2` |
+| This branch's binary, rustc 1.75.0 | `e22d389cc33b0a8c0bbe9d74b0371261ac8c631b25633850f9f18deae427acc4` |
 
 Registry `.crate` files, each matching both `Cargo.lock` and the checksum crates.io
 publishes (`tests/verify_deps.sh`):
@@ -442,7 +472,7 @@ looked at before committing.
 | `06-rollback-warning.png` | The rollback warning, with Open anyway and Cancel. |
 | `07-tamper-error.png` | The error after extracting from a tampered vault; nothing was written. |
 | `08-passphrase-menu.png` | The Remember passphrase submenu. |
-| `09-key-changed-warning.png` | Added: the warning for a swapped `key.age`, shown before any secret is asked for. |
+| `09-forged-key-refused.png` | Added: a forged `key.age` refused outright, with Close as the only choice. |
 | `10-open-warning.png` | Added: the plaintext warning on first Open, with I understand and Cancel. The Open button is in the action bar behind it. |
 | `11-open-changes-lost.png` | Added: Lock with an edited copy, naming the file. |
 

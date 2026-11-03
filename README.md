@@ -50,13 +50,17 @@ to a key belonging to that vault, so changing one file re-encrypts one blob. A
 manifest, also age-encrypted, lists every file's name and pins its blob by SHA-256,
 so a blob that is altered, truncated, swapped, deleted or replaced with an older
 version is detected before it is decrypted. The vault's own key is stored in
-`key.age`, encrypted either to your key or to a password you choose (never both:
-age allows a passphrase only as the sole recipient). Plaintext from a vault is
+`key.age`, sealed either with a secret only your private key can produce or with a
+password you choose (never both: age allows a passphrase only as the sole recipient).
+A vault made with your key opens only for whoever holds your private key. age can't
+prove who made a file and your public key is public, so a key merely wrapped to it
+could have come from anyone; a sealed one can't, so a vault forged from your public
+key simply won't open, on any device. Plaintext from a vault is
 fully decrypted and verified in the backend's memory before a single byte is
 written, and it is only ever written where you explicitly extract it, or to a private
 in-memory folder if you use **Open**. On this
-device, VaultSend also remembers each vault's generation and the hash of its
-`key.age`, and warns if a vault goes backwards or its key is replaced.
+device, VaultSend also remembers each vault's generation, and warns if a vault goes
+backwards.
 
 **If you turn on Remember passphrase,** the passphrase is held in the frontend's
 memory for the time you chose. It is never written to disk, but that memory, unlike
@@ -220,8 +224,8 @@ environment variable, the sibling `backend/target/release/` build, then `PATH`.
 
 (`XDG_DATA_HOME` / `XDG_CONFIG_HOME` are honored if set.) Contacts are just a
 list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
-`vaults.json` is a list of `{"name", "path", "mode", "last_generation", "key_sha256"}`.
-The last two are what let this device notice a rolled-back vault or a replaced key.
+`vaults.json` is a list of `{"name", "path", "mode", "last_generation"}`. The last is
+what lets this device notice a rolled-back vault.
 
 ## Using it
 
@@ -236,7 +240,8 @@ The last two are what let this device notice a rolled-back vault or a replaced k
   to copy their key.
 - **Your public key** lives in the menu (⋮) — share it so others can write to you.
 - **Vaults:** switch the sidebar to **Vaults**, click **Add vault**, and choose how to
-  protect it. Select a vault and **Unlock** it to see its files. **Add files…**, **Add
+  protect it. A vault using your key opens only with your private key, so making one asks
+  for your passphrase. Select a vault and **Unlock** it to see its files. **Add files…**, **Add
   folder…** or dropping files adds them (into the selected folder, if one is selected).
   **Extract…** and **Delete** act on the selected row; **Extract…** on *Everything in
   this vault* extracts it all. Removing a vault from the list only forgets it; its
@@ -262,7 +267,7 @@ vaultsend-backend recover-pubkey --pass-fd N  # rebuild pubkey from identity.age
 vaultsend-backend encrypt -r age1.. [-r age1..]... [--armor] [--in PATH] [--out PATH]
 vaultsend-backend decrypt --pass-fd N [--in PATH] [--out PATH]
 
-vaultsend-backend vault-create  --dir P --mode self
+vaultsend-backend vault-create  --dir P --mode self --pass-fd N       # your passphrase
 vaultsend-backend vault-create  --dir P --mode password --pass-fd N   # at least 10 characters
 vaultsend-backend vault-list    --dir P --pass-fd N                   # names and sizes only
 vaultsend-backend vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
@@ -278,8 +283,7 @@ written to `PATH.vaultsend-part` and renamed to `PATH` only once complete, so
 the destination is never a partial file (and `--out` may safely name the input).
 
 For a vault, `--pass-fd` carries your passphrase for a `self` vault and the vault's
-password for a `password` vault. Every command that opens a vault also accepts
-`--key-sha256 HEX`, and refuses if `key.age` doesn't have that hash.
+password for a `password` vault.
 
 ## Backing up and restoring
 
@@ -341,7 +345,8 @@ expected in that one case.
   the file) is the process-hardening described in the security warning above;
   `read_passphrase` and the `--out` paths of `cmd_encrypt` / `cmd_decrypt` are
   where secret material is held in memory and where staged writes happen.
-- `backend/src/vault.rs` — start with `unlock` (the key pin and both secrets),
+- `backend/src/vault.rs` — start with `seal_secret` and `unlock` (both secrets, and why
+  a vault forged from your public key doesn't open),
   `read_verified` and `extract_folder` (nothing is written until everything has
   verified in RAM), `Manifest::parse` and `valid_vault_path` (everything that decides
   what a hostile vault can make us do), then `commit_next` and `orphans` (the crash
@@ -368,9 +373,10 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
 - One identity per user; no key fetching over a network; no plugins. By design.
 - Vaults hide names and folder structure, but anyone who can see a vault's folder can
   see how many files it holds, each file's approximate size, and when each changed.
-- Noticing a rolled-back vault or a replaced `key.age` works only on a device that has
-  already seen the vault, because that memory lives in `vaults.json`. A vault replaced
-  before this device first added it isn't detected.
+- Noticing a rolled-back vault works only on a device that has already seen the newer
+  version, because that memory lives in `vaults.json`. Someone with write access can also
+  delete a vault, or put another of your own vaults in its place. They can't read it, or
+  make one that opens for you.
 - Extracting needs RAM of about twice the file's size, because it is fully decrypted
   and verified before anything is written. A folder needs roughly its total size.
   **Open** needs about three times, since the copy stays in memory too.
