@@ -29,7 +29,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     commit_staged, encrypt_to, load_identity, open_private_new, read_passphrase, staging_path,
-    R, SCRYPT_LOG_N, SCRYPT_MAX_LOG_N,
+    R, SCRYPT_LOG_N,
 };
 
 const VAULT_FILE: &str = "VAULT";
@@ -221,6 +221,15 @@ fn sync_dir(path: &str) {
     }
 }
 
+/// fs::read for anything inside a vault. A FIFO planted there would otherwise block forever,
+/// with the window frozen behind it, since unlocking runs in the foreground.
+fn read_regular(path: &str) -> io::Result<Vec<u8>> {
+    if !fs::metadata(path)?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    fs::read(path)
+}
+
 fn parent_of(path: &str) -> &str {
     match Path::new(path).parent().and_then(Path::to_str) {
         Some("") | None => ".",
@@ -257,8 +266,12 @@ impl<W: Write> Write for HashingWriter<W> {
 /// collection can never delete blobs another has written but not yet committed.
 /// The kernel releases flock however the process dies, so there is no stale lock.
 fn lock_vault(dir: &str, exclusive: bool) -> R<File> {
-    let file = File::open(format!("{dir}/{VAULT_FILE}"))
-        .map_err(|_| format!("{dir} is not a VaultSend vault (no {VAULT_FILE} file)"))?;
+    let path = format!("{dir}/{VAULT_FILE}");
+    let not_a_vault = format!("{dir} is not a VaultSend vault (no {VAULT_FILE} file)");
+    if !fs::metadata(&path).is_ok_and(|m| m.is_file()) {
+        return Err(not_a_vault);
+    }
+    let file = File::open(&path).map_err(|_| not_a_vault)?;
     #[cfg(target_os = "linux")]
     {
         use std::os::unix::io::AsRawFd;
@@ -295,7 +308,7 @@ fn unlock(dir: &str, pass_fd: i32) -> R<x25519::Identity> {
     let hint = fs::read_to_string(format!("{dir}/{VAULT_FILE}"))
         .map_err(|e| format!("reading {VAULT_FILE}: {e}"))?;
     let mode = hint.strip_prefix(VAULT_MAGIC).and_then(|r| r.strip_prefix("\nmode "));
-    let wrapped = fs::read(format!("{dir}/{KEY_FILE}"))
+    let wrapped = read_regular(&format!("{dir}/{KEY_FILE}"))
         .map_err(|e| format!("reading this vault's {KEY_FILE}: {e}"))?;
     let dec = age::Decryptor::new(&wrapped[..])
         .map_err(|_| format!("this vault's {KEY_FILE} is damaged"))?;
@@ -309,7 +322,8 @@ fn unlock(dir: &str, pass_fd: i32) -> R<x25519::Identity> {
         }
         Some("password\n") => {
             let mut scrypt_id = age::scrypt::Identity::new(read_passphrase(pass_fd)?);
-            scrypt_id.set_max_work_factor(SCRYPT_MAX_LOG_N);
+            // What vault-create uses, and no more: a shared vault could otherwise cost gigabytes.
+            scrypt_id.set_max_work_factor(SCRYPT_LOG_N);
             dec.decrypt(once(&scrypt_id as &dyn age::Identity))
                 .map_err(|_| format!("wrong password, or this vault's {KEY_FILE} is damaged"))?
         }
@@ -453,7 +467,7 @@ impl Vault {
     }
 
     fn load_manifest(&self) -> R<Manifest> {
-        let data = fs::read(format!("{}/{MANIFEST_FILE}", self.dir))
+        let data = read_regular(&format!("{}/{MANIFEST_FILE}", self.dir))
             .map_err(|e| format!("reading the vault's manifest: {e}"))?;
         let text = self.decrypt_in_ram(&data).map_err(|_| "the vault's manifest is damaged or was replaced".to_string())?;
         let text = std::str::from_utf8(&text).map_err(|_| "the vault's manifest is not valid text".to_string())?;
@@ -464,7 +478,7 @@ impl Vault {
     /// its hash against the manifest, decrypt to the end in memory. The caller gets
     /// plaintext only if all of that succeeded.
     fn read_verified(&self, path: &str, blob: &str, sha256: &str) -> R<Zeroizing<Vec<u8>>> {
-        let data = fs::read(self.blob_path(blob)).map_err(|e| match e.kind() {
+        let data = read_regular(&self.blob_path(blob)).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => format!("'{path}': its encrypted data is missing from the vault"),
             _ => format!("'{path}': reading its encrypted data: {e}"),
         })?;
@@ -1040,6 +1054,20 @@ mod tests {
         fs::copy(format!("{other}/key.age"), format!("{dir}/key.age")).unwrap();
         let v = Vault::open(&dir, pass_fd(ID_PASS), false).unwrap();
         assert!(v.load_manifest().err().unwrap().contains("manifest"));
+    }
+
+    /// A hang would fail this by never finishing, and would freeze the window the same way.
+    #[test]
+    fn a_fifo_in_a_vault_is_refused_rather_than_waited_on() {
+        let t = TempDir::new();
+        let fifo = t.path("fifo");
+        let c_path = std::ffi::CString::new(fifo.as_str()).unwrap();
+        // SAFETY: mkfifo only reads the path, which outlives the call.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        assert!(read_regular(&fifo).is_err());
+        fs::create_dir(t.path("v")).unwrap();
+        fs::rename(&fifo, t.path("v/VAULT")).unwrap();
+        assert!(lock_vault(&t.path("v"), false).is_err());
     }
 
     #[test]
