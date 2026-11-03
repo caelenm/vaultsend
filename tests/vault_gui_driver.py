@@ -423,6 +423,36 @@ def script():
     yield SETTLE
     check(not photos_row.get_expanded() and "My Documents/photos" not in win.expanded, "clicking again closes it")
 
+    # Closing a folder can't leave the selection on a row that's gone out of sight.
+    def toggle_folder(path):
+        real_click(radio_of(path).get_ancestor(Adw.ActionRow))
+
+    real_click(radio_of("My Documents/taxes/2025"))
+    yield SETTLE
+    toggle_folder("My Documents/taxes")
+    yield SETTLE
+    check(win.selected_entry == app.ROOT_ENTRY and radio_of(app.ROOT_ENTRY).get_active(), "closing a folder moves a selection inside it to Everything")
+    toggle_folder("My Documents/taxes")
+    yield SETTLE
+    select("My Documents/notes.txt")
+    toggle_folder("My Documents/taxes")
+    yield SETTLE
+    check(win.selected_entry == "My Documents/notes.txt", "a selection outside the folder stays")
+    toggle_folder("My Documents/taxes")
+    yield SETTLE
+    select("My Documents/taxes")
+    toggle_folder("My Documents/taxes")
+    yield SETTLE
+    check(win.selected_entry == "My Documents/taxes", "and so does the folder's own")
+    toggle_folder("My Documents/taxes")
+    yield SETTLE
+    select("My Documents/taxes/2025/receipts & <invoices>.csv")
+    toggle_folder("My Documents")
+    yield SETTLE
+    check(win.selected_entry == app.ROOT_ENTRY, "a selection moves back from any depth")
+    toggle_folder("My Documents")
+    yield SETTLE
+
     def folder(path):
         return {"path": path, "is_dir": True, "size": 0}
 
@@ -434,6 +464,14 @@ def script():
     check(arrow_color("open/closed") == arrow_color("closed"), "a closed folder inside an open one has a closed arrow")
     check(arrow_color("open/open/closed") == arrow_color("closed"), "at any depth")
     check(arrow_color("open/open") == arrow_color("open") != arrow_color("closed"), "an open folder has an open arrow at any depth")
+
+    win.expanded = {"tax", "taxes"}
+    win._show_files([folder("tax"), folder("tax/x"), folder("taxes"), folder("taxes/y")])
+    yield SETTLE
+    select("taxes/y")
+    radio_of("tax").get_ancestor(Adw.ExpanderRow).set_expanded(False)
+    yield SETTLE
+    check(win.selected_entry == "taxes/y", "closing a folder with a similar name leaves a selection alone")
 
     # A very deep path keeps its indent within reason, and leaves the window alone.
     width = win.get_width()

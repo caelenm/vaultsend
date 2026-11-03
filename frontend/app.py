@@ -1750,7 +1750,7 @@ class Window(Adw.ApplicationWindow):
             if e["is_dir"]:
                 row = Adw.ExpanderRow(title=name + "/", use_markup=False)
                 row.set_expanded(e["path"] in self.expanded)
-                row.connect("notify::expanded", self._on_folder_expanded, e["path"])
+                row.connect("notify::expanded", self._on_folder_expanded, e["path"], everything)
                 folders[e["path"]] = row
             else:
                 row = Adw.ActionRow(title=name, subtitle=human_bytes(e["size"]), use_markup=False)
@@ -1769,8 +1769,11 @@ class Window(Adw.ApplicationWindow):
         if radio.get_active():
             self.selected_entry = path
 
-    def _on_folder_expanded(self, row, _pspec, path):
+    def _on_folder_expanded(self, row, _pspec, path, everything):
         (self.expanded.add if row.get_expanded() else self.expanded.discard)(path)
+        # The actions follow the selection, so it can't stay on a row that's now hidden.
+        if not row.get_expanded() and self.selected_entry.startswith(path + "/"):
+            everything.set_active(True)
 
     # -- Vault operations -----------------------------------------------------
     def _secret_key(self, vault):
