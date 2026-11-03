@@ -25,8 +25,10 @@ Vaults are encrypted folders that change one file at a time: per-file age blobs 
 by an age-encrypted manifest that pins each blob by SHA-256 and carries a generation
 counter. Everything in the plan is built, in the backend (`vault.rs`), the frontend
 (`app.py`) and tests, plus an **Open** button the owner asked for afterwards. No new
-crate. The audited backend functions and `FileOperation`, `run_backend` and
-`spawn_backend` are byte-identical to `main`, checked by comparing each definition.
+crate. `FileOperation`, `run_backend`, `spawn_backend` and the audited backend functions are
+byte-identical to `main`, checked by comparing each definition, except for three the owner
+chose to change so secret buffers are locked in memory: `read_passphrase`, `load_identity` and
+`cmd_keygen`. Those changes are listed below.
 
 ---
 
@@ -61,13 +63,13 @@ written. See the threat model below.
 ## Files touched
 
 ```
- CHANGES-VAULTS.md                                 |  602 ++++++++++++++++
- README.md                                         |  131 +++-
+ CHANGES-VAULTS.md                                 |  627 ++++++++++++++++
+ README.md                                         |  132 +++-
  VAULTS_PLAN.md                                    |  403 +++++++++++
  backend/Cargo.lock                                |    4 +-
  backend/Cargo.toml                                |   13 +-
- backend/src/main.rs                               |    8 +-
- backend/src/vault.rs                              | 1602 +++++++++++++++++++++++++++++++++++++++++
+ backend/src/main.rs                               |   41 +-
+ backend/src/vault.rs                              | 1605 +++++++++++++++++++++++++++++++++++++++++
  docs/screenshots/vaults/01a-contacts-main.png     |  Bin 0 -> 40841 bytes
  docs/screenshots/vaults/01b-contacts-branch.png   |  Bin 0 -> 41523 bytes
  docs/screenshots/vaults/02-vaults-empty.png       |  Bin 0 -> 39245 bytes
@@ -82,12 +84,12 @@ written. See the threat model below.
  docs/screenshots/vaults/11-open-changes-lost.png  |  Bin 0 -> 61813 bytes
  frontend/app.py                                   | 1155 ++++++++++++++++++++++++++++-
  tests/test_frontend_helpers.py                    |  342 +++++++++
- tests/vault_attack.py                             | 1367 +++++++++++++++++++++++++++++++++++
+ tests/vault_attack.py                             | 1372 +++++++++++++++++++++++++++++++++++
  tests/vault_gui_check.sh                          |   48 ++
  tests/vault_gui_driver.py                         | 1091 ++++++++++++++++++++++++++++
  tests/vault_roundtrip.sh                          |  316 ++++++++
  tests/verify_deps.sh                              |   75 ++
- 26 files changed, 7123 insertions(+), 34 deletions(-)
+ 26 files changed, 7187 insertions(+), 37 deletions(-)
 ```
 
 | File | What |
@@ -120,6 +122,18 @@ Lines added around existing code aren't listed; these are the lines that were al
 **No `pub(crate)` was needed, so none was added.** A child module can already see its
 ancestors' private items, so the helpers §3 reuses needed no change at all. The other
 additions are `mod vault;`, one new dispatch arm, and one line in the header's command list.
+
+### `backend/src/main.rs`: the audited functions (owner's decision)
+
+| Function | Line on `main` | Becomes |
+|---|---|---|
+| `read_passphrase` | `let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());` | `let mut buf = secret_buffer();` |
+| `read_passphrase` | `Ok(SecretString::from(pass.to_owned()))` | The same value, with `lock_in_ram` on it first |
+| `load_identity` | `let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());` | `let mut secret_bytes = secret_buffer();` |
+| `cmd_keygen` | None altered | One line added: `lock_in_ram` on the key's text |
+
+`lock_in_ram`, `secret_buffer` and `SECRET_CAPACITY` are new, and they're the whole of it: one
+`unsafe` call to `mlock`, whose result is ignored just as `mlockall`'s is.
 
 ### `backend/Cargo.toml` (one line)
 
@@ -269,8 +283,18 @@ buffers, allocated once so they never leave a copy behind. Swap protection is th
 `mlockall` as the rest of the backend, which is weaker than "best-effort" suggests. Measured
 under WSL, with a hard limit of 64 KB: `mlockall(MCL_CURRENT)` fails outright and `VmLck` stays
 at 0 kB. `MCL_FUTURE` is used only when the limit is unlimited, so scrypt's buffer and decrypted
-files aren't locked on a typical system either. `harden_process` is audited and unchanged, and
-the README now says plainly that these can reach swap.
+files aren't locked on a typical system either.
+
+**So the backend's own secret buffers are now locked one by one (owner's decision).** A new
+helper, `lock_in_ram`, calls `mlock` on each, which fits under a limit too low for `mlockall`:
+the passphrase as read, the private key's text in `load_identity` and `cmd_keygen`, and the seal,
+the vault key's text and its copy in `vault.rs`. This changes audited functions
+(`read_passphrase`, `load_identity`, `cmd_keygen`); the changes are listed below, and
+`harden_process` itself is unchanged. They're never unlocked, since the backend exits when the
+operation ends, and a page can hold more than one buffer. It's still best-effort. **It doesn't
+cover** copies inside the `age` crate (the parsed key, file keys, scrypt's working memory), a
+decrypted file or the manifest, or the frontend's copy of the passphrase in Python. Those can
+still reach swap, so the advice to use encrypted swap stands.
 
 ### Open (added at the owner's request)
 
@@ -413,7 +437,7 @@ Places this differs from, or adds to, what the plan says:
 | Clippy gate runs on Rust 1.85.0 | On untouched `main`, `clippy -D warnings` under 1.75.0 already fails on `File::open(&p)` in `identity_is_valid`, a lint later narrowed. That line is audited, so it stays. Build and tests run on both. |
 | `tests/vault_gui_check.sh` and `vault_gui_driver.py` | Not asked for. They make the Phase 4 run-through and §5.3 repeatable. |
 | `tests/vault_attack.py` | Not asked for. It makes the attacks on the backend repeatable. |
-| `vault.rs` is 831 lines without its tests | Over the budget of ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed, which took it to 817, and refusing FIFOs added the rest. |
+| `vault.rs` is 834 lines without its tests | Over the budget of ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed, which took it to 817, and refusing FIFOs and locking secret buffers added the rest. |
 
 ---
 
@@ -432,12 +456,13 @@ Run from the final tree:
 | `tests/test_frontend_helpers.py` | 38 passed, on both GTK versions below |
 | `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 149 passed, 0 failed |
 | `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 149 passed, 0 failed |
-| `tests/vault_attack.py`, with the `age` tool | 215 passed, 0 failed |
+| `tests/vault_attack.py`, with the `age` tool | 216 passed, 0 failed |
 
-The Rust, dependency, round-trip and attack results are from `fe80c05`, and the backend hasn't
-changed since. The Python and GUI runs are on the final frontend, which after `fe80c05` only
-changed the wording of one dialog and how a long contact name wraps. These are from separate
-scripts that aren't in the repo, and ran on `fe80c05`:
+All of these ran on the final code, `a48985e`. With secret buffers locked, strace under a 64 KB
+limit shows `mlockall` failing and every `mlock` succeeding, for key creation and for creating
+and opening both kinds of vault. These are from separate scripts that aren't in the repo. They
+ran on `fe80c05`, before the last two commits (a dialog's wording, how a long contact name wraps,
+and the locking), except the comparison with `main`, which ran again after them:
 
 | Check | Result |
 |---|---|
@@ -513,7 +538,7 @@ Wayland: openbox on X11 is the only real window manager tested.
 | | SHA-256 |
 |---|---|
 | Baseline binary, `main` @ `ecab899`, rustc 1.75.0 | `9bd8360a7eac449c92192591dc757df918b110b8f4973ced33ec5d8c029aafb1` |
-| This branch's binary, rustc 1.75.0 | `88342e06783d235ae8bd0378f5395cb1b6f3870a8c32b697d18755e12f0040dd` |
+| This branch's binary, rustc 1.75.0 | `bb057cf25c749975bd8fa544a937eb1535678905f8c6500046b30eb177cf04e5` |
 
 Registry `.crate` files, each matching both `Cargo.lock` and the checksum crates.io
 publishes (`tests/verify_deps.sh`):

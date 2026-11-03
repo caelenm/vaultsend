@@ -110,13 +110,14 @@ or a crash dump while the backend is briefly holding it. Concretely:
   system's Yama `ptrace_scope` setting.
 - Intermediate secret buffers (the passphrase, the decrypted key text) are held
   in zeroizing storage so they're wiped on drop rather than left in freed heap.
-- Locking memory out of swap (`mlockall`) is attempted, but **don't count on it**.
-  It locks everything or nothing, and needs a limit that ordinary users often
-  can't raise. Where the limit is low (it was 64 KB where this was measured, in
-  WSL), nothing gets locked, and later allocations such as scrypt's and a decrypted
-  file's aren't locked unless the limit is unlimited. So secrets and decrypted
-  files can reach swap or a hibernation image: use encrypted swap, or none. To see
-  your own limit, run `ulimit -l`.
+- The backend's own buffers holding your passphrase and the key's text are locked
+  out of swap one by one (`mlock`), which works even under a low limit on locked
+  memory. **That doesn't cover everything.** Locking the whole process (`mlockall`)
+  needs a limit ordinary users often can't raise; where it was measured, in WSL, the
+  limit was 64 KB and it failed. So copies inside the `age` library, scrypt's working
+  memory, decrypted files and the frontend's remembered passphrase can still reach
+  swap or a hibernation image. Use encrypted swap, or none. To see your own limit,
+  run `ulimit -l`.
 - The identity file is created atomically at `0600` (no window at a wider
   permission, no clobber race), and a decrypted output file is staged to a
   temp file and only renamed into place after the entire ciphertext has
