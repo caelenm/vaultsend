@@ -58,7 +58,7 @@ written. See the threat model below.
 ## Files touched
 
 ```
- CHANGES-VAULTS.md                                  |  486 +++++++++++++
+ CHANGES-VAULTS.md                                  |  493 +++++++++++++
  README.md                                          |  103 ++-
  VAULTS_PLAN.md                                     |  403 +++++++++++
  backend/Cargo.lock                                 |    4 +-
@@ -66,24 +66,24 @@ written. See the threat model below.
  backend/src/main.rs                                |    8 +-
  backend/src/vault.rs                               | 1542 ++++++++++++++++++++++++++++++++++++++++
  docs/screenshots/vaults/01a-contacts-main.png      |  Bin 0 -> 40841 bytes
- docs/screenshots/vaults/01b-contacts-branch.png    |  Bin 0 -> 42208 bytes
+ docs/screenshots/vaults/01b-contacts-branch.png    |  Bin 0 -> 41547 bytes
  docs/screenshots/vaults/02-vaults-empty.png        |  Bin 0 -> 39245 bytes
  docs/screenshots/vaults/03-vaults-two.png          |  Bin 0 -> 36869 bytes
- docs/screenshots/vaults/04-create-dialog.png       |  Bin 0 -> 61092 bytes
- docs/screenshots/vaults/05-unlocked-nested.png     |  Bin 0 -> 47764 bytes
+ docs/screenshots/vaults/04-create-dialog.png       |  Bin 0 -> 61648 bytes
+ docs/screenshots/vaults/05-unlocked-nested.png     |  Bin 0 -> 47769 bytes
  docs/screenshots/vaults/06-rollback-warning.png    |  Bin 0 -> 54236 bytes
- docs/screenshots/vaults/07-tamper-error.png        |  Bin 0 -> 62387 bytes
+ docs/screenshots/vaults/07-tamper-error.png        |  Bin 0 -> 59810 bytes
  docs/screenshots/vaults/08-passphrase-menu.png     |  Bin 0 -> 45891 bytes
  docs/screenshots/vaults/09-key-changed-warning.png |  Bin 0 -> 69172 bytes
- docs/screenshots/vaults/10-open-warning.png        |  Bin 0 -> 76764 bytes
- docs/screenshots/vaults/11-open-changes-lost.png   |  Bin 0 -> 63308 bytes
- frontend/app.py                                    | 1132 ++++++++++++++++++++++++++++-
- tests/test_frontend_helpers.py                     |  322 +++++++++
+ docs/screenshots/vaults/10-open-warning.png        |  Bin 0 -> 75282 bytes
+ docs/screenshots/vaults/11-open-changes-lost.png   |  Bin 0 -> 62480 bytes
+ frontend/app.py                                    | 1153 +++++++++++++++++++++++++++++-
+ tests/test_frontend_helpers.py                     |  333 +++++++++
  tests/vault_gui_check.sh                           |   48 ++
- tests/vault_gui_driver.py                          |  897 +++++++++++++++++++++++
+ tests/vault_gui_driver.py                          |  981 +++++++++++++++++++++++++
  tests/vault_roundtrip.sh                           |  257 +++++++
  tests/verify_deps.sh                               |   75 ++
- 25 files changed, 5274 insertions(+), 16 deletions(-)
+ 25 files changed, 5397 insertions(+), 16 deletions(-)
 ```
 
 | File | What |
@@ -146,6 +146,7 @@ New lines also went into `Window.__init__`, `Window.error` (forgets a rejected
 passphrase; every identity decrypt reports through it), the menu in `_build_content`,
 and `VaultSend` (clears the cache on shutdown). All are §4.5. `ask_passphrase` itself
 is unchanged. Key creation and recovery still call it directly, so those are never cached.
+The stylesheet in `_load_css` also gained rules for the vault file list.
 
 ### `README.md` (three lines)
 
@@ -347,6 +348,7 @@ Places this differs from, or adds to, what the plan says:
 | Only changes re-list, not "every op" (§4.2) | Extract and verify change nothing, and a re-list costs a scrypt with the window frozen. |
 | A **Verify all** button beside the "Files" heading | §4.2 lists check as a frontend operation, but its action bar has no button for it. The bar itself matches the plan. |
 | An "Everything in this vault" row | What Extract acts on when nothing else is selected, so there's no hidden default. |
+| Nested `Adw.ExpanderRow`s kept as §4.2 says, plus an indent per level and CSS corrections | libadwaita doesn't indent nested rows, and its arrow rule matches every arrow below an open row, so a closed folder inside an open one looked open. Each radio now gets a `margin_start` by depth, and one CSS rule restores the closed arrow. Another stops the per-level shading, which left text unreadable around 40 levels. Indent and shading stop at `INDENT_LEVELS`, because the list can't scroll sideways: with no cap, 40 levels widened the window from 870 to 1110 pixels. A flat list wouldn't need the CSS but would depart from the plan. The arrow rule depends on libadwaita's internal row structure, which is the same on 1.5.0 and 1.7.6; if that changes, the arrow goes back to looking open and the GUI run-through fails. |
 | Vault errors are dialogs, not toasts | A failed integrity check shouldn't fade away by itself. |
 | A file with a name colliding on extract is an error | `open_private_new` would replace it, and "A" and "a" are one file on a case-insensitive disk. |
 | Clippy gate runs on Rust 1.85.0 | On untouched `main`, `clippy -D warnings` under 1.75.0 already fails on `File::open(&p)` in `identity_is_valid`, a lint later narrowed. That line is audited, so it stays. Build and tests run on both. |
@@ -367,13 +369,13 @@ Run from the final tree:
 | `tests/verify_deps.sh` | All 8 crates match `Cargo.lock` and crates.io; no `[[package]]` added |
 | `tests/vault_roundtrip.sh` | 89 passed, 0 failed; 90 of 90 where `strace` is available |
 | strace proof | The last blob is opened before the output path is first touched |
-| `tests/test_frontend_helpers.py` | 36 passed, on both GTK versions below |
-| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 119 passed, 0 failed |
-| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 119 passed, 0 failed |
+| `tests/test_frontend_helpers.py` | 38 passed, on both GTK versions below |
+| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 134 passed, 0 failed |
+| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 134 passed, 0 failed |
 
-The backend hasn't changed since those Rust, dependency and round-trip results, because Open
-needed no backend change; the binary hash is the same. The Python and GUI runs are on the
-final frontend.
+The backend hasn't changed since those Rust, dependency and round-trip results, because
+neither Open nor the file-list fix needed a backend change; the binary hash is the same. The
+Python and GUI runs are on the final frontend.
 
 **The version floor.** libadwaita 1.5.0 is exactly the app's floor, and the whole run-through
 passes on it. GTK 4.10 itself wasn't tested, but it isn't reachable with that floor anyway:
@@ -393,6 +395,11 @@ before, the release binary and `app.py`, and its build command is unchanged.
 - A warning toast containing a path with `&` would have failed to display.
 - A vault with one file said "1 files".
 - The first Open warning's heading was too long and triggered a GTK layout warning.
+- Nested folders read wrongly in the file list: no indent, so `return.pdf` in `taxes/` looked
+  as if it was inside `2025/`, and a closed folder inside an open one showed an open arrow.
+  No test caught this and the first review of `05-unlocked-nested.png` missed it; it showed
+  up in a recording of the real window. The checks for it are now in the GUI run-through,
+  and five of them fail on a copy of the app with the fix taken out.
 
 ---
 
@@ -431,7 +438,7 @@ looked at before committing.
 | `02-vaults-empty.png` | Vaults mode with an empty list and the "Add vault" button. |
 | `03-vaults-two.png` | Two vaults, one per mode, with the password vault selected and locked. |
 | `04-create-dialog.png` | The create dialog: exact protection labels, default location shown in full. |
-| `05-unlocked-nested.png` | An unlocked vault with nested folders, a name containing `&` and `<`, and sizes. |
+| `05-unlocked-nested.png` | An unlocked vault with nested folders indented by level, open and closed arrows, a name containing `&` and `<`, and sizes. |
 | `06-rollback-warning.png` | The rollback warning, with Open anyway and Cancel. |
 | `07-tamper-error.png` | The error after extracting from a tampered vault; nothing was written. |
 | `08-passphrase-menu.png` | The Remember passphrase submenu. |
@@ -457,7 +464,7 @@ Every test uses throwaway `HOME` and XDG dirs under `mktemp -d` in `/tmp` (ext4)
 key and config were never touched.
 
 **The GUI run-through drives the real window** with real dialogs and the real backend,
-including real GTK file choosers, but through its widgets rather than a mouse. For Open it
+including real GTK file choosers, but mostly through its widgets rather than a mouse. For Open it
 launches through the real GTK and desktop-file path, but the "default app" is a stand-in
 script registered in the throwaway dirs. What it can't show: a real drag from a file manager
 (it calls the drop handler directly), Open with real apps, and how the app behaves on a real
