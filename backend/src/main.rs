@@ -11,6 +11,7 @@
 //   recover-pubkey --pass-fd N    Rebuild the public key cache from identity.age.
 //   encrypt -r AGE1.. [..] [--armor] [--in P] [--out P]   (no secret needed)
 //   decrypt --pass-fd N [--in P] [--out P]
+//   vault-create|list|add|remove|extract|check   Encrypted folders; see vault.rs.
 //
 // Secrets never travel on argv (which is world-readable via /proc). The identity
 // passphrase is read from a file descriptor handed over by the parent process.
@@ -22,6 +23,8 @@
 // RAM cannot be read by other same-user processes, recovered from a core file,
 // or paged to a swap device. Secret buffers are additionally held in zeroizing
 // storage so they are wiped from memory on drop.
+
+mod vault;
 
 use std::env;
 use std::fs::{self, File};
@@ -491,8 +494,11 @@ fn run() -> R<()> {
             opt_value(rest, "--in").as_deref(),
             opt_value(rest, "--out").as_deref(),
         ),
+        "vault-create" | "vault-list" | "vault-add" | "vault-remove" | "vault-extract"
+        | "vault-check" => vault::run(cmd, rest),
         other => Err(format!(
-            "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt)"
+            "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt|\
+             vault-create|vault-list|vault-add|vault-remove|vault-extract|vault-check)"
         )),
     }
 }

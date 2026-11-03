@@ -1012,6 +1012,8 @@ version = "0.1.2"
 dependencies = [
  "age",
  "libc",
+ "rand",
+ "sha2",
  "zeroize",
  "zeroize_derive",
 ]

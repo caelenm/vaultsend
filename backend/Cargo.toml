@@ -19,6 +19,12 @@ age = { version = "0.11", features = ["armor"] }
 # directly. Cargo unifies it with the locked version, so the lock is unchanged.
 zeroize = "1"
 
+# Vaults: SHA-256 pins each encrypted blob in the manifest; rand names the blobs.
+# Both already in the tree via age, and unified with the locked versions, so the
+# lock gains no [[package]] (checked by tests/verify_deps.sh).
+sha2 = "0.10"
+rand = "0.8"
+
 # --- Pins so the tree builds on Rust 1.75 (older releases of age's localization
 # --- sub-tree; age itself targets rustc 1.65). Recorded in Cargo.lock too. ---
 zeroize_derive = "=1.4.2"
@@ -34,3 +40,8 @@ opt-level = "z"
 lto = true
 strip = true
 panic = "abort"
+
+# Unit tests run real scrypt at 2^18, which is slow unoptimized. Affects test and
+# debug builds only; the release binary is built by the profile above.
+[profile.dev.package."*"]
+opt-level = 2
