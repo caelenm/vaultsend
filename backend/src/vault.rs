@@ -28,8 +28,8 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::{
-    commit_staged, encrypt_to, load_identity, open_private_new, read_passphrase, staging_path,
-    R, SCRYPT_LOG_N,
+    commit_staged, encrypt_to, load_identity, lock_in_ram, open_private_new, read_passphrase,
+    secret_buffer, staging_path, R, SCRYPT_LOG_N,
 };
 
 const VAULT_FILE: &str = "VAULT";
@@ -294,10 +294,12 @@ fn lock_vault(dir: &str, exclusive: bool) -> R<File> {
 fn seal_secret(identity: &x25519::Identity) -> SecretString {
     let private = identity.to_string();
     let private = private.expose_secret();
+    lock_in_ram(private.as_bytes());
     // Exact capacity: SecretString won't reallocate it, so no copy is left behind.
     let mut text = String::with_capacity(SEAL_PREFIX.len() + private.len());
     text.push_str(SEAL_PREFIX);
     text.push_str(private);
+    lock_in_ram(text.as_bytes());
     SecretString::from(text)
 }
 
@@ -329,7 +331,7 @@ fn unlock(dir: &str, pass_fd: i32) -> R<x25519::Identity> {
         }
         _ => return Err(format!("{dir}/{VAULT_FILE} is not a format this version understands")),
     };
-    let mut secret: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut secret = secret_buffer();
     stream.read_to_end(&mut secret).map_err(|e| format!("reading this vault's {KEY_FILE}: {e}"))?;
     std::str::from_utf8(&secret)
         .map_err(|_| format!("this vault's {KEY_FILE} is corrupt"))?
@@ -424,6 +426,7 @@ impl Vault {
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{dir}: {e}"))?;
             private_dir(&format!("{dir}/{BLOBS_DIR}"), false)?;
             let secret = Zeroizing::new(v.key.to_string().expose_secret().to_owned());
+            lock_in_ram(secret.as_bytes());
             write_atomic(&format!("{dir}/{KEY_FILE}"), |file| {
                 encrypt_to(wrap, false, Box::new(Cursor::new(secret)), file)
             })?;

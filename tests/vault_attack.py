@@ -633,7 +633,12 @@ def section_hardening():
             note("/proc/pid/limits isn't readable here")
         status = Path(f"/proc/{p.pid}/status").read_text()
         locked = next((l for l in status.splitlines() if l.startswith("VmLck")), "")
-        note(f"memory locked out of swap: {' '.join(locked.split())} (ulimit -l here: {resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]})")
+        limit = resource.getrlimit(resource.RLIMIT_MEMLOCK)[0]
+        kb = int(locked.split()[1]) if locked else 0
+        if limit == resource.RLIM_INFINITY or limit >= 8192:
+            check(kb > 0, f"the passphrase's buffer is locked out of swap before the secret arrives ({kb} kB, limit {limit})", locked)
+        else:
+            note(f"the limit on locked memory is too low to test locking here: {limit}")
     finally:
         os.write(w, VAULT_PASS.encode())
         os.close(w)
