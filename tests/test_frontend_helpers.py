@@ -73,6 +73,25 @@ class Registry(ConfigFiles):
         self.write(app.VAULTS_FILE, json.dumps([{"name": "x", "path": "/p", "mode": "self", "last_generation": 2, "key_sha256": "ab"}]))
         self.assertEqual(app.load_vaults(), [{"name": "x", "path": "/p", "mode": "self", "last_generation": 2}])
 
+    def test_saved_files_are_private(self):
+        old = os.umask(0)
+        self.addCleanup(os.umask, old)
+        for path, save in (
+            (app.VAULTS_FILE, lambda: app.save_json(app.VAULTS_FILE, [])),
+            (app.SETTINGS_FILE, lambda: app.save_json(app.SETTINGS_FILE, {})),
+            (app.CONTACTS_FILE, lambda: app.save_contacts([])),
+        ):
+            save()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
+            # Neither an older, wider file nor a temp file left by a crash passes its mode on.
+            path.chmod(0o644)
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text("left by a crash")
+            tmp.chmod(0o644)
+            save()
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600, path)
+            self.assertFalse(tmp.exists())
+
 
 class Settings(ConfigFiles):
     DEFAULT = {"remember": "off", "cache_explained": False, "open_explained": False}

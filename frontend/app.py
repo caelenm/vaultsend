@@ -249,16 +249,23 @@ def load_contacts() -> list:
 
 
 def save_contacts(contacts: list) -> None:
+    save_json(CONTACTS_FILE, contacts)
+
+
+def save_json(path, value) -> None:
     # Write a temp file and rename it over the old one, so a crash or full disk
-    # mid-write can never leave a truncated contacts.json (which would load as
-    # an empty list and then be saved over).
+    # mid-write can never leave a truncated file (contacts.json would then load as
+    # an empty list and be saved over). Private: who you talk to, and your vaults'
+    # names and locations, are nobody else's business on a shared machine.
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CONTACTS_FILE.with_name(CONTACTS_FILE.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(contacts, indent=2))
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
+        os.fchmod(fd, 0o600)  # a temp file left by a crash keeps its old mode otherwise
+        f.write(json.dumps(value, indent=2))
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, CONTACTS_FILE)
+    os.replace(tmp, path)
 
 
 def is_valid_pubkey(s: str) -> bool:
@@ -284,17 +291,6 @@ def short(pubkey: str) -> str:
 # ---------------------------------------------------------------------------
 # Vault registry and settings (plain JSON; no secrets in either)
 # ---------------------------------------------------------------------------
-def save_json(path, value) -> None:
-    # Temp file and rename, for the same reason as save_contacts().
-    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(path.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(value, indent=2))
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
-
-
 def load_vaults() -> list:
     """The vaults this device knows about. Besides name and location, each entry
     remembers the highest generation seen, for spotting a rollback."""
@@ -401,6 +397,17 @@ def short_path(path: str) -> str:
 
 def entry_indent(path: str) -> int:
     return min(path.count("/"), INDENT_LEVELS) * INDENT_STEP
+
+
+def plain_row(title: str, subtitle: str) -> Adw.ActionRow:
+    """A row showing a name exactly as it is. As markup, an "&" in a contact's or a file's
+    name would leave it blank. Setters, in this order: passed to the constructor, the text
+    is parsed as markup first."""
+    row = Adw.ActionRow()
+    row.set_use_markup(False)
+    row.set_title(title)
+    row.set_subtitle(subtitle)
+    return row
 
 
 def memory_candidates() -> list:
@@ -667,9 +674,7 @@ class VaultOperation(FileOperation):
             self.window.toast("Cancelled.")
             self.on_done(None)
         elif code == 0:
-            # Toasts parse markup, and a warning can name a path.
-            note = f"{self.note} Note: {GLib.markup_escape_text(warnings[0])}." if warnings else self.note
-            self.window.toast(note)
+            self.window.toast(f"{self.note} Note: {warnings[0]}." if warnings else self.note)
             self.on_done(None)
         else:
             self._discard_partials()
@@ -691,6 +696,9 @@ class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="VaultSend")
         self.set_default_size(880, 600)
+        # GTK would otherwise log every file chosen in a dialog to the desktop's shared list of
+        # recent files, by name, and keep that record after the file itself has gone.
+        self.get_settings().set_property("gtk-recent-files-enabled", False)
         self.my_pubkey = None
         self.contacts = load_contacts()
         self.current_op = None  # in-flight FileOperation, if any
@@ -743,6 +751,8 @@ class Window(Adw.ApplicationWindow):
         list.nested list.nested list.nested list.nested list.nested list.nested list.nested {
             background: none;
         }
+        /* Above the row of buttons at the bottom, not over them, where it would catch their clicks. */
+        toast { margin-bottom: 72px; }
         """
         provider = Gtk.CssProvider()
         try:
@@ -828,7 +838,7 @@ class Window(Adw.ApplicationWindow):
             self.contact_list.append(row)
             return
         for c in self.contacts:
-            row = Adw.ActionRow(title=c["name"], subtitle=short(c["pubkey"]))
+            row = plain_row(c["name"], short(c["pubkey"]))
             row.set_activatable(True)
             copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
             copy.add_css_class("flat")
@@ -1007,14 +1017,16 @@ class Window(Adw.ApplicationWindow):
 
     # -- Small helpers --------------------------------------------------------
     def toast(self, text):
-        self.toasts.add_toast(Adw.Toast.new(text))
+        # Plain text: messages can name files and contacts, and an "&" read as markup
+        # would make the whole toast fail to appear.
+        self.toasts.add_toast(Adw.Toast(use_markup=False, title=text))
 
     def error(self, text):
         # Every identity decrypt reports failure through here, including the file
         # path's FileOperation, so this is the one place to drop a rejected passphrase.
         if "wrong passphrase" in text:
             self.cache.forget("identity")
-        self.toasts.add_toast(Adw.Toast.new(text))
+        self.toast(text)
 
     def copy(self, text, note="Copied."):
         self.get_clipboard().set(text)
@@ -1328,6 +1340,7 @@ class Window(Adw.ApplicationWindow):
             on_ok(p)
 
         dlg.connect("response", resp)
+        dlg.set_focus(entry)  # ready to type into, without reaching for the mouse
         dlg.present(self)
 
     def add_contact_dialog(self):
@@ -1454,8 +1467,7 @@ class Window(Adw.ApplicationWindow):
             kind = "Password" if v["mode"] == "password" else "Your key"
             found = read_vault_mode(v["path"]) is not None
             subtitle = f"{kind} · {short_path(v['path'])}" if found else "Not found"
-            # Names can come from folder names on disk, so they are never markup.
-            row = Adw.ActionRow(title=v["name"], subtitle=subtitle, use_markup=False)
+            row = plain_row(v["name"], subtitle)  # names can come from folder names on disk
             row.set_activatable(found)
             row.set_selectable(found)
             row.connect("activated", lambda _r, vault=v: self.select_vault(vault))
@@ -1532,7 +1544,7 @@ class Window(Adw.ApplicationWindow):
     def add_vault_dialog(self):
         dlg = Adw.AlertDialog(heading="Add vault", body="A vault is an encrypted folder of files.")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        name = Gtk.Entry(placeholder_text="Vault name")
+        name = Gtk.Entry(placeholder_text="Vault name", activates_default=True)
         box.append(name)
 
         how = Gtk.Label(label="Protection", xalign=0, margin_top=8)
@@ -1590,6 +1602,7 @@ class Window(Adw.ApplicationWindow):
                 self._begin_create(n, str(VAULTS_DIR / (n + VAULT_SUFFIX)), mode)
 
         dlg.connect("response", resp)
+        dlg.set_focus(name)
         dlg.present(self)
         return dlg
 
@@ -1654,7 +1667,8 @@ class Window(Adw.ApplicationWindow):
 
     # -- Vault page -----------------------------------------------------------
     def _build_vault_page(self):
-        clamp = Adw.Clamp(maximum_size=680, margin_top=24, margin_bottom=24, margin_start=16, margin_end=16)
+        # No tightening: it would narrow the page until the buttons wrapped, with room to spare.
+        clamp = Adw.Clamp(maximum_size=680, tightening_threshold=680, margin_top=24, margin_bottom=24, margin_start=16, margin_end=16)
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         clamp.set_child(col)
 
@@ -1689,22 +1703,27 @@ class Window(Adw.ApplicationWindow):
         self.vault_body.add_named(file_scroller, "files")
         col.append(self.vault_body)
 
-        self.vault_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        for label, handler in (
-            ("Add files…", self.vault_add_files),
-            ("Add folder…", self.vault_add_folder),
-            (None, None),
-            ("Open", self.vault_open),
-            ("Extract…", self.vault_extract),
-            ("Delete", self.vault_delete),
-            ("Lock", self.vault_lock),
+        # Two groups that share a line when they fit and wrap when they don't. In one fixed
+        # row, these buttons would set the minimum width of the whole window, on every page.
+        self.vault_actions = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=2, row_spacing=8, column_spacing=8,
+        )
+        for halign, buttons in (
+            (Gtk.Align.START, (("Add files…", self.vault_add_files), ("Add folder…", self.vault_add_folder))),
+            (Gtk.Align.END, (
+                ("Open", self.vault_open),
+                ("Extract…", self.vault_extract),
+                ("Delete", self.vault_delete),
+                ("Lock", self.vault_lock),
+            )),
         ):
-            if label is None:
-                self.vault_actions.append(Gtk.Box(hexpand=True))
-                continue
-            btn = Gtk.Button(label=label)
-            btn.connect("clicked", lambda _b, fn=handler: fn())
-            self.vault_actions.append(btn)
+            group = Gtk.Box(spacing=8, halign=halign)
+            for label, handler in buttons:
+                btn = Gtk.Button(label=label)
+                btn.connect("clicked", lambda _b, fn=handler: fn())
+                group.append(btn)
+            self.vault_actions.append(group)
+            group.get_parent().set_focusable(False)  # Tab goes to the buttons, not around them
         col.append(self.vault_actions)
 
         drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
@@ -1753,7 +1772,7 @@ class Window(Adw.ApplicationWindow):
                 row.connect("notify::expanded", self._on_folder_expanded, e["path"], everything)
                 folders[e["path"]] = row
             else:
-                row = Adw.ActionRow(title=name, subtitle=human_bytes(e["size"]), use_markup=False)
+                row = plain_row(name, human_bytes(e["size"]))
                 row.set_activatable_widget(radio)
             row.add_prefix(radio)
             if parent in folders:
@@ -1877,6 +1896,9 @@ class Window(Adw.ApplicationWindow):
         if self.vault_entries is None:
             self.error("Unlock the vault first.")
             return False
+        # The drag left the keyboard with the other app: without this, a passphrase typed
+        # into the prompt that comes next would go there instead.
+        self.present()
         self._add_paths([f.get_path() for f in value.get_files() if f.get_path()])
         return True
 

@@ -141,6 +141,11 @@ def click_vault(vault):
     win.vault_list.emit("row-activated", row)
 
 
+def has_focus(dlg, widget):
+    focus = dlg.get_focus()
+    return focus is not None and (focus is widget or focus.is_ancestor(widget))
+
+
 def radio_of(path):
     """A row's radio button. They run in display order after "Everything"."""
     radios = [w for w in walk(win.file_list) if isinstance(w, Gtk.CheckButton)]
@@ -262,6 +267,7 @@ def script():
     yield SETTLE
     dlg = dialog()
     entry = next(w for w in walk(dlg) if type(w) is Gtk.Entry)
+    check(has_focus(dlg, entry), "the vault name is ready to type into")
     entry.set_text("Personal")
     yield 300
     check(find_check(dlg, "Encrypt with my key (simplest, secure)").get_active(), "my key is the default")
@@ -270,6 +276,7 @@ def script():
     respond("Create")
     yield SETTLE
     check(bool([w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)]), "creating with my key asks for the passphrase")
+    check(has_focus(dialog(), next(w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry))), "and the passphrase is ready to type, without reaching for the mouse")
     enter_passphrase("not the identity passphrase")
     yield SETTLE
     check("wrong passphrase" in dialog_text(), "a wrong passphrase is reported")
@@ -488,6 +495,19 @@ def script():
     win._show_files(listing)
     yield SETTLE
 
+    # The vault's buttons wrap rather than setting a wide minimum for the whole window.
+    narrowest = win.measure(Gtk.Orientation.HORIZONTAL, -1)[0]
+    check(narrowest < 700, f"the window can still be narrow ({narrowest} pixels at the least)")
+
+    # A toast mustn't sit on the action buttons, where it would catch their clicks.
+    win.toast("a message")
+    yield 400
+    toast = next(w for w in walk(win.toasts) if w.get_css_name() == "toast")
+    _, toast_bottom = toast.compute_point(win, Graphene.Point().init(0, toast.get_height()))
+    _, buttons_top = win.vault_actions.compute_point(win, Graphene.Point())
+    check(toast_bottom.y <= buttons_top.y, "a toast sits above the action buttons, not over them")
+    yield SETTLE
+
     # -- Name clash: Replace / Cancel ------------------------------------------------
     single.write_text("a second version of the letter\n")
     win._add_paths([str(single)])
@@ -517,6 +537,8 @@ def script():
     yield from idle()
     check((WORK / "out" / "letter-out.txt").read_text() == single.read_text(), "extracted file has the new contents")
     check((WORK / "out" / "letter-out.txt").stat().st_mode & 0o777 == 0o600, "extracted file is private")
+    recent = Path(os.environ["XDG_DATA_HOME"], "recently-used.xbel")
+    check(not recent.exists() or "letter-out" not in recent.read_text(), "and its name isn't logged in the desktop's recent files")
 
     select(app.ROOT_ENTRY)
     win.vault_extract()
@@ -966,6 +988,27 @@ def script():
     yield SETTLE
     check(win.add_content.get_label() == "Add contact", "back to contacts")
     check(len(win.contacts) == 2, "contacts untouched")
+
+    # Names are never markup: an "&" can't blank a contact or swallow a message.
+    def shown_text(root):
+        return [w.get_text() for w in walk(root) if isinstance(w, Gtk.Label)]
+
+    odd = {"name": "Sam & <co>", "pubkey": win.my_pubkey}
+    win.contacts.append(odd)
+    win._refresh_contacts()
+    yield SETTLE
+    check(odd["name"] in shown_text(win.contact_list), "a contact with & in the name shows it")
+    win.contacts.remove(odd)
+    win._refresh_contacts()
+    message = "can't read /tmp/a&b <c>"
+    win.error(message)
+    yield 300
+    check(message in shown_text(win.toasts), "an error naming a path with & appears")
+    win.toast(message)
+    yield 300
+    check(message in shown_text(win.toasts), "and so does any other message")
+    yield SETTLE
+
     check(not list(WORK.rglob("*.vaultsend-part")), "no staging files left anywhere")
     config = app.VAULTS_FILE.read_text() + app.SETTINGS_FILE.read_text()
     check(ID_PASS not in config and VAULT_PASS not in config, "no secret in any config file")
