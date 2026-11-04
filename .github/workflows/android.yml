@@ -32,6 +32,14 @@ jobs:
         working-directory: rust
         run: cargo test
 
+      # The desktop vaults branch's end-to-end script, run against the same vault
+      # code through a host-side CLI (examples/vault_cli.rs, not shipped).
+      - name: Vault round trip
+        working-directory: rust
+        run: |
+          cargo build --release --locked --example vault_cli --features cli
+          bash tests/vault_roundtrip.sh
+
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 3.5.4 --locked
 
