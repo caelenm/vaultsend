@@ -150,7 +150,7 @@ downloads aren't reachable from it):
 | `rust/tests/vault_attack.py`, with `age` 1.1.1 | **211 passed, 4 failed**: the four process-hardening checks above; everything about vaults passes |
 | `VaultHelpersTest` (JVM) | 45 passed |
 | Kotlin type-check: everything but the Compose UI, against Robolectric's `android-all` (API 34) | Compiles |
-| Kotlin type-check: the Compose UI, against Compose Multiplatform 1.7 (the same APIs as this app's Compose BOM), with stubs for the AndroidX activity, lifecycle and `FileProvider` calls | See the commit that adds the UI |
+| Kotlin type-check: the Compose UI and view model, against Compose Multiplatform 1.7 (the same `androidx.compose` APIs as this app's Compose BOM) and `android-all`, with stubs for the AndroidX activity, lifecycle and `FileProvider` calls | Compiles. It found one error (a function clashing with a property's setter), now fixed. `MainActivity.kt` and `Theme.kt` were left out; their changes are small |
 
 ---
 

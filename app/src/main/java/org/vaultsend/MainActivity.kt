@@ -81,7 +81,7 @@ class MainActivity : ComponentActivity() {
                 // Several files at once only make sense for a vault: added to the open one.
                 val uris = IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
                     ?.filter { isContentUri(it) }
-                if (!uris.isNullOrEmpty()) vm.setPendingShareMany(uris)
+                if (!uris.isNullOrEmpty()) vm.offerShareMany(uris)
             }
             Intent.ACTION_SEND -> {
                 val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)

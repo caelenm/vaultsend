@@ -269,7 +269,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         pendingShareMany = null
     }
 
-    fun setPendingShareMany(uris: List<Uri>) {
+    fun offerShareMany(uris: List<Uri>) {
         pendingShareMany = uris
     }
 
