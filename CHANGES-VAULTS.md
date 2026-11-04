@@ -4,6 +4,7 @@ Record for `feature/vaults`, version 0.2.0 (spec: `VAULTS_PLAN.md`). Local branc
 only; nothing has been pushed.
 
 - [Summary](#summary)
+- [Changes from the owner's testing](#changes-from-the-owners-testing)
 - [Decisions made by the owner](#decisions-made-by-the-owner)
 - [Files touched](#files-touched)
 - [Every existing line changed, and why](#every-existing-line-changed-and-why)
@@ -29,6 +30,65 @@ crate. `FileOperation`, `run_backend`, `spawn_backend` and the audited backend f
 byte-identical to `main`, checked by comparing each definition, except for three the owner
 chose to change so secret buffers are locked in memory: `read_passphrase`, `load_identity` and
 `cmd_keygen`. Those changes are listed below.
+
+---
+
+## Changes from the owner's testing
+
+| # | Asked for | What it does now |
+|---|---|---|
+| 0 | "Everything in this vault" isn't clear | The owner chose to remove the row. **Select all**, **Select multiple** and **Verify all** sit above the list, and the heading shows the vault's totals. Nothing is selected to begin with, so Open, Extract…, Share… and Delete wait for a selection rather than falling back on a hidden default. |
+| 1 | Add folder shouldn't take a file | The chooser is filtered to folders, and the result is checked after, because a desktop's own chooser can ignore a filter. Applies to every folder chooser. |
+| 2 | Share | **Share…** lists contacts, with an *Add new contact* link that opens Add contact over the dialog, so the selection and the place in the flow are kept. Clicking a contact goes on to Save. See below for what's saved. |
+| 3 | Delete on the whole vault does nothing | With everything selected, Delete asks, then empties the vault and leaves it in place. |
+| 4 | Percentages on file operations | Vault operations now show one. See below. Encrypt and Decrypt on the main page already did. |
+| 5 | A bigger window | 1012 x 690, 15% more each way. |
+| 6 | Copyable path in "Remove from list?" | The path is in a selectable label, with a copy button. |
+| 7 | Drop a password vault on the main page | Decrypt, then its password. It opens and joins the list. A wrong password leaves nothing behind. |
+| 8 | The same for key vaults | Unlocks if your key is the one, and otherwise says your key doesn't match, and that it was made for a different recipient or with a different key. |
+| 9 | Create with no name shouldn't close the dialog | Create stays off until the name will do, and a name with `/` also turns the field red. Answering an `Adw.AlertDialog` always closes it, so this is the only way. |
+| 10 | Select several | **Select multiple** has a dotted box that turns blue, and turns the rows into tick boxes. Open, Extract…, Share… and Delete then act on all of them. |
+
+Not asked for, in the same family as 9: Add contact's **Add** also waits for a name and an
+`age1…` key, because a slip there would otherwise throw away what was typed part way through
+Share. The vault page's column went from 680 to 760 pixels, and the action buttons' spacing from 8
+to 6, so that Share… fits on one line at the default size.
+
+**How selecting several works.** Ticking a folder ticks what's in it and stands for all of it;
+unticking something inside unticks the folders above it, so a ticked folder always means the
+whole folder. Every row ticked, by hand or with Select all, means the whole vault. Closing a
+folder clears ticks hidden inside it, unless the folder itself is ticked, as with a single
+selection (`836aeb7`). Open covers the files in anything ticked, and asks first above 10.
+Extracting several makes one new folder, where each keeps its path from the top of the vault, so
+two files with one name can't collide.
+
+**What Share saves.** A plain age file, encrypted to the contact and to you, not a vault: a
+`self` vault only opens for whoever sealed it, so one can't be made for someone else. They need
+only the main page, or the `age` tool. One file stays that file. Anything else becomes a tar
+archive inside the age file, written by `backend/src/tar.rs`, since the plan rules out a new crate
+and this is 75 lines. It only writes, so nothing a stranger sends goes through it. Everything
+verifies in RAM before the output is touched, as with extract.
+
+**How the percentage works.** The backend writes whole percentages, one per line, to a pipe
+given by `--progress-fd`. The frontend can't read the backend's memory (`harden_process`), and a
+vault write has no single growing file to measure. The reports are numbers only, 101 lines at
+most, and the pipe is non-blocking at both ends, so a report can never hold up the work. Copying
+to the output counts as well as decrypting, so the bar doesn't sit at 100% through the slow part.
+The bar pulses until the first report, while the key unlocks, and again once the work is done but
+not yet committed. Deleting has no bytes to count, so it counts blobs. It's a measure of work done,
+not of time, so a file much larger than the rest moves it in step with its size.
+
+**Emptying a vault** has its own flag, `vault-remove --all`. `--entry /` is still refused, as a
+test has always required, so no path, however it got built, can mean this by accident.
+
+**Audited code.** `FileOperation`, `run_backend` and `spawn_backend` are still byte-identical to
+`main`, checked by comparing each definition. `VaultOperation.start` repeats a few lines to add
+the pipe, as `_finish` already does. `main.rs` gained only `mod tar`, the dispatch for
+`vault-share`, and its name in two messages.
+
+**Not tested:** a real drag from a file manager (the run-through calls the drop handler with a
+real `Gdk.FileList`), several real apps opening at once, and any desktop's own chooser, where only
+the check after choosing can be relied on. These are worth a manual check.
 
 ---
 
@@ -95,6 +155,7 @@ written. See the threat model below.
 | File | What |
 |---|---|
 | `backend/src/vault.rs` | New. All vault logic and its unit tests. |
+| `backend/src/tar.rs` | New. Writes the archive Share uses for a folder or several items, with its unit tests. |
 | `backend/src/main.rs` | `mod vault;`, one dispatch arm, usage text. |
 | `backend/Cargo.toml`, `Cargo.lock` | `sha2` and `rand` as direct dependencies, version, test profile. |
 | `frontend/app.py` | Sidebar toggle, vault page, dialogs, registry, passphrase cache. |
@@ -191,13 +252,16 @@ vault-create  --dir P --mode self --pass-fd N
 vault-create  --dir P --mode password --pass-fd N
 vault-list    --dir P --pass-fd N
 vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
-vault-remove  --dir P --pass-fd N --entry VAULTPATH
-vault-extract --dir P --pass-fd N --entry VAULTPATH --out PATH
+vault-remove  --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]...
+vault-remove  --dir P --pass-fd N --all
+vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH
+vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH
 vault-check   --dir P --pass-fd N
 ```
 
 `--pass-fd` carries the identity passphrase for a `self` vault and the vault password
-for a `password` vault. `--entry /` means the whole vault.
+for a `password` vault. `--entry /` means the whole vault, except to `vault-remove`, which
+refuses it. Anything that opens a vault also takes `--progress-fd N`.
 
 ---
 
@@ -430,14 +494,14 @@ Places this differs from, or adds to, what the plan says:
 | `VaultOperation` subclass, not `total=None` in `FileOperation` | §4.2 allowed the smallest change to `FileOperation`. A subclass needs none, so it stays byte-identical, at the cost of repeating a few lines of `_finish`. |
 | Only changes re-list, not "every op" (§4.2) | Extract and verify change nothing, and a re-list costs a scrypt with the window frozen. |
 | A **Verify all** button beside the "Files" heading | §4.2 lists check as a frontend operation, but its action bar has no button for it. The bar itself matches the plan. |
-| An "Everything in this vault" row | What Extract acts on when nothing else is selected, so there's no hidden default. |
+| Select all, in place of the "Everything in this vault" row | The row was there so Extract had no hidden default. The owner found it unclear and chose this instead: nothing is selected until you choose, so there's still no hidden default. |
 | Nested `Adw.ExpanderRow`s kept as §4.2 says, plus an indent per level and CSS corrections | libadwaita doesn't indent nested rows, and its arrow rule matches every arrow below an open row, so a closed folder inside an open one looked open. Each radio now gets a `margin_start` by depth, and one CSS rule restores the closed arrow. Another stops the per-level shading, which left text unreadable around 40 levels. Indent and shading stop at `INDENT_LEVELS`, because the list can't scroll sideways: with no cap, 40 levels widened the window from 870 to 1110 pixels. A flat list wouldn't need the CSS but would depart from the plan. The arrow rule depends on libadwaita's internal row structure, which is the same on 1.5.0 and 1.7.6; if that changes, the arrow goes back to looking open and the GUI run-through fails. |
 | Vault errors are dialogs, not toasts | A failed integrity check shouldn't fade away by itself. |
 | A file with a name colliding on extract is an error | `open_private_new` would replace it, and "A" and "a" are one file on a case-insensitive disk. |
 | Clippy gate runs on Rust 1.85.0 | On untouched `main`, `clippy -D warnings` under 1.75.0 already fails on `File::open(&p)` in `identity_is_valid`, a lint later narrowed. That line is audited, so it stays. Build and tests run on both. |
 | `tests/vault_gui_check.sh` and `vault_gui_driver.py` | Not asked for. They make the Phase 4 run-through and §5.3 repeatable. |
 | `tests/vault_attack.py` | Not asked for. It makes the attacks on the backend repeatable. |
-| `vault.rs` is 834 lines without its tests | Over the budget of ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed, which took it to 817, and refusing FIFOs and locking secret buffers added the rest. |
+| `vault.rs` is about 1,075 lines without its tests | Over the budget of ~800, after the owner raised it from ~550. It was 804 before `key.age` was sealed, which took it to 817, and refusing FIFOs and locking secret buffers took it to 834. Progress, acting on several entries and `vault-share` added the rest. The tar writer is in its own file. |
 
 ---
 
@@ -447,18 +511,19 @@ Run from the final tree:
 
 | Check | Result |
 |---|---|
-| `cargo test --locked`, Rust 1.75.0 and 1.85.0 | 30 passed, 0 failed, on both |
+| `cargo test --locked`, Rust 1.75.0 and 1.85.0 | 48 passed, 0 failed, on both |
 | `cargo clippy --locked --all-targets -- -D warnings`, 1.85.0 | Clean |
 | `cargo build --release --locked`, 1.75.0 | OK |
-| `tests/verify_deps.sh` | All 8 crates match `Cargo.lock` and crates.io; no `[[package]]` added |
-| `tests/vault_roundtrip.sh` | 103 passed, 0 failed; 104 of 104 where `strace` is available |
+| `tests/verify_deps.sh` | All 8 crates match `Cargo.lock` and crates.io; no `[[package]]` added. Not re-run after the owner's testing, since `Cargo.toml` and `Cargo.lock` are unchanged since |
+| `tests/vault_roundtrip.sh` | 131 passed, 0 failed, with `strace` |
 | strace proof | The last blob is opened before the output path is first touched |
-| `tests/test_frontend_helpers.py` | 38 passed, on both GTK versions below |
-| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 149 passed, 0 failed |
-| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 149 passed, 0 failed |
+| `tests/test_frontend_helpers.py` | 51 passed, on both GTK versions below |
+| `tests/vault_gui_check.sh`, Debian trixie: Python 3.13, GTK 4.18.6, libadwaita 1.7.6 | 247 passed, 0 failed |
+| `tests/vault_gui_check.sh`, Ubuntu 24.04: Python 3.12, GTK 4.14.5, libadwaita 1.5.0 | 247 passed, 0 failed |
 | `tests/vault_attack.py`, with the `age` tool | 216 passed, 0 failed |
 
-All of these ran on the final code, `a48985e`. With secret buffers locked, strace under a 64 KB
+These ran on the final code for the owner's testing round, on top of `ded68f5`. The only later
+change is one line of the GUI driver, moving when a screenshot is taken. With secret buffers locked, strace under a 64 KB
 limit shows `mlockall` failing and every `mlock` succeeding, for key creation and for creating
 and opening both kinds of vault. These are from separate scripts that aren't in the repo. They
 ran on `fe80c05`, before the last two commits (a dialog's wording, how a long contact name wraps,
@@ -538,7 +603,7 @@ Wayland: openbox on X11 is the only real window manager tested.
 | | SHA-256 |
 |---|---|
 | Baseline binary, `main` @ `ecab899`, rustc 1.75.0 | `9bd8360a7eac449c92192591dc757df918b110b8f4973ced33ec5d8c029aafb1` |
-| This branch's binary, rustc 1.75.0 | `bb057cf25c749975bd8fa544a937eb1535678905f8c6500046b30eb177cf04e5` |
+| This branch's binary, rustc 1.75.0 | `5eb443acc3eda9e573dbcbfa3fb923c42e442488dec095d30a06a55aa526122b` |
 
 Registry `.crate` files, each matching both `Cargo.lock` and the checksum crates.io
 publishes (`tests/verify_deps.sh`):
@@ -575,6 +640,16 @@ looked at before committing.
 | `09-forged-key-refused.png` | Added: a forged `key.age` refused outright, with Close as the only choice. |
 | `10-open-warning.png` | Added: the plaintext warning on first Open, with I understand and Cancel. The Open button is in the action bar behind it. |
 | `11-open-changes-lost.png` | Added: Lock with an edited copy, naming the file. |
+| `04b-create-needs-a-name.png` | Added: Add vault with no name yet, and Create off. |
+| `12-dropped-vault.png` | Added: a vault dropped on the main page, offering Decrypt. |
+| `13-key-mismatch.png` | Added: someone else's key vault, with your key not matching. |
+| `14-progress.png` | Added: a percentage on a vault operation. |
+| `15-add-folder-chooser.png` | Added: the Add folder chooser, showing only folders. |
+| `16-selector-off.png`, `17-selector-on.png` | Added: Select multiple off, with its dotted box, and on, with the box blue. |
+| `18-share.png`, `19-share-add-contact.png`, `20-share-with-new-contact.png` | Added: Share, adding a contact on top of it, and back with them listed. |
+| `21-delete-everything.png` | Added: Delete with everything selected, asking first. |
+| `22-remove-from-list.png` | Added: Remove from list, with the path selectable and a copy button. |
+| `23-select-all.png`, `24-empty-vault.png` | Added: everything ticked, with Select all now offering Select none; and an empty vault, with nothing to act on. |
 
 ---
 

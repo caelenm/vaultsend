@@ -25,8 +25,8 @@ are two parts and a hard line between them:
 - **`backend/`** — a tiny Rust command-line tool. It is the **only** component
   that ever touches your private key. All cryptography is delegated to the `age`
   crate; the backend itself contains no hand-written crypto, just plumbing and
-  process hardening (~515 lines in `main.rs`, and ~800 more in `vault.rs` for
-  vaults, plus that file's tests).
+  process hardening (~515 lines in `main.rs`, ~1,050 more in `vault.rs` for vaults,
+  and 75 in `tar.rs` for sharing folders, plus those files' tests).
 - **`frontend/`** — a GTK 4 / libadwaita app in Python. It draws the window and
   keeps your contact list. It **never sees your private key** — when a passphrase
   is needed it hands it to the backend over a private pipe and forgets it (unless
@@ -251,10 +251,20 @@ what lets this device notice a rolled-back vault.
   protect it. A vault using your key opens only with your private key, so making one asks
   for your passphrase. Select a vault and **Unlock** it to see its files. **Add files…**, **Add
   folder…** or dropping files adds them (into the selected folder, if one is selected).
-  **Extract…** and **Delete** act on the selected row; **Extract…** on *Everything in
-  this vault* extracts it all. Removing a vault from the list only forgets it; its
-  files stay where they are. **Add existing vault…** re-attaches a vault after a
-  restore, or one someone shared with you.
+  **Open**, **Extract…**, **Share…** and **Delete** act on what's selected, and wait until
+  something is. **Select multiple**, above the list, turns the rows into tick boxes so
+  they act on several at once, and **Select all** ticks every row. Extracting several
+  makes one new folder, where each keeps its path from the top of the vault. Removing a
+  vault from the list only forgets it; its files stay where they are. **Add existing
+  vault…** re-attaches a vault after a restore, or one someone shared with you.
+- **Opening a vault from outside the list:** drop its folder on the main page's text box
+  and click **Decrypt**. A password vault asks for its password. A vault using a key
+  unlocks if yours is the key, and otherwise says your key doesn't match. Once open, it's
+  added to your vaults.
+- **Sharing from a vault:** select something, click **Share…**, and pick a contact, or
+  click *Add new contact* to add one on the way. You then choose where to save a file
+  that only you and they can read, to send however you like. They decrypt it on the main
+  page. One file stays that file; a folder or several items arrive as a `.tar` archive.
 - **Opening a file from a vault:** select it and click **Open**. It opens in its default
   app from a copy in memory, which is deleted when you lock the vault or close VaultSend.
   Changes aren't saved back to the vault: to keep them, use **Save As** in that app, then
@@ -279,10 +289,19 @@ vaultsend-backend vault-create  --dir P --mode self --pass-fd N       # your pas
 vaultsend-backend vault-create  --dir P --mode password --pass-fd N   # at least 10 characters
 vaultsend-backend vault-list    --dir P --pass-fd N                   # names and sizes only
 vaultsend-backend vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
-vaultsend-backend vault-remove  --dir P --pass-fd N --entry VAULTPATH
-vaultsend-backend vault-extract --dir P --pass-fd N --entry VAULTPATH --out PATH   # "/" is the whole vault
+vaultsend-backend vault-remove  --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]...
+vaultsend-backend vault-remove  --dir P --pass-fd N --all             # empty the vault, keep the vault
+vaultsend-backend vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH   # "/" is the whole vault
+vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH
 vaultsend-backend vault-check   --dir P --pass-fd N                   # verify every file in RAM
 ```
+
+Any vault command that opens a vault also takes `--progress-fd N`: whole percentages, one
+per line, on that descriptor. It carries numbers only, and a report that doesn't fit is
+dropped rather than waited on, so give it a non-blocking pipe.
+
+`vault-share` writes an ordinary age file, readable with `vaultsend-backend decrypt` or the
+`age` tool. A single file stays that file; anything else is a tar archive inside the age file.
 
 Secrets are never passed as arguments (those are visible to other processes):
 the passphrase is read from the file descriptor named by `--pass-fd`. File data
