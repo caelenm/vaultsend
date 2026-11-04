@@ -219,6 +219,67 @@ class Names(unittest.TestCase):
         self.assertEqual(app.entry_indent("a/" * 1000 + "x"), most)
 
 
+class Selection(unittest.TestCase):
+    ENTRIES = {
+        "a": {"is_dir": True}, "a/1.txt": {"is_dir": False}, "a/b": {"is_dir": True},
+        "a/b/2.txt": {"is_dir": False}, "ab.txt": {"is_dir": False}, "empty": {"is_dir": True},
+    }
+
+    def test_parent_folders(self):
+        self.assertEqual(app.parent_folders("top"), [])
+        self.assertEqual(app.parent_folders("a/b/c"), ["a", "a/b"])
+
+    def test_a_folder_covers_what_is_in_it(self):
+        self.assertEqual(app.top_level_selection(["a", "a/1.txt", "a/b", "a/b/2.txt", "ab.txt"]), ["a", "ab.txt"])
+
+    def test_a_similar_name_is_not_inside(self):
+        self.assertEqual(app.top_level_selection(["a", "ab.txt"]), ["a", "ab.txt"])
+
+    def test_the_whole_vault_covers_everything(self):
+        self.assertEqual(app.top_level_selection(["a", app.ROOT_ENTRY]), [app.ROOT_ENTRY])
+
+    def test_nothing_selected(self):
+        self.assertEqual(app.top_level_selection([]), [])
+
+    def test_files_in_a_selection(self):
+        files = lambda *selection: app.files_in_selection(selection, self.ENTRIES)
+        self.assertEqual(files("a"), ["a/1.txt", "a/b/2.txt"])
+        self.assertEqual(files("a/b", "ab.txt"), ["a/b/2.txt", "ab.txt"])
+        self.assertEqual(files(app.ROOT_ENTRY), ["a/1.txt", "a/b/2.txt", "ab.txt"])
+        self.assertEqual(files("empty"), [])
+
+    def test_entry_args(self):
+        self.assertEqual(app.entry_args(["a", "--replace"]), ["--entry", "a", "--entry", "--replace"])
+
+    def test_share_names(self):
+        name = lambda *selection: app.share_file_name("V", selection, self.ENTRIES)
+        self.assertEqual(name("a/1.txt"), "1.txt.age")
+        self.assertEqual(name("a/b"), "b.tar.age")
+        self.assertEqual(name(app.ROOT_ENTRY), "V.tar.age")
+        self.assertEqual(name("a/1.txt", "ab.txt"), "V selection.tar.age")
+
+    def test_vault_name_from_path(self):
+        self.assertEqual(app.vault_name_from_path("/x/My Vault.vsvault"), "My Vault")
+        self.assertEqual(app.vault_name_from_path("/x/My Vault.vsvault/"), "My Vault")
+        self.assertEqual(app.vault_name_from_path("/x/plain"), "plain")
+
+
+class ProgressReports(unittest.TestCase):
+    def test_latest_wins(self):
+        self.assertEqual(app.last_percent(b"3\n4\n5\n", None), 5)
+
+    def test_nothing_new_keeps_the_last(self):
+        self.assertEqual(app.last_percent(b"", 40), 40)
+        self.assertIsNone(app.last_percent(b"", None))
+
+    def test_never_above_100(self):
+        self.assertEqual(app.last_percent(b"999\n", 1), 100)
+
+    def test_junk_is_ignored(self):
+        self.assertEqual(app.last_percent(b"7\nnot a number\n", None), 7)
+        self.assertEqual(app.last_percent(b"\xff\xfe", 7), 7)
+
+
 class Listing(unittest.TestCase):
     def test_unescapes_for_display(self):
         generation, entries = app.parse_listing(

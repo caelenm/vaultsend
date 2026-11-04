@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Run through the vault UI in the real window and capture screenshots (VAULTS_PLAN.md
-# §5.3). Needs a display (WSLg, or Xvfb at 880x600), a session bus, ImageMagick's
+# §5.3). Needs a display (WSLg, or Xvfb at 1012x690), a session bus, ImageMagick's
 # `import`, xdotool and an in-memory $XDG_RUNTIME_DIR or /dev/shm. A fresh temp dir
 # holds HOME, the XDG dirs and every test vault, so the real key and config are out of
 # reach. Open is tested with a stand-in app, registered in those throwaway dirs as the

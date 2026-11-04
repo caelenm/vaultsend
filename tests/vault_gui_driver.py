@@ -6,11 +6,13 @@ Started by tests/vault_gui_check.sh, which sets up the throwaway environment.
 Usage: vault_gui_driver.py SCREENSHOT_DIR WORK_DIR
 """
 
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 import traceback
 import warnings
 from pathlib import Path
@@ -22,7 +24,7 @@ import app  # noqa: E402
 import gi  # noqa: E402
 
 gi.require_version("Graphene", "1.0")
-from gi.repository import Adw, Gio, GLib, Graphene, Gtk  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, Graphene, Gtk  # noqa: E402
 
 # The app uses Gtk.FileDialog; only this driver reaches into the chooser it opens.
 warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -80,6 +82,10 @@ def find_button(root, label):
         if isinstance(w, Gtk.Button) and w.get_label() == label and w.is_sensitive():
             return w
     raise AssertionError(f"no enabled button labelled {label!r}")
+
+
+def find_disabled(label):
+    return next(w for w in walk(win.vault_actions) if isinstance(w, Gtk.Button) and w.get_label() == label)
 
 
 def find_check(root, label):
@@ -147,17 +153,24 @@ def has_focus(dlg, widget):
 
 
 def radio_of(path):
-    """A row's radio button. They run in display order after "Everything"."""
+    """A row's radio button or tick box. They run in display order."""
     radios = [w for w in walk(win.file_list) if isinstance(w, Gtk.CheckButton)]
-    paths = [app.ROOT_ENTRY, *win.vault_entries]
+    paths = list(win.vault_entries)
     assert len(radios) == len(paths), f"{len(radios)} radios for {len(paths)} rows"
     return radios[paths.index(path)]
 
 
 def select(path):
-    """Click a row's radio button."""
+    """Click a row's radio button, selecting one at a time."""
+    win.select_mode_btn.set_active(False)
     radio_of(path).set_active(True)
     assert win.selected_entry == path, f"selected {win.selected_entry!r}, wanted {path!r}"
+
+
+def select_all():
+    if win._selection() != [app.ROOT_ENTRY]:
+        win.select_all_btn.emit("clicked")
+    assert win._selection() == [app.ROOT_ENTRY], win._selection()
 
 
 def left_edge(path):
@@ -246,9 +259,468 @@ def forge_key_file():
     return forged.read_bytes()
 
 
+def as_identity(data_home, *args, secret=ID_PASS):
+    """Run the backend as someone with another key, the way a contact would."""
+    read_end, write_end = os.pipe()
+    os.write(write_end, secret.encode())
+    os.close(write_end)
+    done = subprocess.run(
+        [app.BACKEND, *args, "--pass-fd", str(read_end)], pass_fds=(read_end,),
+        env={**os.environ, "XDG_DATA_HOME": str(data_home)}, capture_output=True,
+    )
+    os.close(read_end)
+    return done
+
+
+def drop_on_main_page(path):
+    return win.on_file_dropped(None, Gdk.FileList.new_from_list([Gio.File.new_for_path(str(path))]), 0, 0)
+
+
+def tick(path, active=True):
+    radio_of(path).set_active(active)
+
+
+def ticked():
+    return win._selection()
+
+
+def answer_save(folder, name):
+    yield 1500  # the chooser takes this long to come up
+    chooser = choose_in_file_dialog(str(folder), save_as=name)
+    yield 800
+    chooser.response(Gtk.ResponseType.ACCEPT)
+    yield 300
+
+
+def watch_progress():
+    """Until the running operation ends: every percentage it reached, and what its bar said."""
+    percents, texts = [], []
+    while win.current_op is not None:
+        op = win.current_op
+        if op.percent is not None and op.percent not in percents:
+            percents.append(op.percent)
+        if op.bar is not None:
+            text = op.bar.get_text()
+            if text not in texts:
+                texts.append(text)
+                if text.endswith("%") and 20 < op.percent < 90 and not (SHOTS / "14-progress.png").exists():
+                    shot("14-progress")
+        yield 30
+    yield (percents, texts)
+
+
+def clicking_through_the_new_features():
+    # -- A vault dropped on the main page: password ------------------------------------
+    win.contacts_toggle.emit("clicked")
+    yield SETTLE
+    batch_path = WORK / "Batch Dropped.vsvault"
+    app.run_backend(["vault-create", "--dir", str(batch_path), "--mode", "password"], passphrase=VAULT_PASS)
+    batch_src = WORK / "batch"
+    (batch_src / "x" / "deep").mkdir(parents=True)
+    (batch_src / "y").mkdir()
+    (batch_src / "hollow").mkdir()
+    (batch_src / "top.txt").write_text("top\n")
+    (batch_src / "x" / "same.txt").write_text("the one in x\n")
+    (batch_src / "x" / "deep" / "low.txt").write_text("low\n")
+    (batch_src / "y" / "same.txt").write_text("the one in y\n")
+    app.run_backend(
+        ["vault-add", "--dir", str(batch_path), *(a for name in sorted(os.listdir(batch_src)) for a in ("--src", str(batch_src / name)))],
+        passphrase=VAULT_PASS,
+    )
+    known_before = len(win.vaults)
+    check(drop_on_main_page(batch_path), "the main page takes a dropped vault")
+    yield SETTLE
+    check(dialog().get_heading() == "Decrypt this vault?" and "a password" in dialog().get_body(), "it asks about decrypting, and names the protection")
+    shot("12-dropped-vault")
+    respond("Decrypt")
+    yield SETTLE
+    check("Unlock vault" in dialog().get_heading(), "then asks for that vault's password")
+    enter_passphrase("not the password")
+    yield SETTLE
+    check("wrong password" in dialog().get_body(), "a wrong password is reported")
+    check(len(win.vaults) == known_before, "and adds nothing to the list")
+    respond("Close")
+    yield SETTLE
+    drop_on_main_page(batch_path)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    batch = next((v for v in win.vaults if v["path"] == str(batch_path)), None)
+    check(batch is not None and batch["name"] == "Batch Dropped" and batch["mode"] == "password", "the right password adds it, named after its folder")
+    check(win.vault is batch and visible_vault_page() and "top.txt" in win.vault_entries, "and shows it, unlocked")
+    check(win.vaults_toggle.get_active() and win.sidebar_stack.get_visible_child_name() == "vaults", "with the sidebar on vaults")
+    check(registry(batch)["last_generation"] == 1, "its generation is remembered like any other's")
+
+    # Dropping it again doesn't list it twice.
+    win.contacts_toggle.emit("clicked")
+    yield SETTLE
+    drop_on_main_page(batch_path)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    check(len(win.vaults) == known_before + 1, "a vault already listed isn't added twice")
+
+    # -- A vault dropped on the main page: key ------------------------------------------
+    win.contacts_toggle.emit("clicked")
+    yield SETTLE
+    others = WORK / "Someone Elses.vsvault"
+    made = as_identity(WORK.parent / "a", "vault-create", "--dir", str(others), "--mode", "self")
+    assert made.returncode == 0, made.stderr
+    drop_on_main_page(others)
+    yield SETTLE
+    check("a key" in dialog().get_body(), "a key vault says it's protected by a key")
+    respond("Decrypt")
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    check(dialog().get_heading() == "Your key doesn't match this vault" and "different recipient" in dialog().get_body(), "someone else's key vault says the key doesn't match")
+    shot("13-key-mismatch")
+    respond("Close")
+    yield SETTLE
+    check(not any(v["path"] == str(others) for v in win.vaults), "and isn't added")
+
+    mine = WORK / "My Own.vsvault"
+    app.run_backend(["vault-create", "--dir", str(mine), "--mode", "self"], passphrase=ID_PASS)
+    drop_on_main_page(mine)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    check(win.vault is not None and win.vault["path"] == str(mine) and visible_vault_page() and win.vault_entries == {}, "your own key vault unlocks")
+    win.vaults = [v for v in win.vaults if v["path"] != str(mine)]
+    win.contacts_toggle.emit("clicked")
+    yield SETTLE
+
+    drop_on_main_page(WORK / "batch")
+    yield SETTLE
+    check("isn't a vault" in dialog().get_heading(), "a folder that isn't a vault gets a plain answer")
+    respond("Close")
+    yield SETTLE
+    drop_on_main_page(batch_src / "top.txt")
+    yield SETTLE
+    check(dialog().get_heading() == "Encrypt or decrypt?", "a file still gets Encrypt or decrypt")
+    respond("Cancel")
+    yield SETTLE
+
+    # -- Add folder: not a file -----------------------------------------------------------
+    win.vaults_toggle.emit("clicked")
+    click_vault(batch)
+    yield SETTLE
+    win.vault = None  # so that selecting it again shows it locked, then unlock as normal
+    click_vault(batch)
+    yield SETTLE
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    check("top.txt" in win.vault_entries, "back in the vault")
+    check(not any(w.get_title() == "Whole vault" for w in walk(win.file_list) if isinstance(w, Adw.ActionRow)), "no whole-vault row in the list")
+    check(win._selection() == [] and win.selected_entry is None, "nothing is selected to begin with")
+    check(not any(find_disabled(label).is_sensitive() for label in ("Open", "Extract…", "Share…", "Delete")), "so the actions wait")
+    check(all(find_disabled(label).is_sensitive() for label in ("Add files…", "Add folder…", "Lock")), "apart from those that need no selection")
+    check("4 files, 34 B" in win.files_heading.get_label(), "and the heading has the vault's totals")
+    labels = [w.get_label() for w in walk(win.files_heading.get_parent()) if isinstance(w, Gtk.Button) and w.get_label()]
+    check(labels == ["Select all", "Verify all"] and win.select_mode_btn.get_tooltip_text(), "Select all, Select multiple and Verify all are at the top")
+    select("top.txt")
+    check(find_disabled("Delete").is_sensitive(), "a selection turns the actions on")
+    lone = WORK / "lone"
+    lone.mkdir()
+    (lone / "only-file.txt").write_text("a file\n")
+    win.vault_add_folder()
+    yield 1500
+    chooser = choose_in_file_dialog(str(lone / "only-file.txt"))
+    check(chooser.get_filter() is not None and chooser.get_filter().get_name() == "Folders", "the Add folder chooser is filtered to folders")
+    shot("15-add-folder-chooser")
+    yield 500
+    chooser.response(Gtk.ResponseType.CANCEL)
+    yield 800
+    reached = []
+    win._folder_chosen(str(lone / "only-file.txt"), reached.append)
+    yield 300
+    check(not reached and "That's a file. Choose a folder." in toasts, "a file coming back from a chooser is turned away")
+    win._folder_chosen(str(lone), reached.append)
+    check(reached == [str(lone)], "and a folder goes through")
+
+    # -- Progress ---------------------------------------------------------------------------
+    big = WORK / "progress-big.bin"
+    big.write_bytes(os.urandom(160 * 1024 * 1024))
+    win._add_paths([str(big)])
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    gen = watch_progress()
+    for step in gen:
+        if isinstance(step, tuple):
+            percents, texts = step
+            break
+        yield step
+    check(any(0 < p < 100 for p in percents) and percents == sorted(percents), f"adding reports a rising percentage ({len(percents)} steps)")
+    check(any(t.endswith("%") for t in texts), f"and the bar shows it: {texts[:3]}")
+    yield from idle()
+    select(big.name)
+    win.vault_extract()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    yield from answer_save(WORK, "progress-out.bin")
+    gen = watch_progress()
+    yield 50
+    for step in gen:
+        if isinstance(step, tuple):
+            percents, texts = step
+            break
+        yield step
+    check(any(0 < p < 100 for p in percents) and percents == sorted(percents), f"extracting does too ({len(percents)} steps)")
+    check((WORK / "progress-out.bin").read_bytes() == big.read_bytes(), "and the file is right")
+    (WORK / "progress-out.bin").unlink()
+    yield from idle()
+    select(big.name)
+    win.vault_delete()
+    yield SETTLE
+    respond("Delete")
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield from idle()
+    big.unlink()
+
+    # -- Selecting several ------------------------------------------------------------------
+    win.expanded.update(["x", "x/deep", "y"])
+    win.vault_lock()
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    btn = win.select_mode_btn
+    check(not btn.get_active() and "vaultsend-select-mode" in btn.get_css_classes(), "the selector starts off")
+    shot("16-selector-off")
+    select("top.txt")
+    real_click(btn)
+    yield SETTLE
+    check(btn.get_active(), "a click turns it on")
+    check(bool(btn.get_state_flags() & Gtk.StateFlags.CHECKED), "and it shows as on")
+    check(ticked() == ["top.txt"], "what was selected stays selected")
+    check("1 selected" in win.files_heading.get_label(), "and the heading counts it")
+    shot("17-selector-on")
+    tick("top.txt", False)
+    yield 200
+    check(ticked() == [] and not find_disabled("Share…").is_sensitive(), "nothing ticked: nothing to act on")
+    tick("x/same.txt")
+    tick("y/same.txt")
+    check(ticked() == ["x/same.txt", "y/same.txt"], "several can be ticked")
+
+    tick("x")
+    check(all(radio_of(p).get_active() for p in ("x/same.txt", "x/deep", "x/deep/low.txt")), "ticking a folder ticks what's in it")
+    check(ticked() == ["x", "y/same.txt"], "and it stands for them")
+    tick("x/deep/low.txt", False)
+    check(not radio_of("x").get_active() and not radio_of("x/deep").get_active(), "unticking something inside unticks the folders above it")
+    check(ticked() == ["x/same.txt", "y/same.txt"], "leaving only what's still ticked")
+    win.select_all_btn.emit("clicked")
+    check(all(radio_of(p).get_active() for p in win.vault_entries), "Select all ticks everything")
+    check(ticked() == [app.ROOT_ENTRY] and "all selected" in win.files_heading.get_label(), "and means all of it")
+    check(win.select_all_btn.get_label() == "Select none", "and the button offers the way back")
+    tick("top.txt", False)
+    check(ticked() != [app.ROOT_ENTRY] and "top.txt" not in ticked() and win.select_all_btn.get_label() == "Select all", "unticking one row isn't all any more")
+    tick("top.txt")
+    check(ticked() == [app.ROOT_ENTRY], "and ticking every row by hand is all again")
+    win.select_all_btn.emit("clicked")
+    check(ticked() == [] and not find_disabled("Delete").is_sensitive(), "Select none unticks everything")
+
+    # Closing a folder can't leave ticks out of sight, unless its own box says so.
+    tick("x/same.txt")
+    radio_of("x").get_ancestor(Adw.ExpanderRow).set_expanded(False)
+    yield 300
+    check(not radio_of("x/same.txt").get_active() and ticked() == [], "closing a folder clears ticks hidden inside it")
+    tick("x")
+    radio_of("x").get_ancestor(Adw.ExpanderRow).set_expanded(True)
+    radio_of("x").get_ancestor(Adw.ExpanderRow).set_expanded(False)
+    yield 300
+    check(ticked() == ["x"], "but a ticked folder stays ticked")
+    radio_of("x").get_ancestor(Adw.ExpanderRow).set_expanded(True)
+    yield 300
+    tick("x", False)
+
+    # Extract only those.
+    tick("x/same.txt")
+    tick("y/same.txt")
+    tick("hollow")
+    win.vault_extract()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    yield from answer_save(WORK, "picked")
+    yield from idle()
+    picked = WORK / "picked"
+    check((picked / "x" / "same.txt").read_text() == "the one in x\n" and (picked / "y" / "same.txt").read_text() == "the one in y\n", "Extract gets the two files, each with its own path")
+    check((picked / "hollow").is_dir() and not (picked / "top.txt").exists() and not (picked / "x" / "deep").exists(), "the empty folder ticked, and nothing unticked")
+    check(picked.stat().st_mode & 0o777 == 0o700 and (picked / "x" / "same.txt").stat().st_mode & 0o777 == 0o600, "private on disk")
+
+    # Open them all: same names, separate copies.
+    launched = len(VIEWER_LOG.read_text().splitlines()) if VIEWER_LOG.exists() else 0
+    win.vault_open()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield from wait_for(lambda: len(VIEWER_LOG.read_text().splitlines()) >= launched + 2, "both to launch")
+    yield from idle()
+    lines = VIEWER_LOG.read_text().splitlines()
+    new = lines[launched:]
+    check(len(new) == 2 and all(os.path.basename(p) == "same.txt" for p in new), "Open opens every selected file, the empty folder aside")
+    check(len({os.path.dirname(p) for p in new}) == 2, "each from a folder of its own")
+    check(sorted(Path(p).read_text() for p in new) == ["the one in x\n", "the one in y\n"], "with the right contents")
+    win.vault_lock()
+    yield SETTLE
+    check(not any(os.path.exists(p) for p in new), "and Lock deletes them all")
+    check(not btn.get_active(), "locking leaves selecting several")
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+
+    # A lot of files asks first, and a folder with no file in it has nothing to open.
+    real_click(btn)
+    yield SETTLE
+    tick("hollow")
+    win.vault_open()
+    yield 300
+    check(win.get_visible_dialog() is None and "there's no file in them" in toasts[-1], "an empty folder has nothing to open")
+    tick("hollow", False)
+    many = [f"m{i}.txt" for i in range(app.OPEN_ASK_ABOVE + 1)]
+    win._ask_then_open(batch, many)
+    yield SETTLE
+    check(dialog().get_heading() == f"Open {len(many)} files?", "opening a lot at once asks first")
+    respond("Cancel")
+    yield SETTLE
+
+    # -- Share, with a contact added on the way ----------------------------------------------
+    real_click(btn)  # back to one at a time
+    yield SETTLE
+    check(win.selected_entry is None and not any(radio_of(p).get_active() for p in win.vault_entries), "off again: back to one selection, with none made")
+    select("x/same.txt")
+    new_home = WORK.parent / "c"
+    made = as_identity(new_home, "keygen")
+    new_key = made.stdout.decode().strip()
+    contacts_before = list(win.contacts)
+    win.vault_share()
+    yield SETTLE
+    share_dialog = dialog()
+    check(share_dialog.get_heading() == "Share “same.txt”", "Share names what it's sharing")
+    link = next(w for w in walk(share_dialog) if isinstance(w, Gtk.Label) and "Add new contact" in w.get_label())
+    check("<a " in link.get_label() and not any(isinstance(w, Gtk.Button) and w.get_label() == "Add new contact" for w in walk(share_dialog)), "Add new contact is a link, not a button")
+    shot("18-share")
+    link.emit("activate-link", "add-contact")
+    yield SETTLE
+    add_dialog = dialog()
+    check(add_dialog.get_heading() == "Add contact", "and opens the Add contact dialog")
+    fields = [w for w in walk(add_dialog) if type(w) is Gtk.Entry]
+    check(not add_dialog.get_response_enabled("add"), "Add waits for a name and a key")
+    fields[0].set_text("New & Friend")
+    fields[1].set_text(new_key)
+    check(add_dialog.get_response_enabled("add"), "and then is offered")
+    shot("19-share-add-contact")
+    respond("Add")
+    yield SETTLE
+    check(dialog() is share_dialog, "adding returns to Share")
+    check(win.selected_entry == "x/same.txt", "with the item still selected")
+    check(any(c["pubkey"] == new_key for c in win.contacts), "and they are a contact now")
+    shot("20-share-with-new-contact")
+    rows = [w for w in walk(share_dialog) if isinstance(w, Adw.ActionRow)]
+    check(rows[-1].get_title() == "New & Friend", "listed, with their name shown as it is")
+    rows[-1].get_parent().emit("row-activated", rows[-1])
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    yield from answer_save(WORK, "shared one.age")
+    yield from idle()
+    one = WORK / "shared one.age"
+    check(one.exists() and any("Encrypted for New & Friend" in t for t in toasts[-3:]), "clicking them leads to Save, then says it's done")
+    got = as_identity(new_home, "decrypt", "--in", str(one))
+    check(got.returncode == 0 and got.stdout == b"the one in x\n", "the new contact can decrypt it")
+    check(app.run_backend(["decrypt", "--in", str(one)], passphrase=ID_PASS) == b"the one in x\n", "and so can you")
+    check(as_identity(WORK.parent / "b", "decrypt", "--in", str(one)).returncode != 0, "and no one else")
+    check(one.stat().st_mode & 0o777 == 0o600, "the shared file is private on disk")
+    drop_on_main_page(one)
+    yield SETTLE
+    check(dialog().get_heading() == "Encrypt or decrypt?", "a contact opens it by dropping it on the main page")
+    respond("Cancel")
+    yield SETTLE
+
+    # Several at once, to an existing contact.
+    real_click(btn)
+    yield SETTLE
+    tick("x/same.txt", False)  # it came along, having been the selection until now
+    tick("x/deep")
+    tick("top.txt")
+    win.vault_share()
+    yield SETTLE
+    check(dialog().get_heading() == "Share “2 items”" and ".tar" in dialog().get_body(), "several at once say they'll be an archive")
+    rows = [w for w in walk(dialog()) if isinstance(w, Adw.ActionRow)]
+    rows[0].get_parent().emit("row-activated", rows[0])
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    yield from answer_save(WORK, "shared many.tar.age")
+    yield from idle()
+    got = as_identity(WORK.parent / "a", "decrypt", "--in", str(WORK / "shared many.tar.age"))
+    check(got.returncode == 0, "the contact can decrypt the archive")
+    with tarfile.open(fileobj=io.BytesIO(got.stdout)) as archive:
+        check(sorted(archive.getnames()) == ["top.txt", "x", "x/deep", "x/deep/low.txt"], "it holds what was picked and the way to it")
+        check(archive.extractfile("x/deep/low.txt").read() == b"low\n", "with the right contents")
+
+    # -- Delete: several, and then everything -------------------------------------------------
+    win.vault_delete()
+    yield SETTLE
+    check("2 items" in dialog().get_heading() and "x/deep" in dialog().get_body() and "top.txt" in dialog().get_body(), "deleting several lists them first")
+    respond("Delete")
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield from idle()
+    check(sorted(win.vault_entries) == ["hollow", "x", "x/same.txt", "y", "y/same.txt"], "and deletes only those")
+    check(btn.get_active(), "still selecting several")
+    real_click(btn)
+    yield SETTLE
+    check(not btn.get_active(), "back to one at a time")
+    win.select_all_btn.emit("clicked")
+    yield 300
+    check(btn.get_active() and bool(btn.get_state_flags() & Gtk.StateFlags.CHECKED), "Select all turns on selecting several")
+    shot("23-select-all")
+    win.vault_delete()
+    yield SETTLE
+    check(dialog().get_heading() == "Delete everything in this vault?" and "2 files" in dialog().get_body(), "Delete with everything selected asks before deleting everything")
+    shot("21-delete-everything")
+    respond("Cancel")
+    yield SETTLE
+    check(len(win.vault_entries) == 5, "Cancel keeps it all")
+    win.vault_delete()
+    yield SETTLE
+    respond("Delete")
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield from idle()
+    check(win.vault_entries == {}, "Delete empties the vault")
+    check(batch_path.is_dir() and any(v is batch for v in win.vaults), "and leaves the vault itself")
+    check(any(w.get_title() == "Nothing in this vault yet" for w in walk(win.file_list) if isinstance(w, Adw.ActionRow)), "an empty vault says so")
+    check(not win.select_all_btn.is_sensitive() and not find_disabled("Delete").is_sensitive() and not find_disabled("Share…").is_sensitive(), "and has nothing to select, delete or share")
+    shot("24-empty-vault")
+
+    win.contacts = contacts_before
+    app.save_contacts(win.contacts)
+    win._refresh_contacts()
+    win.vault_lock()
+    win.vaults = [v for v in win.vaults if v is not batch]
+    win.vault = None
+    app.save_json(app.VAULTS_FILE, win.vaults)
+    win._refresh_vaults()
+    win.content_stack.set_visible_child_name("send")
+    yield SETTLE
+
+
 def script():
     yield 1800
     check(not STALE_COPY.exists(), "a crash's leftover copy is cleared at launch")
+    check(win.get_default_size() == (1012, 690), "the window opens 15% larger than it did")
     # -- Contacts mode: unchanged apart from the toggle ------------------------------
     shot("01b-contacts-branch")
     check(win.content_stack.get_visible_child_name() == "send", "starts on the send page")
@@ -299,13 +771,25 @@ def script():
     check(registry(own)["last_generation"] == 0, "registry written")
     check(visible_vault_page() and locked(), "new vault shows locked")
 
-    # An invalid name is refused without creating anything.
+    # A name that won't do can't be submitted, so the dialog never closes on it.
     win.on_add_clicked()
     yield SETTLE
-    next(w for w in walk(dialog()) if type(w) is Gtk.Entry).set_text("a/b")
-    respond("Create")
+    dlg = dialog()
+    entry = next(w for w in walk(dlg) if type(w) is Gtk.Entry)
+    check(not dlg.get_response_enabled("create"), "Create is off with no name")
+    shot("04b-create-needs-a-name")
+    entry.emit("activate")
     yield SETTLE
-    check(len(win.vaults) == 1, "a name with / is refused")
+    check(win.get_visible_dialog() is dlg and len(win.vaults) == 1, "and Enter doesn't close the dialog either")
+    entry.set_text("   ")
+    check(not dlg.get_response_enabled("create"), "spaces aren't a name")
+    entry.set_text("a/b")
+    check(not dlg.get_response_enabled("create") and "error" in entry.get_css_classes(), "a name with / is refused, visibly")
+    entry.set_text("fine")
+    check(dlg.get_response_enabled("create") and "error" not in entry.get_css_classes(), "a usable name turns it on")
+    respond("Cancel")
+    yield SETTLE
+    check(len(win.vaults) == 1, "nothing was created")
 
     # -- Create a password vault somewhere chosen, through the real folder chooser ---
     (WORK / "elsewhere").mkdir()
@@ -385,7 +869,7 @@ def script():
     enter_passphrase(ID_PASS)
     yield from idle()
     check("My Documents/taxes/letter.txt" in win.vault_entries, "added into the selected folder")
-    check(win.selected_entry == app.ROOT_ENTRY, "selection returns to the whole vault after a change")
+    check(win.selected_entry is None, "the selection clears after a change")
 
     # Dropping a file is the same path.
     class Dropped:
@@ -409,7 +893,7 @@ def script():
     top = left_edge("My Documents")
     subfolder = left_edge("My Documents/taxes")
     deeper = left_edge("My Documents/taxes/2025")
-    check(top == left_edge(app.ROOT_ENTRY) == left_edge("letter.txt"), "top-level rows line up")
+    check(top == left_edge("letter.txt"), "top-level rows line up")
     check(top < subfolder < deeper, "each folder level sits further in")
     check(left_edge("My Documents/taxes/return.pdf") == deeper, "a file lines up with the folders beside it")
     check(left_edge("My Documents/notes.txt") == subfolder, "and so does one higher up")
@@ -438,7 +922,7 @@ def script():
     yield SETTLE
     toggle_folder("My Documents/taxes")
     yield SETTLE
-    check(win.selected_entry == app.ROOT_ENTRY and radio_of(app.ROOT_ENTRY).get_active(), "closing a folder moves a selection inside it to Everything")
+    check(win.selected_entry is None and not any(radio_of(p).get_active() for p in win.vault_entries), "closing a folder clears a selection inside it")
     toggle_folder("My Documents/taxes")
     yield SETTLE
     select("My Documents/notes.txt")
@@ -456,7 +940,7 @@ def script():
     select("My Documents/taxes/2025/receipts & <invoices>.csv")
     toggle_folder("My Documents")
     yield SETTLE
-    check(win.selected_entry == app.ROOT_ENTRY, "a selection moves back from any depth")
+    check(win.selected_entry is None, "from any depth")
     toggle_folder("My Documents")
     yield SETTLE
 
@@ -540,7 +1024,7 @@ def script():
     recent = Path(os.environ["XDG_DATA_HOME"], "recently-used.xbel")
     check(not recent.exists() or "letter-out" not in recent.read_text(), "and its name isn't logged in the desktop's recent files")
 
-    select(app.ROOT_ENTRY)
+    select_all()
     win.vault_extract()
     yield SETTLE
     enter_passphrase(ID_PASS)
@@ -560,10 +1044,6 @@ def script():
     check(got == expected_with_letter, "extracted tree is byte-identical, empty folder included")
 
     # -- Delete, with a destructive confirmation ------------------------------------
-    select(app.ROOT_ENTRY)
-    win.vault_delete()
-    yield SETTLE
-    check(win.get_visible_dialog() is None, "delete needs a selection")
     select("My Documents/photos")
     win.vault_delete()
     yield SETTLE
@@ -600,7 +1080,7 @@ def script():
     check("big.bin" not in win.vault_entries, "a cancelled add adds nothing")
     check(registry(own)["last_generation"] == generation, "and makes no new generation")
 
-    select(app.ROOT_ENTRY)
+    select_all()
     win.vault_extract()
     yield SETTLE
     enter_passphrase(ID_PASS)
@@ -735,7 +1215,7 @@ def script():
     bad = bytearray(good)
     bad[len(bad) // 2] ^= 1
     victim.write_bytes(bad)
-    select(app.ROOT_ENTRY)
+    select_all()
     win.vault_extract()
     yield SETTLE
     enter_passphrase(ID_PASS)
@@ -932,14 +1412,14 @@ def script():
     yield SETTLE
 
     # The menu itself, opened with real clicks.
-    subprocess.run(["xdotool", "mousemove", "738", "28", "click", "1"], check=True)
+    subprocess.run(["xdotool", "mousemove", "870", "28", "click", "1"], check=True)
     yield 900
-    subprocess.run(["xdotool", "mousemove", "660", "99", "click", "1"], check=True)
+    subprocess.run(["xdotool", "mousemove", "792", "99", "click", "1"], check=True)
     yield 900
     shot("08-passphrase-menu")
     subprocess.run(["xdotool", "key", "Escape"], check=True)
     yield 500
-    subprocess.run(["xdotool", "mousemove", "500", "580", "click", "1"], check=True)
+    subprocess.run(["xdotool", "mousemove", "500", "670", "click", "1"], check=True)
     yield SETTLE
 
     # -- Remove from list, Not found, Add existing -----------------------------------
@@ -949,6 +1429,14 @@ def script():
     win._confirm_forget_vault(shared)
     yield SETTLE
     check("does not delete" in dialog().get_body(), "Remove says it deletes nothing")
+    where = [w for w in walk(dialog()) if isinstance(w, Gtk.Label) and w.get_label() == path]
+    check(len(where) == 1 and where[0].get_selectable(), "the path is there, and can be selected")
+    shot("22-remove-from-list")
+    next(w for w in walk(dialog()) if isinstance(w, Gtk.Button) and w.get_icon_name() == "edit-copy-symbolic").emit("clicked")
+    pasted = []
+    win.get_clipboard().read_text_async(None, lambda c, res: pasted.append(c.read_text_finish(res)))
+    yield 300
+    check(pasted == [path] and "Path copied." in toasts, "and copied with one click")
     respond("Remove from list")
     yield SETTLE
     check(shared not in win.vaults, "forgotten from the list")
@@ -982,6 +1470,8 @@ def script():
     os.rename(moved, path)
     win._refresh_vaults()
     yield SETTLE
+
+    yield from clicking_through_the_new_features()
 
     # Contacts must still work as before.
     win.contacts_toggle.emit("clicked")
