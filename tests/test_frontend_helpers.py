@@ -27,14 +27,6 @@ def tearDownModule():
     shutil.rmtree(ROOT, ignore_errors=True)
 
 
-class FakeClock:
-    def __init__(self):
-        self.now = 1000.0
-
-    def __call__(self):
-        return self.now
-
-
 class ConfigFiles(unittest.TestCase):
     def setUp(self):
         shutil.rmtree(app.CONFIG_DIR, ignore_errors=True)
@@ -100,16 +92,16 @@ class Settings(ConfigFiles):
         self.assertEqual(app.load_settings(), self.DEFAULT)
 
     def test_round_trip(self):
-        value = {"remember": "20m", "cache_explained": True, "open_explained": True}
+        value = {"remember": "session", "cache_explained": True, "open_explained": True}
         app.save_json(app.SETTINGS_FILE, value)
         self.assertEqual(app.load_settings(), value)
 
     def test_settings_from_before_open_existed_still_warn(self):
-        self.write(app.SETTINGS_FILE, '{"remember": "5m", "cache_explained": true}')
+        self.write(app.SETTINGS_FILE, '{"remember": "session", "cache_explained": true}')
         self.assertFalse(app.load_settings()["open_explained"])
 
     def test_garbled(self):
-        for text in ("{not json", "[]", "null", '{"remember": "forever"}', '{"remember": ["5m"]}', '{"remember": 5}'):
+        for text in ("{not json", "[]", "null", '{"remember": "forever"}', '{"remember": ["session"]}', '{"remember": 5}'):
             self.write(app.SETTINGS_FILE, text)
             self.assertEqual(app.load_settings(), self.DEFAULT, text)
 
@@ -117,57 +109,34 @@ class Settings(ConfigFiles):
         self.write(app.SETTINGS_FILE, '{"cache_explained": "yes"}')
         self.assertFalse(app.load_settings()["cache_explained"])
 
-    def test_every_choice_has_a_lifetime(self):
-        self.assertEqual(app.REMEMBER_SECONDS["off"], 0)
-        self.assertIsNone(app.REMEMBER_SECONDS["session"])
+    def test_choices(self):
         self.assertEqual(
-            [label for _, label, _ in app.REMEMBER_CHOICES],
-            ["Off", "5 minutes", "20 minutes", "1 day", "1 week", "Until VaultSend closes"],
+            [label for _, label in app.REMEMBER_CHOICES],
+            ["Off", "Until VaultSend closes"],
         )
+
+    def test_old_timed_choices_fall_back_to_off(self):
+        for value in ("5m", "20m", "1d", "1w"):
+            self.write(app.SETTINGS_FILE, '{"remember": "%s"}' % value)
+            self.assertEqual(app.load_settings()["remember"], "off", value)
 
 
 class Cache(unittest.TestCase):
     def setUp(self):
-        self.clock = FakeClock()
-        self.cache = app.PassphraseCache(clock=self.clock)
+        self.cache = app.PassphraseCache()
 
     def test_off_remembers_nothing(self):
         self.cache.put("identity", "secret")
         self.assertIsNone(self.cache.get("identity"))
         self.assertEqual(self.cache.entries, {})
 
-    def test_expiry(self):
-        self.cache.set_lifetime(300)
+    def test_until_closed_keeps_it(self):
+        self.cache.set_enabled(True)
         self.cache.put("identity", "secret")
-        self.clock.now += 299
-        self.assertEqual(self.cache.get("identity"), "secret")
-        self.clock.now += 1
-        self.assertIsNone(self.cache.get("identity"))
-        self.assertEqual(self.cache.entries, {})
-
-    def test_reading_does_not_extend_it(self):
-        self.cache.set_lifetime(300)
-        self.cache.put("identity", "secret")
-        self.clock.now += 200
-        self.cache.get("identity")
-        self.clock.now += 200
-        self.assertIsNone(self.cache.get("identity"))
-
-    def test_sweep_clears_without_a_read(self):
-        self.cache.set_lifetime(60)
-        self.cache.put("identity", "secret")
-        self.clock.now += 61
-        self.cache.sweep()
-        self.assertEqual(self.cache.entries, {})
-
-    def test_until_closed_never_expires(self):
-        self.cache.set_lifetime(None)
-        self.cache.put("identity", "secret")
-        self.clock.now += 10 * 365 * 24 * 3600
         self.assertEqual(self.cache.get("identity"), "secret")
 
     def test_keys_are_separate(self):
-        self.cache.set_lifetime(300)
+        self.cache.set_enabled(True)
         self.cache.put("identity", "one")
         self.cache.put(("vault", "/a"), "two")
         self.cache.put(("vault", "/b"), "three")
@@ -178,15 +147,17 @@ class Cache(unittest.TestCase):
         self.cache.forget("not there")
 
     def test_clear(self):
-        self.cache.set_lifetime(None)
+        self.cache.set_enabled(True)
         self.cache.put("identity", "secret")
         self.cache.clear()
         self.assertIsNone(self.cache.get("identity"))
 
     def test_changing_the_setting_clears(self):
-        self.cache.set_lifetime(300)
+        self.cache.set_enabled(True)
         self.cache.put("identity", "secret")
-        self.cache.set_lifetime(1200)
+        self.cache.set_enabled(False)
+        self.assertIsNone(self.cache.get("identity"))
+        self.cache.set_enabled(True)
         self.assertIsNone(self.cache.get("identity"))
 
 

@@ -1350,12 +1350,12 @@ def script():
     yield SETTLE
 
     # -- Remember passphrase ---------------------------------------------------------
-    win.activate_action("win.remember", GLib.Variant("s", "5m"))
+    win.activate_action("win.remember", GLib.Variant("s", "session"))
     yield SETTLE
     check("swap" in dialog().get_body(), "first use explains the caveat")
     respond("Got it")
     yield SETTLE
-    check(json.loads(app.SETTINGS_FILE.read_text())["remember"] == "5m", "the choice is saved")
+    check(json.loads(app.SETTINGS_FILE.read_text())["remember"] == "session", "the choice is saved")
     check(ID_PASS not in app.SETTINGS_FILE.read_text(), "the passphrase is not")
     win.vault_unlock()
     yield SETTLE
@@ -1403,10 +1403,12 @@ def script():
 
     # Changing the setting clears; Lock forgets that vault's secret.
     win.cache.put("identity", ID_PASS)
+    win.activate_action("win.remember", GLib.Variant("s", "off"))
+    yield SETTLE
+    check(win.cache.entries == {}, "changing the setting clears the cache")
     win.activate_action("win.remember", GLib.Variant("s", "session"))
     yield SETTLE
     check(win.get_visible_dialog() is None, "the explanation shows only once")
-    check(win.cache.entries == {}, "changing the setting clears the cache")
     win.cache.put("identity", ID_PASS)
     win._show_files([])
     win.vault_lock()

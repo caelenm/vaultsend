@@ -299,14 +299,12 @@ may have been restored from a backup — or rolled back by someone else.") with
 
 ### 4.5 Passphrase cache (hamburger menu)
 
-- Menu: submenu **Remember passphrase** with radio items **Off** (default),
-  **5 minutes**, **20 minutes**, **1 day**, **1 week**, **Until VaultSend
-  closes** (this is "forever" — the passphrase is **never** written to disk),
+- Menu: submenu **Remember passphrase** with radio items **Off** (default) and
+  **Until VaultSend closes** (the passphrase is **never** written to disk),
   plus a **Lock now** item.
 - Implementation: a stateful `Gio.SimpleAction` with a string state; the
   choice (not the passphrase) is saved to `$XDG_CONFIG_HOME/vaultsend/settings.json`.
-- Cache: dict keyed `"identity"` or `("vault", path)`; an expiry checked on use
-  plus a `GLib.timeout_add_seconds` sweep. Cleared on: expiry, Lock now,
+- Cache: dict keyed `"identity"` or `("vault", path)`. Cleared on: Lock now,
   setting change, a "wrong passphrase" error for that key, app quit.
 - Applies to the identity passphrase everywhere (text/file decrypt too) and to
   vault passwords.

@@ -152,8 +152,8 @@ applies on Linux for now — see Platform support below.
   extract files where you choose, delete them, and verify the whole vault for tampering. Open one with your own key, or with a password if you
   want to share it. Names and folder structure stay hidden; see the limitations
   below for what a vault does reveal.
-- **Remember passphrase.** Optionally keep your passphrase in memory for 5 minutes,
-  20 minutes, a day, a week, or until the app closes, with **Lock now** in the menu.
+- **Remember passphrase.** Optionally keep your passphrase in memory until the app
+  closes, with **Lock now** in the menu.
   Off by default; see the security model above for the trade-off.
 - **No network code, no plugins, one identity per user.** VaultSend doesn't
   fetch keys from anywhere or phone home. What you see in the three source files

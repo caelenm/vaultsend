@@ -17,7 +17,6 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 from pathlib import Path
 from urllib.parse import unquote
 
@@ -316,17 +315,13 @@ def load_vaults() -> list:
     return vaults
 
 
-# How long a typed passphrase may be remembered: (value, menu label, seconds).
-# None means until the app closes; it is never written to disk.
+# Whether a typed passphrase is remembered: (value, menu label). "session" keeps it
+# until the app closes; it is never written to disk.
 REMEMBER_CHOICES = (
-    ("off", "Off", 0),
-    ("5m", "5 minutes", 5 * 60),
-    ("20m", "20 minutes", 20 * 60),
-    ("1d", "1 day", 24 * 60 * 60),
-    ("1w", "1 week", 7 * 24 * 60 * 60),
-    ("session", "Until VaultSend closes", None),
+    ("off", "Off"),
+    ("session", "Until VaultSend closes"),
 )
-REMEMBER_SECONDS = {value: seconds for value, _, seconds in REMEMBER_CHOICES}
+REMEMBER_VALUES = {value for value, _ in REMEMBER_CHOICES}
 
 
 def load_settings() -> dict:
@@ -336,7 +331,7 @@ def load_settings() -> dict:
     except (OSError, ValueError):
         return settings
     if isinstance(data, dict):
-        if isinstance(data.get("remember"), str) and data["remember"] in REMEMBER_SECONDS:
+        if isinstance(data.get("remember"), str) and data["remember"] in REMEMBER_VALUES:
             settings["remember"] = data["remember"]
         settings["cache_explained"] = data.get("cache_explained") is True
         settings["open_explained"] = data.get("open_explained") is True
@@ -508,35 +503,27 @@ def file_stamp(path):
 
 
 class PassphraseCache:
-    """Passphrases the user chose to have remembered, in this process's memory only.
-    Keyed "identity" or ("vault", path). `clock` is injectable for the tests. Wall
-    clock rather than monotonic, which on Linux stops counting while suspended."""
+    """Passphrases the user chose to have remembered, in this process's memory only,
+    until Lock now, a change of setting, or the app closes. Keyed "identity" or
+    ("vault", path)."""
 
-    def __init__(self, clock=time.time):
-        self.clock = clock
-        self.seconds = 0  # 0 = remember nothing; None = until the app closes
-        self.entries = {}  # key -> (passphrase, expiry or None)
+    def __init__(self):
+        self.enabled = False
+        self.entries = {}  # key -> passphrase
 
-    def set_lifetime(self, seconds):
-        self.seconds = seconds
+    def set_enabled(self, enabled):
+        self.enabled = enabled
         self.clear()
 
     def put(self, key, passphrase):
-        if self.seconds != 0:
-            expiry = None if self.seconds is None else self.clock() + self.seconds
-            self.entries[key] = (passphrase, expiry)
+        if self.enabled:
+            self.entries[key] = passphrase
 
     def get(self, key):
-        self.sweep()
-        entry = self.entries.get(key)
-        return entry[0] if entry else None
+        return self.entries.get(key)
 
     def forget(self, key):
         self.entries.pop(key, None)
-
-    def sweep(self):
-        now = self.clock()
-        self.entries = {k: e for k, e in self.entries.items() if e[1] is None or now < e[1]}
 
     def clear(self):
         self.entries.clear()
@@ -812,8 +799,7 @@ class Window(Adw.ApplicationWindow):
         self.connect("close-request", self._on_close_request)
         self.settings = load_settings()
         self.cache = PassphraseCache()
-        self.cache.set_lifetime(REMEMBER_SECONDS[self.settings["remember"]])
-        GLib.timeout_add_seconds(30, lambda: self.cache.sweep() or True)
+        self.cache.set_enabled(self.settings["remember"] != "off")
         self._load_css()
 
         self.split = Adw.OverlaySplitView(sidebar_width_fraction=0.25)
@@ -1051,7 +1037,7 @@ class Window(Adw.ApplicationWindow):
         menu = Gio.Menu()
         menu.append("My public key", "win.show-key")
         remember = Gio.Menu()
-        for value, label, _seconds in REMEMBER_CHOICES:
+        for value, label in REMEMBER_CHOICES:
             remember.append(label, f"win.remember::{value}")
         menu.append_submenu("Remember passphrase", remember)
         menu.append("Lock now", "win.lock-now")
@@ -1608,7 +1594,7 @@ class Window(Adw.ApplicationWindow):
     def on_remember_changed(self, action, value):
         choice = value.get_string()
         action.set_state(value)
-        self.cache.set_lifetime(REMEMBER_SECONDS[choice])
+        self.cache.set_enabled(choice != "off")
         self.settings["remember"] = choice
         if choice != "off" and not self.settings["cache_explained"]:
             self.settings["cache_explained"] = True
