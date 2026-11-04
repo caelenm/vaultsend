@@ -853,6 +853,16 @@ class Window(Adw.ApplicationWindow):
         }
         /* Both groups of buttons on one line, at the window's default size. */
         .vaultsend-actions > flowboxchild { padding: 0; }
+        /* The cells only lay the groups out. Without this the theme shades a whole cell on
+           hover, a ghost box behind the buttons. */
+        .vaultsend-actions > flowboxchild,
+        .vaultsend-actions > flowboxchild:hover,
+        .vaultsend-actions > flowboxchild:active,
+        .vaultsend-actions > flowboxchild:selected,
+        .vaultsend-actions > flowboxchild:focus,
+        .vaultsend-actions > flowboxchild:focus-visible {
+            background: none; box-shadow: none; outline: none;
+        }
         /* One of Select all and Select multiple is lit at a time. With everything ticked,
            Select all is, so Select multiple, still on underneath, doesn't show it. */
         .vaultsend-select-mode.vaultsend-outranked:checked:not(:hover):not(:active) {
