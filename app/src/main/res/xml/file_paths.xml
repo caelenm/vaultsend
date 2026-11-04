@@ -1,6 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- What Open's FileProvider may serve: the private copies in the cache's open/
-     folder (OpenCopies.kt), and nothing else. -->
+<!-- What the FileProvider may serve: Open's private copies in the cache's open/
+     folder (OpenCopies.kt), and encrypted files staged for the share sheet in
+     share/, and nothing else. -->
 <paths>
     <cache-path name="open" path="open/" />
+    <cache-path name="share" path="share/" />
 </paths>

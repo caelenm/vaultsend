@@ -49,6 +49,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -493,25 +494,29 @@ fun RemoveFromListDialog(vault: VaultRecord, location: String, onCopy: () -> Uni
 }
 
 /**
- * Share…: who it's for. Picking a contact goes straight on to Save. "Add new
- * contact" opens Add contact over this, so the selection and place are kept.
+ * Share…: who it's for. Tick one or more contacts, then Continue goes on to
+ * Save File or Share. "Add new contact" opens Add contact over this, so the
+ * selection and place are kept.
  */
 @Composable
 fun ShareDialog(
     what: String,
     oneFile: Boolean,
     contacts: List<Contact>,
-    onAddNew: () -> Unit,
-    onPick: (Contact) -> Unit,
+    initiallyPicked: Set<String>,
+    onAddNew: (Set<String>) -> Unit,
+    onConfirm: (List<Contact>) -> Unit,
     onCancel: () -> Unit,
 ) {
+    val checked = remember { mutableStateMapOf<String, Boolean>().apply { initiallyPicked.forEach { put(it, true) } } }
+    fun picked(): Set<String> = checked.filterValues { it }.keys.toSet()
     AlertDialog(
         onDismissRequest = onCancel,
         title = { Text("Share “$what”") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                 Text(
-                    "Encrypted so only you and the person you choose can read it. They open it by " +
+                    "Encrypted so only you and the people you choose can read it. They open it by " +
                         "decrypting it in VaultSend" +
                         if (oneFile) ", which gives them this file." else ", which gives them a .tar archive of it all.",
                     style = MaterialTheme.typography.bodyMedium,
@@ -519,10 +524,12 @@ fun ShareDialog(
                 Column(modifier = Modifier.heightIn(max = 260.dp).verticalScroll(rememberScrollState())) {
                     if (contacts.isEmpty()) Text("No contacts yet", style = MaterialTheme.typography.bodyLarge)
                     for (c in contacts) {
+                        val on = checked[c.pubkey] ?: false
                         Row(
-                            modifier = Modifier.fillMaxWidth().clickable { onPick(c) }.padding(vertical = 6.dp),
+                            modifier = Modifier.fillMaxWidth().clickable { checked[c.pubkey] = !on }.padding(vertical = 2.dp),
                             verticalAlignment = Alignment.CenterVertically,
                         ) {
+                            Checkbox(checked = on, onCheckedChange = { checked[c.pubkey] = it })
                             Column(modifier = Modifier.weight(1f)) {
                                 Text(c.name)
                                 Text(
@@ -532,17 +539,21 @@ fun ShareDialog(
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
-                            Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
                         }
                     }
                 }
                 TextButton(
-                    onClick = onAddNew,
+                    onClick = { onAddNew(picked()) },
                     contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
                 ) { Text("Add new contact") }
             }
         },
-        confirmButton = {},
+        confirmButton = {
+            TextButton(
+                onClick = { val p = picked(); onConfirm(contacts.filter { it.pubkey in p }) },
+                enabled = contacts.any { checked[it.pubkey] == true },
+            ) { Text("Continue") }
+        },
         dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
     )
 }

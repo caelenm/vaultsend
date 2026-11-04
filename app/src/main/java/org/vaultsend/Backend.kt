@@ -368,6 +368,18 @@ class Backend(private val context: Context) {
     val openRoot: File get() = File(context.cacheDir, OPEN_DIR)
 
     /**
+     * A new, empty file named `name` for encrypted output that goes to the share
+     * sheet. Only ciphertext is ever written here. Earlier staged files are
+     * deleted first, so at most one share's worth is kept in the cache.
+     */
+    fun newShareFile(name: String): File {
+        val root = File(context.cacheDir, SHARE_DIR)
+        deleteTree(root)
+        val folder = newCopyFolder(root)
+        return File(folder, name).also { it.createNewFile() }
+    }
+
+    /**
      * Decrypt one file for Open into a new private folder in the cache, as
      * `name`, 0600. Verified in full in the core before a byte is written. Returns
      * the copy; on failure nothing is left behind.

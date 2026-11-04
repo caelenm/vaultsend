@@ -23,6 +23,9 @@ import java.security.SecureRandom
 /** The folder under the cache directory that holds every opened copy. */
 const val OPEN_DIR = "open"
 
+/** The folder under the cache directory that holds encrypted files staged for the share sheet. */
+const val SHARE_DIR = "share"
+
 /**
  * A new private (0700) folder for one opened file, under `openRoot`, with a name
  * nobody can guess. The copy inside is written 0600 by the core.
