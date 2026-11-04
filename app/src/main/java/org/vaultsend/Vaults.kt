@@ -64,13 +64,13 @@ fun serializeVaults(vaults: List<VaultRecord>): String {
 /** How long a typed secret may be remembered: (value, menu label, seconds). */
 data class RememberChoice(val value: String, val label: String, val seconds: Long?)
 
-/** null seconds means until the app closes; the choice itself is never a secret. */
+/**
+ * null seconds means until the app closes; the choice itself is never a secret.
+ * Only Off and Until VaultSend closes are offered: a saved timed choice from an
+ * older version falls back to the default.
+ */
 val REMEMBER_CHOICES = listOf(
     RememberChoice("off", "Off", 0),
-    RememberChoice("5m", "5 minutes", 5 * 60),
-    RememberChoice("20m", "20 minutes", 20 * 60),
-    RememberChoice("1d", "1 day", 24 * 60 * 60),
-    RememberChoice("1w", "1 week", 7 * 24 * 60 * 60),
     RememberChoice("session", "Until VaultSend closes", null),
 )
 

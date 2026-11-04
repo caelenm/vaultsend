@@ -85,7 +85,7 @@ The UI is the desktop's vault page in Compose, with the desktop's wording:
 | Share…: contacts, *Add new contact* over the dialog, then Save | The same. Add contact stacks on Share and returns to it. |
 | Delete: three wordings; everything → `--all` | The same texts; everything calls `vaultRemove(all = true)`. |
 | Open: first-use warning (I understand), asks above 10 files | The same, worded for Android. |
-| Lock, Lock now, Remember passphrase (Off … Until VaultSend closes), first-use explanation | ⋮ menu: **Remember passphrase…** and **Lock now**; each vault page has Lock. The explanation is reworded, since nothing is held in Python. |
+| Lock, Lock now, Remember passphrase (Off or Until VaultSend closes; the timed choices are dropped), first-use explanation | ⋮ menu: **Remember passphrase…** and **Lock now**; each vault page has Lock. The explanation is reworded, since nothing is held in Python. |
 | Percentages on vault operations | A progress bar under the list, fed by the core through `ProgressSink`. It pulses before the first report and after 100%, as on desktop. |
 | `vaults.json`, `settings.json`, `contacts.json` written `0600` | `savePrivately`. The app's files are private already; this matches the mode and replaces a stale temp file. |
 | Toast markup bug with `&`; contact names with `&` | Not applicable: Compose doesn't parse markup. |

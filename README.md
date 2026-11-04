@@ -157,8 +157,7 @@ is the device-independent default requested here.)
   (a backup, a copy from your computer, or one someone shared), use **Add existing
   vault…**, or pick its `VAULT` file with **Open file…** and choose its folder.
 - **Remember passphrase** (⋮ menu): how long your key stays unlocked, and how long a
-  password vault's key is remembered: Off, 5 minutes, 20 minutes, 1 day, 1 week, or
-  until VaultSend closes (the default, which is how this app has always worked).
+  password vault's key is remembered: Off or until VaultSend closes (the default, which is how this app has always worked).
   **Lock now** forgets all of it, locks open vaults and deletes opened copies.
 
 ## Security model — what changed in the port

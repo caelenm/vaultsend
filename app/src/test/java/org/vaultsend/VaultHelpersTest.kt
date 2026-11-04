@@ -117,19 +117,19 @@ class VaultHelpersTest {
 
     @Test
     fun settingsRoundTrip() {
-        val value = AppSettings("20m", cacheExplained = true, openExplained = true)
+        val value = AppSettings("off", cacheExplained = true, openExplained = true)
         VaultStore(dir).saveSettings(value)
         assertEquals(value, VaultStore(dir).loadSettings())
     }
 
     @Test
     fun settingsFromBeforeOpenExistedStillWarn() {
-        assertFalse(parseSettings("""{"remember": "5m", "cache_explained": true}""").openExplained)
+        assertFalse(parseSettings("""{"remember": "off", "cache_explained": true}""").openExplained)
     }
 
     @Test
     fun settingsGarbled() {
-        for (text in listOf("{not json", "[]", "null", """{"remember": "forever"}""", """{"remember": ["5m"]}""", """{"remember": 5}""")) {
+        for (text in listOf("{not json", "[]", "null", """{"remember": "forever"}""", """{"remember": "5m"}""", """{"remember": "1w"}""", """{"remember": ["5m"]}""", """{"remember": 5}""")) {
             assertEquals(text, AppSettings(), parseSettings(text))
         }
     }
@@ -145,7 +145,7 @@ class VaultHelpersTest {
         assertNull(REMEMBER_SECONDS["session"])
         assertTrue("session" in REMEMBER_SECONDS)
         assertEquals(
-            listOf("Off", "5 minutes", "20 minutes", "1 day", "1 week", "Until VaultSend closes"),
+            listOf("Off", "Until VaultSend closes"),
             REMEMBER_CHOICES.map { it.label },
         )
     }

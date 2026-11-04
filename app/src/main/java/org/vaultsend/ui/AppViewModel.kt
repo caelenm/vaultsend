@@ -88,9 +88,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Refresh [unlocked] from the native session (call after unlock/lock/keygen). */
     fun refreshUnlocked() {
-        val now = backend.isUnlocked()
-        if (now && !unlocked) unlockedAt = System.currentTimeMillis()
-        unlocked = now
+        unlocked = backend.isUnlocked()
     }
 
     /**
@@ -133,9 +131,6 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Copies Open has handed to other apps, deleted on Lock, Lock now and close. */
     val openedCopies = mutableStateListOf<OpenedCopy>()
-
-    /** When the session was unlocked, for a Remember lifetime. */
-    private var unlockedAt = 0L
 
     init {
         backend.setVaultRemember(rememberSeconds())
@@ -219,7 +214,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Remember passphrase --------------------------------------------------
 
-    /** The chosen lifetime in seconds: 0 none, null until the app closes. */
+    /** The chosen lifetime: 0 none, null until the app closes. */
     fun rememberSeconds(): Long? = REMEMBER_SECONDS[settings.remember]
 
     /**
@@ -233,13 +228,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         lockSession()
     }
 
-    /** Lock the session once its Remember lifetime is up, and sweep vault keys. Polled. */
+    /** Sweep remembered vault keys. Polled; no choice is timed, so nothing else expires. */
     fun enforceRemember() {
         backend.sweepVaultKeys()
-        val seconds = rememberSeconds() ?: return
-        if (seconds > 0 && unlocked && System.currentTimeMillis() - unlockedAt >= seconds * 1000) {
-            lockSession()
-        }
     }
 
     /** The background auto-lock: keys and open vault pages, but not opened copies. */
