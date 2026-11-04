@@ -98,6 +98,26 @@ The APK lands in `app/build/outputs/apk/`. A release build is unsigned; sign it
 with your own key (`apksigner`, or Android Studio's *Build → Generate Signed
 Bundle / APK*) before distributing.
 
+### Releasing
+
+Releases are signed with the key whose certificate is listed under *App verifier
+Details*; an APK signed with any other key won't install over an existing copy.
+Each release needs a higher `versionCode` than the last one published (including
+betas), and a tag `vX.Y.Z` matching `versionName`, which Obtainium reads. The
+steps are listed below; `apksigner` is in the SDK's `build-tools/<version>/`.
+
+```sh
+git checkout android && git pull origin android
+(cd rust && cargo test)
+./gradlew clean testDebugUnitTest assembleRelease
+apksigner sign --ks /path/to/vaultsend-release.jks \
+  --out vaultsend-X.Y.Z.apk app/build/outputs/apk/release/app-release-unsigned.apk
+apksigner verify --print-certs vaultsend-X.Y.Z.apk   # SHA-256 must match above
+git tag -a vX.Y.Z -m "VaultSend Android X.Y.Z" && git push origin vX.Y.Z
+```
+
+Then publish a GitHub release for the tag with the `.apk` attached.
+
 You can also build the native libraries by themselves at any time:
 
 ```sh
@@ -129,7 +149,8 @@ is the device-independent default requested here.)
 - **Decrypt** text or a file. The first decrypt of a session asks for your
   passphrase to **unlock**; after that you stay unlocked until you close the app,
   tap **Lock now** in the ⋮ menu, or leave the app in the background for 2 minutes
-  (see the security note below). File decryption stages
+  (see the security note below). With **Remember passphrase** set to Off, it asks
+  every time. File decryption stages
   the output to a private temp file and only writes it to your chosen destination
   after the whole stream authenticates, so a tampered or truncated file never
   leaves partial plaintext behind.
@@ -156,8 +177,10 @@ is the device-independent default requested here.)
   forgets a vault; its files stay where they are. To add a vault you already have
   (a backup, a copy from your computer, or one someone shared), use **Add existing
   vault…**, or pick its `VAULT` file with **Open file…** and choose its folder.
-- **Remember passphrase** (⋮ menu): how long your key stays unlocked, and how long a
-  password vault's key is remembered: Off or until VaultSend closes (the default, which is how this app has always worked).
+- **Remember passphrase** (⋮ menu): whether your key stays unlocked, and whether a
+  password vault's key is remembered. There are two choices: **Off** (ask every
+  time) or **Until VaultSend closes** (the default, which is how this app has always
+  worked). Either way the 2-minute background lock still applies.
   **Lock now** forgets all of it, locks open vaults and deletes opened copies.
 
 ## Security model — what changed in the port
@@ -262,7 +285,9 @@ scrypt would need more than 1 GiB of memory.
 
 ## Build verification status
 
-**Vaults (0.2.0).** The Rust core passes `cargo test` on Rust 1.75 and current
+**Vaults (0.2.0).** Remember passphrase offers only Off and Until VaultSend
+closes; the timed choices from 0.2.0 beta 1 were removed, and a saved timed choice
+falls back to the default. The Rust core passes `cargo test` on Rust 1.75 and current
 stable: 62 tests, including all 48 of the desktop branch's vault and tar tests. The
 desktop's end-to-end `vault_roundtrip.sh` passes 131 of 131 against this code
 (`rust/tests/`, run in CI), and `vault_attack.py` passes everything about vaults
