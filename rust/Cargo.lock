@@ -1052,10 +1052,13 @@ dependencies = [
 
 [[package]]
 name = "vaultsend"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "age",
  "jni",
+ "libc",
+ "rand",
+ "sha2",
  "zeroize",
  "zeroize_derive",
 ]
