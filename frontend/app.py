@@ -805,6 +805,7 @@ class Window(Adw.ApplicationWindow):
         self.selected_entry = None  # what the actions act on, selecting one at a time
         self.entry_checks = {}  # every row's radio button or tick box, by path
         self.syncing_checks = False  # ticking one box is ticking others too; see _on_entry_ticked
+        self.syncing_select_all = False  # Select all's state set from _update_selection
         self.expanded = set()  # folders left open, kept across re-listing
         self.opened = []  # decrypted copies given to other apps; see vault_open()
         clear_stale_copies()
@@ -852,13 +853,10 @@ class Window(Adw.ApplicationWindow):
         }
         /* Both groups of buttons on one line, at the window's default size. */
         .vaultsend-actions > flowboxchild { padding: 0; }
-        /* The box on the switch between selecting one row and selecting several. */
-        .vaultsend-select-box {
-            min-width: 18px; min-height: 18px;
-            border: 2px dotted alpha(currentColor, 0.6); border-radius: 4px;
-        }
-        .vaultsend-select-mode:checked .vaultsend-select-box {
-            background-color: #3584e4; border-color: #3584e4; color: white;
+        /* One of Select all and Select multiple is lit at a time. With everything ticked,
+           Select all is, so Select multiple, still on underneath, doesn't show it. */
+        .vaultsend-select-mode.vaultsend-outranked:checked:not(:hover):not(:active) {
+            background-color: transparent;
         }
         /* Above the row of buttons at the bottom, not over them, where it would catch their clicks. */
         toast { margin-bottom: 72px; }
@@ -1884,17 +1882,12 @@ class Window(Adw.ApplicationWindow):
         files_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
         self.files_heading = Gtk.Label(label="Files", xalign=0, hexpand=True, ellipsize=3)  # 3: at the end
         self.files_heading.add_css_class("heading")
-        self.select_all_btn = Gtk.Button(label="Select all", tooltip_text="Select every file and folder in this vault")
+        # A toggle, lit while everything is selected; see _update_selection.
+        self.select_all_btn = Gtk.ToggleButton(label="Select all", tooltip_text="Select every file and folder in this vault")
         self.select_all_btn.add_css_class("flat")
-        self.select_all_btn.connect("clicked", self._on_select_all)
-        select_box = Gtk.Box(halign=Gtk.Align.CENTER, valign=Gtk.Align.CENTER)
-        select_box.add_css_class("vaultsend-select-box")
-        select_box.append(Gtk.Image.new_from_icon_name("object-select-symbolic"))
-        select_content = Gtk.Box(spacing=6)
-        select_content.append(select_box)
-        select_content.append(Gtk.Label(label="Select multiple"))
+        self.select_all_btn.connect("toggled", self._on_select_all)
         self.select_mode_btn = Gtk.ToggleButton(tooltip_text="Select several at once")
-        self.select_mode_btn.set_child(select_content)
+        self.select_mode_btn.set_child(Gtk.Label(label="Select multiple"))
         self.select_mode_btn.add_css_class("flat")
         self.select_mode_btn.add_css_class("vaultsend-select-mode")
         self.select_mode_btn.connect("toggled", self._on_select_mode_toggled)
@@ -2057,11 +2050,22 @@ class Window(Adw.ApplicationWindow):
         self.files_heading.set_label(summary)
         for btn in self.selection_buttons:
             btn.set_sensitive(bool(chosen))
-        self.select_all_btn.set_label("Select none" if chosen == [ROOT_ENTRY] else "Select all")
+        everything = chosen == [ROOT_ENTRY]
+        self.select_all_btn.set_label("Select none" if everything else "Select all")
         self.select_all_btn.set_sensitive(bool(self.vault_entries))
+        # Only one of the two is lit: Select all while everything is selected, else Select
+        # multiple while it's on.
+        self.syncing_select_all = True
+        self.select_all_btn.set_active(everything)
+        self.syncing_select_all = False
+        (self.select_mode_btn.add_css_class if everything else self.select_mode_btn.remove_css_class)(
+            "vaultsend-outranked"
+        )
 
     def _on_select_all(self, _btn):
         """Selecting everything takes the tick boxes, so this turns them on if they aren't."""
+        if self.syncing_select_all:
+            return
         everything = self._selection() != [ROOT_ENTRY]
         self.select_mode_btn.set_active(True)
         self.syncing_checks = True

@@ -47,7 +47,7 @@ chose to change so secret buffers are locked in memory: `read_passphrase`, `load
 | 7 | Drop a password vault on the main page | Decrypt, then its password. It opens and joins the list. A wrong password leaves nothing behind. |
 | 8 | The same for key vaults | Unlocks if your key is the one, and otherwise says your key doesn't match, and that it was made for a different recipient or with a different key. |
 | 9 | Create with no name shouldn't close the dialog | Create stays off until the name will do, and a name with `/` also turns the field red. Answering an `Adw.AlertDialog` always closes it, so this is the only way. |
-| 10 | Select several | **Select multiple** has a dotted box that turns blue, and turns the rows into tick boxes. Open, Extract…, Share… and Delete then act on all of them. |
+| 10 | Select several | **Select multiple** lights up while it's on, and turns the rows into tick boxes. Only one of it and **Select all** is lit at a time: with every row ticked, Select all is. Open, Extract…, Share… and Delete then act on all of them. |
 
 Not asked for, in the same family as 9: Add contact's **Add** also waits for a name and an
 `age1…` key, because a slip there would otherwise throw away what was typed part way through
@@ -645,7 +645,7 @@ looked at before committing.
 | `13-key-mismatch.png` | Added: someone else's key vault, with your key not matching. |
 | `14-progress.png` | Added: a percentage on a vault operation. |
 | `15-add-folder-chooser.png` | Added: the Add folder chooser, showing only folders. |
-| `16-selector-off.png`, `17-selector-on.png` | Added: Select multiple off, with its dotted box, and on, with the box blue. |
+| `16-selector-off.png`, `17-selector-on.png` | Added: Select multiple off, and on, lit. |
 | `18-share.png`, `19-share-add-contact.png`, `20-share-with-new-contact.png` | Added: Share, adding a contact on top of it, and back with them listed. |
 | `21-delete-everything.png` | Added: Delete with everything selected, asking first. |
 | `22-remove-from-list.png` | Added: Remove from list, with the path selectable and a copy button. |

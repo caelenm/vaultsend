@@ -496,6 +496,7 @@ def clicking_through_the_new_features():
     yield SETTLE
     btn = win.select_mode_btn
     check(not btn.get_active() and "vaultsend-select-mode" in btn.get_css_classes(), "the selector starts off")
+    check(not any(isinstance(w, Gtk.Image) for w in walk(btn)), "Select multiple has no tick icon")
     shot("16-selector-off")
     select("top.txt")
     real_click(btn)
@@ -522,8 +523,10 @@ def clicking_through_the_new_features():
     check(all(radio_of(p).get_active() for p in win.vault_entries), "Select all ticks everything")
     check(ticked() == [app.ROOT_ENTRY] and "all selected" in win.files_heading.get_label(), "and means all of it")
     check(win.select_all_btn.get_label() == "Select none", "and the button offers the way back")
+    check(win.select_all_btn.get_active() and "vaultsend-outranked" in btn.get_css_classes(), "only Select all is lit now")
     tick("top.txt", False)
     check(ticked() != [app.ROOT_ENTRY] and "top.txt" not in ticked() and win.select_all_btn.get_label() == "Select all", "unticking one row isn't all any more")
+    check(not win.select_all_btn.get_active() and "vaultsend-outranked" not in btn.get_css_classes(), "and Select multiple is lit again instead")
     tick("top.txt")
     check(ticked() == [app.ROOT_ENTRY], "and ticking every row by hand is all again")
     win.select_all_btn.emit("clicked")
