@@ -25,10 +25,12 @@ are two parts and a hard line between them:
 - **`backend/`** — a tiny Rust command-line tool. It is the **only** component
   that ever touches your private key. All cryptography is delegated to the `age`
   crate; the backend itself contains no hand-written crypto, just plumbing and
-  process hardening (~443 lines, one file).
+  process hardening (~515 lines in `main.rs`, ~1,050 more in `vault.rs` for vaults,
+  and 75 in `tar.rs` for sharing folders, plus those files' tests).
 - **`frontend/`** — a GTK 4 / libadwaita app in Python. It draws the window and
   keeps your contact list. It **never sees your private key** — when a passphrase
-  is needed it hands it to the backend over a private pipe and forgets it.
+  is needed it hands it to the backend over a private pipe and forgets it (unless
+  you turn on **Remember passphrase**; see below).
 
 ## Security model in one paragraph
 
@@ -42,6 +44,39 @@ encrypt and look up your own address without typing a passphrase. The passphrase
 is therefore only ever needed to **decrypt**. Encrypting to several recipients
 does not weaken anything: age encrypts the body once under a single random key
 and just wraps a copy of that key to each recipient separately.
+
+**Vaults** are encrypted folders. Each file is its own age file ("blob"), encrypted
+to a key belonging to that vault, so changing one file re-encrypts one blob. A
+manifest, also age-encrypted, lists every file's name and pins its blob by SHA-256,
+so a blob that is altered, truncated, swapped, deleted or replaced with an older
+version is detected before it is decrypted. The vault's own key is stored in
+`key.age`, sealed either with a secret only your private key can produce or with a
+password you choose (never both: age allows a passphrase only as the sole recipient).
+A vault made with your key opens only for whoever holds your private key. age can't
+prove who made a file and your public key is public, so a key merely wrapped to it
+could have come from anyone; a sealed one can't, so a vault forged from your public
+key simply won't open, on any device. Plaintext from a vault is
+fully decrypted and verified in the backend's memory before a single byte is
+written, and it is only ever written where you explicitly extract it, or to a private
+in-memory folder if you use **Open**. On this
+device, VaultSend also remembers each vault's generation, and warns if a vault goes
+backwards.
+
+**If you turn on Remember passphrase,** the passphrase is held in the frontend's
+memory for the time you chose. It is never written to disk, but that memory, unlike
+the backend's, is not locked out of swap, and Python cannot reliably wipe strings.
+It is off by default.
+
+**Open takes a file outside what VaultSend can protect.** The copy itself goes into
+memory (`$XDG_RUNTIME_DIR`, or `/dev/shm`; if neither is really in RAM, Open refuses
+rather than use the disk). But the app that opens it may save its own unencrypted
+copies to disk, such as recovery files, thumbnails and recent-file lists, and VaultSend
+can't see or remove those. GNOME Text Editor, for one, was tested and keeps the whole document
+in `~/.local/share/org.gnome.TextEditor/drafts/`, even edits you never saved, after everything
+is closed and locked. While the copy exists, other programs running as you can read
+it, and memory can be written to swap or a hibernation image. VaultSend warns you about
+this the first time and asks you to acknowledge it. If that isn't acceptable for a file,
+don't open it on this machine.
 
 ## ⚠️ Security warning
 
@@ -73,10 +108,16 @@ or a crash dump while the backend is briefly holding it. Concretely:
   (`PR_SET_DUMPABLE(0)`) on Linux, so another process running as your user
   cannot read its memory via `/proc/<pid>/mem` or `ptrace`, regardless of the
   system's Yama `ptrace_scope` setting.
-- Secret-holding memory is locked out of swap (`mlockall`) where the OS
-  permits it, and intermediate secret buffers (the passphrase, the decrypted
-  key text) are held in zeroizing storage so they're wiped on drop rather than
-  left in freed heap.
+- Intermediate secret buffers (the passphrase, the decrypted key text) are held
+  in zeroizing storage so they're wiped on drop rather than left in freed heap.
+- The backend's own buffers holding your passphrase and the key's text are locked
+  out of swap one by one (`mlock`), which works even under a low limit on locked
+  memory. **That doesn't cover everything.** Locking the whole process (`mlockall`)
+  needs a limit ordinary users often can't raise; where it was measured, in WSL, the
+  limit was 64 KB and it failed. So copies inside the `age` library, scrypt's working
+  memory, decrypted files and the frontend's remembered passphrase can still reach
+  swap or a hibernation image. Use encrypted swap, or none. To see your own limit,
+  run `ulimit -l`.
 - The identity file is created atomically at `0600` (no window at a wider
   permission, no clobber race), and a decrypted output file is staged to a
   temp file and only renamed into place after the entire ciphertext has
@@ -106,8 +147,16 @@ applies on Linux for now — see Platform support below.
 - **Contacts.** A simple, exportable JSON address book of names and public
   keys. Nothing in it is secret, so it's safe to back up or sync however you
   like.
+- **Vaults.** Keep a whole folder encrypted and change it one file at a time. Add
+  files and folders, open a file in its default app from a copy held in memory,
+  extract files where you choose, delete them, and verify the whole vault for tampering. Open one with your own key, or with a password if you
+  want to share it. Names and folder structure stay hidden; see the limitations
+  below for what a vault does reveal.
+- **Remember passphrase.** Optionally keep your passphrase in memory until the app
+  closes, with **Lock now** in the menu.
+  Off by default; see the security model above for the trade-off.
 - **No network code, no plugins, one identity per user.** VaultSend doesn't
-  fetch keys from anywhere or phone home. What you see in the two source files
+  fetch keys from anywhere or phone home. What you see in the three source files
   is the entire app.
 - **Plaintext touches disk only when you ask.** Decrypting writes a file to
   disk only if you choose **Open file… → Decrypt** with an output path;
@@ -175,10 +224,16 @@ environment variable, the sibling `backend/target/release/` build, then `PATH`.
 |------|------|
 | Encrypted private key (`0600`) | `~/.local/share/vaultsend/identity.age` |
 | Public key (clear) | `~/.local/share/vaultsend/pubkey` |
-| Contacts (plain, exportable JSON) | `~/.config/vaultsend/contacts.json` |
+| Contacts (plain, exportable JSON, `0600`) | `~/.config/vaultsend/contacts.json` |
+| Your list of vaults (no secrets, `0600`) | `~/.config/vaultsend/vaults.json` |
+| Settings, such as Remember passphrase (never the passphrase, `0600`) | `~/.config/vaultsend/settings.json` |
+| New vaults, unless you choose elsewhere | `~/.local/share/vaultsend/vaults/<name>.vsvault` |
+| Files you've opened from a vault, until you lock it or close the app (in memory) | `$XDG_RUNTIME_DIR/vaultsend-open-*`, or `/dev/shm/vaultsend-open-*` |
 
 (`XDG_DATA_HOME` / `XDG_CONFIG_HOME` are honored if set.) Contacts are just a
 list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
+`vaults.json` is a list of `{"name", "path", "mode", "last_generation"}`. The last is
+what lets this device notice a rolled-back vault.
 
 ## Using it
 
@@ -192,6 +247,29 @@ list of `{"name", "pubkey"}` objects — copy the file to back it up or move it.
 - **Contacts:** add someone by pasting their `age1…` public key. Click a contact
   to copy their key.
 - **Your public key** lives in the menu (⋮) — share it so others can write to you.
+- **Vaults:** switch the sidebar to **Vaults**, click **Add vault**, and choose how to
+  protect it. A vault using your key opens only with your private key, so making one asks
+  for your passphrase. Select a vault and **Unlock** it to see its files. **Add files…**, **Add
+  folder…** or dropping files adds them (into the selected folder, if one is selected).
+  **Open**, **Extract…**, **Share…** and **Delete** act on what's selected, and wait until
+  something is. **Select multiple**, above the list, turns the rows into tick boxes so
+  they act on several at once, and **Select all** ticks every row. Extracting several
+  makes one new folder, where each keeps its path from the top of the vault. Removing a
+  vault from the list only forgets it; its files stay where they are. **Add existing
+  vault…** re-attaches a vault after a restore, or one someone shared with you.
+- **Opening a vault from outside the list:** drop its folder on the main page's text box
+  and click **Decrypt**. A password vault asks for its password. A vault using a key
+  unlocks if yours is the key, and otherwise says your key doesn't match. Once open, it's
+  added to your vaults.
+- **Sharing from a vault:** select something, click **Share…**, and pick a contact, or
+  click *Add new contact* to add one on the way. You then choose where to save a file
+  that only you and they can read, to send however you like. They decrypt it on the main
+  page. One file stays that file; a folder or several items arrive as a `.tar` archive.
+- **Opening a file from a vault:** select it and click **Open**. It opens in its default
+  app from a copy in memory, which is deleted when you lock the vault or close VaultSend.
+  Changes aren't saved back to the vault: to keep them, use **Save As** in that app, then
+  add the file back with **Replace**. If a copy was edited, VaultSend asks before deleting
+  it, but it can't see edits you haven't saved yet, so save first.
 
 
 
@@ -206,13 +284,33 @@ vaultsend-backend status                      # ready | locked | empty | corrupt
 vaultsend-backend recover-pubkey --pass-fd N  # rebuild pubkey from identity.age
 vaultsend-backend encrypt -r age1.. [-r age1..]... [--armor] [--in PATH] [--out PATH]
 vaultsend-backend decrypt --pass-fd N [--in PATH] [--out PATH]
+
+vaultsend-backend vault-create  --dir P --mode self --pass-fd N       # your passphrase
+vaultsend-backend vault-create  --dir P --mode password --pass-fd N   # at least 10 characters
+vaultsend-backend vault-list    --dir P --pass-fd N                   # names and sizes only
+vaultsend-backend vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
+vaultsend-backend vault-remove  --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]...
+vaultsend-backend vault-remove  --dir P --pass-fd N --all             # empty the vault, keep the vault
+vaultsend-backend vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH   # "/" is the whole vault
+vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH
+vaultsend-backend vault-check   --dir P --pass-fd N                   # verify every file in RAM
 ```
+
+Any vault command that opens a vault also takes `--progress-fd N`: whole percentages, one
+per line, on that descriptor. It carries numbers only, and a report that doesn't fit is
+dropped rather than waited on, so give it a non-blocking pipe.
+
+`vault-share` writes an ordinary age file, readable with `vaultsend-backend decrypt` or the
+`age` tool. A single file stays that file; anything else is a tar archive inside the age file.
 
 Secrets are never passed as arguments (those are visible to other processes):
 the passphrase is read from the file descriptor named by `--pass-fd`. File data
 flows over stdin/stdout unless `--in`/`--out` are given. With `--out`, output is
 written to `PATH.vaultsend-part` and renamed to `PATH` only once complete, so
 the destination is never a partial file (and `--out` may safely name the input).
+
+For a vault, `--pass-fd` carries your passphrase for a `self` vault and the vault's
+password for a `password` vault.
 
 ## Backing up and restoring
 
@@ -260,6 +358,13 @@ with an empty contact list rather than failing, so a partial restore is never
 fatal — and if `identity.age` is absent, you will be prompted to create a new
 key on first launch, exactly as you were the very first time.
 
+**Your vaults.** A vault is an ordinary folder of encrypted files, so back it up by
+copying the whole `.vsvault` folder. A `self` vault also needs the key it was created
+with, so keep `identity.age` too; a `password` vault needs only its password. After
+restoring, use **Add existing vault…** if it isn't in your list. Restoring an older
+copy over a newer one makes VaultSend warn that the vault looks older, which is
+expected in that one case.
+
 ## Where to look when auditing
 
 - `backend/src/main.rs` — the six `cmd_*` functions are the whole story;
@@ -267,8 +372,17 @@ key on first launch, exactly as you were the very first time.
   the file) is the process-hardening described in the security warning above;
   `read_passphrase` and the `--out` paths of `cmd_encrypt` / `cmd_decrypt` are
   where secret material is held in memory and where staged writes happen.
+- `backend/src/vault.rs` — start with `seal_secret` and `unlock` (both secrets, and why
+  a vault forged from your public key doesn't open),
+  `read_verified` and `extract_folder` (nothing is written until everything has
+  verified in RAM), `Manifest::parse` and `valid_vault_path` (everything that decides
+  what a hostile vault can make us do), then `commit_next` and `orphans` (the crash
+  protocol, and what garbage collection is allowed to delete).
 - `frontend/app.py` — `run_backend()` is the entire trust boundary: it shows
   exactly what is sent to the backend and how the passphrase is passed.
+  `PassphraseCache` and `with_vault_secret` are the rest of what touches a secret.
+  `vault_open` and `memory_folder` are the one place a decrypted file is handed to
+  another program.
 
 ## Platform support
 
@@ -284,6 +398,27 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
 - The backend is invoked synchronously, so encrypting a very large file will
   briefly freeze the window. Fine for typical use; kept this way for simplicity.
 - One identity per user; no key fetching over a network; no plugins. By design.
+- Vaults hide names and folder structure, but anyone who can see a vault's folder can
+  see how many files it holds, each file's approximate size, and when each changed.
+- Noticing a rolled-back vault works only on a device that has already seen the newer
+  version, because that memory lives in `vaults.json`. Someone with write access can also
+  delete a vault, or put another of your own vaults in its place. They can't read it, or
+  make one that opens for you.
+- Extracting needs RAM of about twice the file's size, because it is fully decrypted
+  and verified before anything is written. A folder needs roughly its total size.
+  **Open** needs about three times, since the copy stays in memory too.
+- **Open** handles one file at a time. Sandboxed apps (Flatpak, Snap) may not be able to
+  read the copy. If VaultSend is killed, the copy stays in memory until its next launch,
+  logout or reboot.
+- File and folder names in a vault must be valid UTF-8; adding one that isn't fails
+  and names it.
+- Names from inside a vault appear on the backend's command line while an operation runs, so
+  another account on the same machine can see them in `ps` unless `/proc` is mounted with
+  `hidepid`. Passphrases and passwords never do.
+- A folder extract that is killed partway leaves the files written so far, decrypted, in
+  `<name>.vaultsend-part`. Running the same extract again clears them.
+- A password can't be changed yet, and there's no single-file export: sharing a
+  password vault means copying its folder.
 - No third-party security audit has been performed. See the security warning
   at the top of this document.
 

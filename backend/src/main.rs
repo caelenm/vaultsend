@@ -11,6 +11,7 @@
 //   recover-pubkey --pass-fd N    Rebuild the public key cache from identity.age.
 //   encrypt -r AGE1.. [..] [--armor] [--in P] [--out P]   (no secret needed)
 //   decrypt --pass-fd N [--in P] [--out P]
+//   vault-create|list|add|remove|extract|share|check   Encrypted folders; see vault.rs.
 //
 // Secrets never travel on argv (which is world-readable via /proc). The identity
 // passphrase is read from a file descriptor handed over by the parent process.
@@ -22,6 +23,9 @@
 // RAM cannot be read by other same-user processes, recovered from a core file,
 // or paged to a swap device. Secret buffers are additionally held in zeroizing
 // storage so they are wiped from memory on drop.
+
+mod tar;
+mod vault;
 
 use std::env;
 use std::fs::{self, File};
@@ -89,6 +93,30 @@ fn harden_process() {
     // no-op so the binary still builds on other platforms.
 }
 
+/// Keep one secret buffer out of swap. harden_process's mlockall is all or nothing, so a
+/// low limit on locked memory defeats it; these few small buffers usually still fit.
+/// Best-effort, as that is. Never unlocked: the process is short-lived, and a page can
+/// hold more than one buffer.
+#[cfg(target_os = "linux")]
+fn lock_in_ram<T>(buffer: &[T]) {
+    // SAFETY: mlock only reads the address range, which `buffer` borrows.
+    let _ = unsafe { libc::mlock(buffer.as_ptr().cast(), std::mem::size_of_val(buffer)) };
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_in_ram<T>(_buffer: &[T]) {}
+
+/// Room for a passphrase or a key's text without reallocating, which would leave an
+/// unlocked, unwiped copy behind. A longer passphrase still works; its growth just isn't locked.
+const SECRET_CAPACITY: usize = 1024;
+
+/// An empty buffer for secret bytes: wiped on drop, locked before anything is put in it.
+fn secret_buffer() -> Zeroizing<Vec<u8>> {
+    let mut buf = Zeroizing::new(Vec::with_capacity(SECRET_CAPACITY));
+    lock_in_ram(buf.spare_capacity_mut());
+    buf
+}
+
 // ---------------------------------------------------------------------------
 // Paths.  Identity lives under XDG_DATA_HOME (default ~/.local/share/vaultsend).
 // `identity.age` is the secret key, passphrase-encrypted. `pubkey` is the public
@@ -140,7 +168,7 @@ fn read_passphrase(fd: i32) -> R<SecretString> {
     let mut f = unsafe { File::from_raw_fd(fd) };
     // Read into zeroizing storage so the raw passphrase bytes are wiped from
     // memory on drop instead of lingering in freed heap.
-    let mut buf: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut buf = secret_buffer();
     f.read_to_end(&mut buf).map_err(|e| format!("reading passphrase: {e}"))?;
     // Strip trailing CR/LF without allocating an un-zeroized copy.
     let end = buf
@@ -153,7 +181,9 @@ fn read_passphrase(fd: i32) -> R<SecretString> {
     let pass = std::str::from_utf8(&buf[..end])
         .map_err(|_| "passphrase is not valid UTF-8".to_string())?;
     // The owned String moved into SecretString is zeroized on drop; `buf` is too.
-    Ok(SecretString::from(pass.to_owned()))
+    let passphrase = SecretString::from(pass.to_owned());
+    lock_in_ram(passphrase.expose_secret().as_bytes());
+    Ok(passphrase)
 }
 
 /// Create a brand-new file private to the user (0600), refusing to follow or
@@ -233,6 +263,7 @@ fn cmd_keygen(pass_fd: i32) -> R<()> {
     let identity = x25519::Identity::generate();
     let public = identity.to_public().to_string(); // "age1..."
     let secret = identity.to_string();             // SecretString "AGE-SECRET-KEY-1..."
+    lock_in_ram(secret.expose_secret().as_bytes());
 
     // Write the encrypted identity to a temp file, then atomically rename it into
     // place. identity.age is therefore only ever absent or fully written — never
@@ -325,7 +356,7 @@ fn load_identity(pass_fd: i32) -> R<x25519::Identity> {
     // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
     // drop rather than left behind in freed heap. (age keeps the parsed scalar
     // in its own zeroizing storage; this protects the intermediate text form.)
-    let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut secret_bytes = secret_buffer();
     id_reader
         .read_to_end(&mut secret_bytes)
         .map_err(|e| format!("reading identity: {e}"))?;
@@ -491,8 +522,11 @@ fn run() -> R<()> {
             opt_value(rest, "--in").as_deref(),
             opt_value(rest, "--out").as_deref(),
         ),
+        "vault-create" | "vault-list" | "vault-add" | "vault-remove" | "vault-extract"
+        | "vault-share" | "vault-check" => vault::run(cmd, rest),
         other => Err(format!(
-            "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt)"
+            "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt|\
+             vault-create|vault-list|vault-add|vault-remove|vault-extract|vault-share|vault-check)"
         )),
     }
 }

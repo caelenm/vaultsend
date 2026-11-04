@@ -6,13 +6,19 @@ This process never sees your private key. It only:
   * runs the `vaultsend-backend` binary, which does all cryptography.
 
 The private key lives, passphrase-encrypted, where only the backend reads it.
+File plaintext from a vault never passes through this process either: the backend
+decrypts it, verifies it and writes it straight to the location you choose, or, for
+Open, to a private in-memory folder that another app reads it from.
 """
 
 import json
 import os
+import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
+from urllib.parse import unquote
 
 import gi
 
@@ -31,8 +37,20 @@ APP_ID = "org.vaultsend.VaultSend"
 
 CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "vaultsend"
 CONTACTS_FILE = CONFIG_DIR / "contacts.json"
+VAULTS_FILE = CONFIG_DIR / "vaults.json"
+SETTINGS_FILE = CONFIG_DIR / "settings.json"
 
-APP_VERSION = "0.1.2"
+DATA_DIR = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "vaultsend"
+VAULTS_DIR = DATA_DIR / "vaults"  # where a new vault goes unless you choose elsewhere
+VAULT_SUFFIX = ".vsvault"
+ROOT_ENTRY = "/"  # backend's name for the whole vault (ROOT_ENTRY in vault.rs)
+OPEN_PREFIX = "vaultsend-open-"  # folders holding opened copies, cleared after a crash
+INDENT_STEP = 20  # pixels a row in a vault's file list sits in, per folder level
+INDENT_LEVELS = 6  # no further: the list can't scroll sideways, so more would widen the window
+OPEN_ASK_ABOVE = 10  # opening more files than this at once asks first: each one starts an app
+KEY_MISMATCH = "does not open with your key"  # the backend's words for a `self` vault of someone else's
+
+APP_VERSION = "0.2.0"
 
 # Required when creating a key. The passphrase is all that protects identity.age
 # once it is backed up, so trivially guessable ones are refused. Unlocking an
@@ -232,16 +250,23 @@ def load_contacts() -> list:
 
 
 def save_contacts(contacts: list) -> None:
+    save_json(CONTACTS_FILE, contacts)
+
+
+def save_json(path, value) -> None:
     # Write a temp file and rename it over the old one, so a crash or full disk
-    # mid-write can never leave a truncated contacts.json (which would load as
-    # an empty list and then be saved over).
+    # mid-write can never leave a truncated file (contacts.json would then load as
+    # an empty list and be saved over). Private: who you talk to, and your vaults'
+    # names and locations, are nobody else's business on a shared machine.
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    tmp = CONTACTS_FILE.with_name(CONTACTS_FILE.name + ".tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(json.dumps(contacts, indent=2))
+    tmp = path.with_name(path.name + ".tmp")
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with open(fd, "w", encoding="utf-8") as f:
+        os.fchmod(fd, 0o600)  # a temp file left by a crash keeps its old mode otherwise
+        f.write(json.dumps(value, indent=2))
         f.flush()
         os.fsync(f.fileno())
-    os.replace(tmp, CONTACTS_FILE)
+    os.replace(tmp, path)
 
 
 def is_valid_pubkey(s: str) -> bool:
@@ -262,6 +287,246 @@ def is_valid_pubkey(s: str) -> bool:
 
 def short(pubkey: str) -> str:
     return pubkey[:12] + "…" + pubkey[-6:] if len(pubkey) > 24 else pubkey
+
+
+# ---------------------------------------------------------------------------
+# Vault registry and settings (plain JSON; no secrets in either)
+# ---------------------------------------------------------------------------
+def load_vaults() -> list:
+    """The vaults this device knows about. Besides name and location, each entry
+    remembers the highest generation seen, for spotting a rollback."""
+    try:
+        data = json.loads(VAULTS_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    vaults = []
+    for v in data:
+        if not (isinstance(v, dict) and isinstance(v.get("name"), str) and isinstance(v.get("path"), str)):
+            continue
+        generation = v.get("last_generation")
+        vaults.append({
+            "name": v["name"],
+            "path": v["path"],
+            "mode": "password" if v.get("mode") == "password" else "self",
+            "last_generation": generation if type(generation) is int and generation >= 0 else 0,
+        })
+    return vaults
+
+
+# Whether a typed passphrase is remembered: (value, menu label). "session" keeps it
+# until the app closes; it is never written to disk.
+REMEMBER_CHOICES = (
+    ("off", "Off"),
+    ("session", "Until VaultSend closes"),
+)
+REMEMBER_VALUES = {value for value, _ in REMEMBER_CHOICES}
+
+
+def load_settings() -> dict:
+    settings = {"remember": "off", "cache_explained": False, "open_explained": False}
+    try:
+        data = json.loads(SETTINGS_FILE.read_text("utf-8"))
+    except (OSError, ValueError):
+        return settings
+    if isinstance(data, dict):
+        if isinstance(data.get("remember"), str) and data["remember"] in REMEMBER_VALUES:
+            settings["remember"] = data["remember"]
+        settings["cache_explained"] = data.get("cache_explained") is True
+        settings["open_explained"] = data.get("open_explained") is True
+    return settings
+
+
+def is_valid_vault_name(name: str) -> bool:
+    return (
+        bool(name)
+        and "/" not in name
+        and "\0" not in name
+        and name not in (".", "..")
+        and len((name + VAULT_SUFFIX).encode("utf-8")) <= 255
+    )
+
+
+def read_vault_mode(path):
+    """'self' or 'password' from a vault's VAULT file, or None if it isn't a vault.
+    Only decides which prompt to show; the backend doesn't trust it either."""
+    file = Path(path, "VAULT")
+    try:
+        # is_file first: reading a FIFO put here would hang the window, at startup.
+        text = file.read_text("utf-8") if file.is_file() else ""
+    except (OSError, ValueError):
+        return None
+    return {
+        "vaultsend-vault 1\nmode self\n": "self",
+        "vaultsend-vault 1\nmode password\n": "password",
+    }.get(text)
+
+
+def parse_listing(text: str):
+    """Turn `vault-list` output into (generation, entries), with paths unescaped and
+    entries sorted for display: folder by folder, folders first. Names and sizes
+    only; the backend never sends file content."""
+    lines = text.split("\n")
+    generation = int(lines[0].removeprefix("generation "))
+    entries = []
+    for line in lines[1:]:
+        fields = line.split(" ")
+        if fields[0] == "D" and len(fields) == 2:
+            entries.append({"path": unquote(fields[1]), "is_dir": True, "size": 0})
+        elif fields[0] == "F" and len(fields) == 3:
+            entries.append({"path": unquote(fields[2]), "is_dir": False, "size": int(fields[1])})
+
+    def order(entry):
+        *parents, name = entry["path"].split("/")
+        return [(0, p.casefold(), p) for p in parents] + [(0 if entry["is_dir"] else 1, name.casefold(), name)]
+
+    return generation, sorted(entries, key=order)
+
+
+def short_path(path: str) -> str:
+    home = str(Path.home())
+    if path == home or path.startswith(home + "/"):
+        path = "~" + path[len(home):]
+    parts = path.split("/")
+    return path if len(parts) <= 3 else f"{parts[0]}/…/{parts[-1]}"
+
+
+def entry_indent(path: str) -> int:
+    return min(path.count("/"), INDENT_LEVELS) * INDENT_STEP
+
+
+def parent_folders(path: str) -> list:
+    """Every folder leading to `path`, outermost first: "a/b/c" gives "a", "a/b"."""
+    parts = path.split("/")
+    return ["/".join(parts[:i]) for i in range(1, len(parts))]
+
+
+def top_level_selection(paths) -> list:
+    """What a set of ticked rows comes to: a ticked folder already covers what's in it."""
+    chosen = set(paths)
+    if ROOT_ENTRY in chosen:
+        return [ROOT_ENTRY]
+    return sorted(p for p in chosen if not any(parent in chosen for parent in parent_folders(p)))
+
+
+def files_in_selection(selection, entries) -> list:
+    """The files a selection covers, in display order. `entries` is a listing by path."""
+    def covered(path):
+        return any(s == ROOT_ENTRY or path == s or path.startswith(s + "/") for s in selection)
+
+    return [path for path, entry in entries.items() if not entry["is_dir"] and covered(path)]
+
+
+def entry_args(selection) -> list:
+    return [arg for path in selection for arg in ("--entry", path)]
+
+
+def share_file_name(vault_name: str, selection, entries) -> str:
+    """A name to suggest for a share. One file stays that file; anything else is an archive."""
+    if len(selection) > 1:
+        return f"{vault_name} selection.tar.age"
+    only = selection[0]
+    if only == ROOT_ENTRY:
+        return f"{vault_name}.tar.age"
+    return os.path.basename(only) + (".tar.age" if entries[only]["is_dir"] else ".age")
+
+
+def vault_name_from_path(path: str) -> str:
+    return os.path.basename(path.rstrip("/")).removesuffix(VAULT_SUFFIX)
+
+
+def last_percent(reports: bytes, previous):
+    """The latest whole percent in what the backend has written to its progress pipe."""
+    for line in reversed(reports.split(b"\n")):
+        if line.isdigit():
+            return min(int(line), 100)
+    return previous
+
+
+def plain_row(title: str, subtitle: str) -> Adw.ActionRow:
+    """A row showing a name exactly as it is. As markup, an "&" in a contact's or a file's
+    name would leave it blank. Setters, in this order: passed to the constructor, the text
+    is parsed as markup first."""
+    row = Adw.ActionRow()
+    row.set_use_markup(False)
+    row.set_title(title)
+    row.set_subtitle(subtitle)
+    return row
+
+
+def memory_candidates() -> list:
+    # $XDG_RUNTIME_DIR is private to this user and cleared at logout, so it comes first.
+    # /dev/shm is shared, but mkdtemp makes a 0700 folder with an unguessable name in it.
+    return [p for p in (os.environ.get("XDG_RUNTIME_DIR"), "/dev/shm") if p]
+
+
+def is_in_memory(path) -> bool:
+    try:
+        info = Gio.File.new_for_path(str(path)).query_filesystem_info("filesystem::type", None)
+    except GLib.Error:
+        return False
+    return info.get_attribute_string("filesystem::type") in ("tmpfs", "ramfs")
+
+
+def memory_folder():
+    """Where Open may put a decrypted copy, or None. Checked rather than assumed, so a
+    copy can never quietly land on disk because a folder turned out not to be in RAM."""
+    return next((p for p in memory_candidates() if is_in_memory(p)), None)
+
+
+def clear_stale_copies() -> None:
+    """Remove opened copies left behind by a crash. Only real folders of ours with our
+    prefix: never a symlink, and never another user's in the shared /dev/shm."""
+    for base in memory_candidates():
+        try:
+            with os.scandir(base) as entries:
+                for entry in entries:
+                    if (
+                        entry.name.startswith(OPEN_PREFIX)
+                        and entry.is_dir(follow_symlinks=False)
+                        and entry.stat(follow_symlinks=False).st_uid == os.getuid()
+                    ):
+                        shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            pass
+
+
+def file_stamp(path):
+    """Enough to notice an edit without reading the file: this process must never hold
+    a vault file's plaintext, even to hash it."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return (info.st_mtime_ns, info.st_size)
+
+
+class PassphraseCache:
+    """Passphrases the user chose to have remembered, in this process's memory only,
+    until Lock now, a change of setting, or the app closes. Keyed "identity" or
+    ("vault", path)."""
+
+    def __init__(self):
+        self.enabled = False
+        self.entries = {}  # key -> passphrase
+
+    def set_enabled(self, enabled):
+        self.enabled = enabled
+        self.clear()
+
+    def put(self, key, passphrase):
+        if self.enabled:
+            self.entries[key] = passphrase
+
+    def get(self, key):
+        return self.entries.get(key)
+
+    def forget(self, key):
+        self.entries.pop(key, None)
+
+    def clear(self):
+        self.entries.clear()
 
 
 # ---------------------------------------------------------------------------
@@ -407,16 +672,134 @@ class FileOperation:
             pass
 
 
+class VaultOperation(FileOperation):
+    """A vault command, run the same way as a file operation. A subclass so that
+    FileOperation stays exactly as audited. A vault command has no output growing at
+    a known rate (extract writes nothing until everything has verified in RAM), so the
+    backend reports its own percentage on a pipe. The bar pulses until the first report,
+    while the key is being unlocked, and again once the work is done but not yet committed.
+
+    `partial` is what to remove after a cancel or failure: the staging path of an
+    extract, which is a folder for a folder extract. `on_done` gets the failure
+    message, or None on success or cancel."""
+
+    def __init__(self, window, args, *, passphrase, heading, subject, note, on_done, partial=None):
+        super().__init__(
+            window, args, passphrase=passphrase, heading=heading, subject=subject,
+            watch_path=partial, total=1, note=note,
+        )
+        self.on_done = on_done
+        self.progress_pipe = None
+        self.percent = None
+
+    def start(self):
+        """FileOperation.start, with a pipe for the backend's reports. Its own, rather than
+        an option on spawn_backend, so that stays as audited; the same reason as _finish."""
+        self.progress_pipe, write_end = os.pipe()
+        os.set_blocking(self.progress_pipe, False)  # a tick must never wait on it
+        os.set_blocking(write_end, False)  # nor may a report ever hold up the backend
+        pass_read, pass_write = os.pipe()
+        os.write(pass_write, self.passphrase.encode("utf-8"))
+        os.close(pass_write)
+        try:
+            self.proc = subprocess.Popen(
+                [BACKEND, *self.args, "--progress-fd", str(write_end), "--pass-fd", str(pass_read)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                pass_fds=(write_end, pass_read),
+            )
+        except FileNotFoundError:
+            os.close(self.progress_pipe)
+            self.window.error(
+                f"Backend not found at '{BACKEND}'.\nBuild it with 'cargo build --release' "
+                "or set VAULTSEND_BACKEND."
+            )
+            self.window.current_op = None
+            return
+        finally:
+            os.close(write_end)
+            os.close(pass_read)
+        self.timer = GLib.timeout_add(self.POLL_MS, self._tick)
+        GLib.timeout_add(self.DIALOG_DELAY_MS, self._present_dialog)
+
+    def _read_progress(self):
+        try:
+            self.percent = last_percent(os.read(self.progress_pipe, 4096), self.percent)
+        except BlockingIOError:
+            pass  # nothing new
+
+    def _update(self):
+        self._read_progress()
+        if self.bar is None:
+            return
+        if self.percent is None or self.percent >= 100:
+            self.bar.pulse()
+            self.bar.set_text("Working…" if self.percent is None else "Finishing…")
+        else:
+            self.bar.set_fraction(self.percent / 100)
+            self.bar.set_text(f"{self.percent}%")
+
+    def _finish(self):
+        self.done = True
+        if self.dialog is not None:
+            self.dialog.disconnect(self.dialog_handler)
+            self.dialog.close()
+            self.dialog = None
+        os.close(self.progress_pipe)
+        _, err = self.proc.communicate()
+        code = self.proc.returncode
+        self.window.current_op = None
+
+        lines = err.decode("utf-8", "replace").strip().splitlines()
+        warnings = [line.removeprefix("warning: ") for line in lines if line.startswith("warning: ")]
+        if self.cancelled:
+            self._discard_partials()
+            self.window.toast("Cancelled.")
+            self.on_done(None)
+        elif code == 0:
+            self.window.toast(f"{self.note} Note: {warnings[0]}." if warnings else self.note)
+            self.on_done(None)
+        else:
+            self._discard_partials()
+            errors = [line.removeprefix("error: ") for line in lines if line.startswith("error: ")]
+            # A signalled process (OOM killer, a crash) has no message of its own.
+            self.on_done(errors[-1] if errors else f"the operation failed (exit {code})")
+
+    def _discard_partials(self):
+        if self.watch_path and os.path.isdir(self.watch_path) and not os.path.islink(self.watch_path):
+            shutil.rmtree(self.watch_path, ignore_errors=True)
+        elif self.watch_path:
+            super()._discard_partials()
+
+
 # ---------------------------------------------------------------------------
 # Main window
 # ---------------------------------------------------------------------------
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title="VaultSend")
-        self.set_default_size(880, 600)
+        self.set_default_size(1012, 690)
+        # GTK would otherwise log every file chosen in a dialog to the desktop's shared list of
+        # recent files, by name, and keep that record after the file itself has gone.
+        self.get_settings().set_property("gtk-recent-files-enabled", False)
         self.my_pubkey = None
         self.contacts = load_contacts()
         self.current_op = None  # in-flight FileOperation, if any
+        self.vaults = load_vaults()
+        self.vault = None  # the vault selected in the sidebar, if any
+        self.vault_entries = None  # its listing by path, or None while locked
+        self.selected_entry = None  # what the actions act on, selecting one at a time
+        self.entry_checks = {}  # every row's radio button or tick box, by path
+        self.syncing_checks = False  # ticking one box is ticking others too; see _on_entry_ticked
+        self.syncing_select_all = False  # Select all's state set from _update_selection
+        self.expanded = set()  # folders left open, kept across re-listing
+        self.opened = []  # decrypted copies given to other apps; see vault_open()
+        clear_stale_copies()
+        self.connect("close-request", self._on_close_request)
+        self.settings = load_settings()
+        self.cache = PassphraseCache()
+        self.cache.set_enabled(self.settings["remember"] != "off")
         self._load_css()
 
         self.split = Adw.OverlaySplitView(sidebar_width_fraction=0.25)
@@ -439,6 +822,40 @@ class Window(Adw.ApplicationWindow):
             color: #e01b24;
             background-color: alpha(#e01b24, 0.12);
         }
+        /* libadwaita styles every arrow below an open row as open, so a closed folder
+           inside an open one would look open. Give it the theme's closed arrow back. */
+        list.nested row.expander:not(:checked) > box > list > row image.expander-row-arrow {
+            -gtk-icon-transform: rotate(0.5turn);
+            opacity: 0.55;
+            color: inherit;
+        }
+        list.nested row.expander:not(:checked) > box > list > row image.expander-row-arrow:dir(rtl) {
+            -gtk-icon-transform: rotate(-0.5turn);
+        }
+        /* Each nested list is shaded on top of its parent's, which a very deep vault would
+           take too dark to read. Stop one level past INDENT_LEVELS, as the indent does. */
+        list.nested list.nested list.nested list.nested list.nested list.nested list.nested {
+            background: none;
+        }
+        /* Both groups of buttons on one line, at the window's default size. */
+        .vaultsend-actions > flowboxchild { padding: 0; }
+        /* The cells only lay the groups out. Without this the theme shades a whole cell on
+           hover, a ghost box behind the buttons. */
+        .vaultsend-actions > flowboxchild,
+        .vaultsend-actions > flowboxchild:hover,
+        .vaultsend-actions > flowboxchild:active,
+        .vaultsend-actions > flowboxchild:selected,
+        .vaultsend-actions > flowboxchild:focus,
+        .vaultsend-actions > flowboxchild:focus-visible {
+            background: none; box-shadow: none; outline: none;
+        }
+        /* One of Select all and Select multiple is lit at a time. With everything ticked,
+           Select all is, so Select multiple, still on underneath, doesn't show it. */
+        .vaultsend-select-mode.vaultsend-outranked:checked:not(:hover):not(:active) {
+            background-color: transparent;
+        }
+        /* Above the row of buttons at the bottom, not over them, where it would catch their clicks. */
+        toast { margin-bottom: 72px; }
         """
         provider = Gtk.CssProvider()
         try:
@@ -453,13 +870,14 @@ class Window(Adw.ApplicationWindow):
     def _build_sidebar(self):
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
-        header.set_title_widget(Adw.WindowTitle(title="Contacts"))
+        header.set_title_widget(self._build_mode_toggle())
         view.add_top_bar(header)
 
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
         add_btn = Gtk.Button(margin_top=8, margin_bottom=8, margin_start=8, margin_end=8)
-        add_btn.set_child(Adw.ButtonContent(icon_name="list-add-symbolic", label="Add contact"))
-        add_btn.connect("clicked", lambda *_: self.add_contact_dialog())
+        self.add_content = Adw.ButtonContent(icon_name="list-add-symbolic", label="Add contact")
+        add_btn.set_child(self.add_content)
+        add_btn.connect("clicked", lambda *_: self.on_add_clicked())
         box.append(add_btn)
 
         self.contact_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
@@ -468,10 +886,49 @@ class Window(Adw.ApplicationWindow):
         self.contact_list.set_margin_end(8)
         scroller = Gtk.ScrolledWindow(vexpand=True)
         scroller.set_child(self.contact_list)
-        box.append(scroller)
+
+        self.vault_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.SINGLE)
+        self.vault_list.add_css_class("boxed-list")
+        self.vault_list.set_margin_start(8)
+        self.vault_list.set_margin_end(8)
+        vault_scroller = Gtk.ScrolledWindow(vexpand=True)
+        vault_scroller.set_child(self.vault_list)
+
+        self.sidebar_stack = Gtk.Stack()
+        self.sidebar_stack.add_named(scroller, "contacts")
+        self.sidebar_stack.add_named(vault_scroller, "vaults")
+        box.append(self.sidebar_stack)
         view.set_content(box)
         self._refresh_contacts()
+        self._refresh_vaults()
         return view
+
+    def _build_mode_toggle(self):
+        # Two grouped toggle buttons rather than Adw.ToggleGroup, which needs
+        # libadwaita 1.7; this app's floor is 1.5.
+        self.contacts_toggle = Gtk.ToggleButton(label="Contacts", active=True)
+        self.vaults_toggle = Gtk.ToggleButton(label="Vaults")
+        self.vaults_toggle.set_group(self.contacts_toggle)
+        # This one, not Contacts: a group deactivates the old button before activating
+        # the new one, so only this one's state is right when "toggled" fires either way.
+        self.vaults_toggle.connect("toggled", lambda *_: self._on_mode_toggled())
+        box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        box.add_css_class("linked")
+        box.append(self.contacts_toggle)
+        box.append(self.vaults_toggle)
+        return box
+
+    def _on_mode_toggled(self):
+        vaults = self.vaults_toggle.get_active()
+        self.sidebar_stack.set_visible_child_name("vaults" if vaults else "contacts")
+        self.add_content.set_label("Add vault" if vaults else "Add contact")
+        self.content_stack.set_visible_child_name("vault" if vaults and self.vault else "send")
+
+    def on_add_clicked(self):
+        if self.vaults_toggle.get_active():
+            self.add_vault_dialog()
+        else:
+            self.add_contact_dialog()
 
     def _refresh_contacts(self):
         child = self.contact_list.get_first_child()
@@ -484,7 +941,7 @@ class Window(Adw.ApplicationWindow):
             self.contact_list.append(row)
             return
         for c in self.contacts:
-            row = Adw.ActionRow(title=c["name"], subtitle=short(c["pubkey"]))
+            row = plain_row(c["name"], short(c["pubkey"]))
             row.set_activatable(True)
             copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER)
             copy.add_css_class("flat")
@@ -570,7 +1027,7 @@ class Window(Adw.ApplicationWindow):
         view = Adw.ToolbarView()
         header = Adw.HeaderBar()
 
-        toggle = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Toggle contacts")
+        toggle = Gtk.ToggleButton(icon_name="sidebar-show-symbolic", tooltip_text="Toggle sidebar")
         self.split.bind_property(
             "show-sidebar", toggle, "active", GObject.BindingFlags.BIDIRECTIONAL | GObject.BindingFlags.SYNC_CREATE
         )
@@ -579,6 +1036,11 @@ class Window(Adw.ApplicationWindow):
 
         menu = Gio.Menu()
         menu.append("My public key", "win.show-key")
+        remember = Gio.Menu()
+        for value, label in REMEMBER_CHOICES:
+            remember.append(label, f"win.remember::{value}")
+        menu.append_submenu("Remember passphrase", remember)
+        menu.append("Lock now", "win.lock-now")
         menu.append("About VaultSend", "win.about")
         menu_btn = Gtk.MenuButton(icon_name="open-menu-symbolic", menu_model=menu, tooltip_text="Menu")
         header.pack_end(menu_btn)
@@ -590,7 +1052,10 @@ class Window(Adw.ApplicationWindow):
         clamp = Adw.Clamp(maximum_size=680, margin_top=24, margin_bottom=24, margin_start=16, margin_end=16)
         scroller = Gtk.ScrolledWindow(vexpand=True)
         scroller.set_child(clamp)
-        self.toasts.set_child(scroller)
+        self.content_stack = Gtk.Stack()
+        self.content_stack.add_named(scroller, "send")
+        self.content_stack.add_named(self._build_vault_page(), "vault")
+        self.toasts.set_child(self.content_stack)
 
         col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
         clamp.set_child(col)
@@ -599,8 +1064,8 @@ class Window(Adw.ApplicationWindow):
         title.add_css_class("title-2")
         col.append(title)
         subtitle = Gtk.Label(
-            label="Type or paste text below, or drop a file here. Encrypting scrambles it for chosen "
-            "recipients; decrypting needs your passphrase.",
+            label="Type or paste text below, or drop a file or a vault here. Encrypting scrambles it "
+            "for chosen recipients; decrypting needs your passphrase.",
             xalign=0,
             wrap=True,
         )
@@ -643,17 +1108,28 @@ class Window(Adw.ApplicationWindow):
         return view
 
     def _install_actions(self):
-        for name, fn in (("show-key", self.on_show_key), ("about", self.on_about)):
+        for name, fn in (("show-key", self.on_show_key), ("about", self.on_about), ("lock-now", self.on_lock_now)):
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", fn)
             self.add_action(act)
+        remember = Gio.SimpleAction.new_stateful(
+            "remember", GLib.VariantType.new("s"), GLib.Variant("s", self.settings["remember"])
+        )
+        remember.connect("change-state", self.on_remember_changed)
+        self.add_action(remember)
 
     # -- Small helpers --------------------------------------------------------
     def toast(self, text):
-        self.toasts.add_toast(Adw.Toast.new(text))
+        # Plain text: messages can name files and contacts, and an "&" read as markup
+        # would make the whole toast fail to appear.
+        self.toasts.add_toast(Adw.Toast(use_markup=False, title=text))
 
     def error(self, text):
-        self.toasts.add_toast(Adw.Toast.new(text))
+        # Every identity decrypt reports failure through here, including the file
+        # path's FileOperation, so this is the one place to drop a rejected passphrase.
+        if "wrong passphrase" in text:
+            self.cache.forget("identity")
+        self.toast(text)
 
     def copy(self, text, note="Copied."):
         self.get_clipboard().set(text)
@@ -750,6 +1226,8 @@ class Window(Adw.ApplicationWindow):
     def on_file_dropped(self, _target, value, _x, _y):
         files = value.get_files()
         if files and files[0].get_path():
+            # The drag left the keyboard with the other app, and a prompt may come next.
+            self.present()
             self.handle_file(files[0].get_path())
         return True
 
@@ -769,6 +1247,9 @@ class Window(Adw.ApplicationWindow):
     def handle_file(self, path):
         if not path:
             self.error("That item has no file path on disk.")
+            return
+        if os.path.isdir(path):
+            self._handle_folder(path)
             return
         dlg = Adw.AlertDialog(
             heading="Encrypt or decrypt?",
@@ -790,6 +1271,52 @@ class Window(Adw.ApplicationWindow):
         dlg.connect("response", resp)
         dlg.present(self)
 
+    def _handle_folder(self, path):
+        """A vault dropped on the main page opens here; any other folder has no use there."""
+        mode = read_vault_mode(path)
+        if mode is None:
+            self._vault_error(
+                "That folder isn't a vault",
+                "Only single files can be encrypted here. To protect a folder, add it to a vault.",
+            )
+            return
+        kind = "a password" if mode == "password" else "a key"
+        dlg = Adw.AlertDialog(
+            heading="Decrypt this vault?",
+            body=f"“{os.path.basename(path.rstrip('/'))}” is a vault protected by {kind}. "
+            "Decrypting unlocks it and adds it to your vaults.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("decrypt", "Decrypt")
+        dlg.set_response_appearance("decrypt", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("decrypt")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: self._decrypt_vault(path, mode) if r == "decrypt" else None)
+        dlg.present(self)
+
+    def _decrypt_vault(self, path, mode):
+        real = os.path.realpath(path)
+        known = next((v for v in self.vaults if os.path.realpath(v["path"]) == real), None)
+        vault = known or {"name": vault_name_from_path(path), "path": path, "mode": mode, "last_generation": 0}
+
+        def opened(secret):
+            # Listed before it's added, so a vault that won't open leaves nothing behind.
+            try:
+                out = run_backend(self._vault_args(vault, "vault-list"), passphrase=secret)
+                listing = parse_listing(out.decode("utf-8"))
+            except (BackendError, ValueError, IndexError) as e:
+                self._vault_failed(vault, str(e))
+                return
+            if known is None:
+                self.vaults.append(vault)
+                save_json(VAULTS_FILE, self.vaults)
+            self.select_vault(vault)
+            self._refresh_vaults()
+            self.vaults_toggle.set_active(True)
+            self._apply_listing(vault, *listing)
+
+        self.with_vault_secret(vault, opened)
+
     def encrypt_file(self, path):
         self.pick_recipients(lambda recips: self._save_then(
             os.path.basename(path) + ".age",
@@ -799,7 +1326,7 @@ class Window(Adw.ApplicationWindow):
     def decrypt_file(self, path):
         suggested = os.path.basename(path)
         suggested = suggested[:-4] if suggested.endswith(".age") else suggested + ".decrypted"
-        self.ask_passphrase(lambda p: self._save_then(
+        self.with_passphrase("identity", lambda p: self._save_then(
             suggested,
             lambda out: self._run_decrypt(path, out, p),
         ))
@@ -884,7 +1411,7 @@ class Window(Adw.ApplicationWindow):
         if not text:
             self.error("Paste the encrypted text first.")
             return
-        self.ask_passphrase(lambda p: self._decrypt_text(text, p))
+        self.with_passphrase("identity", lambda p: self._decrypt_text(text, p))
 
     def _decrypt_text(self, text, passphrase):
         try:
@@ -905,10 +1432,12 @@ class Window(Adw.ApplicationWindow):
         you = Gtk.CheckButton(label=f"You ({short(self.my_pubkey)})", active=True, sensitive=False)
         box.append(you)
         for c in self.contacts:
-            cb = Gtk.CheckButton(label=f"{c['name']} ({short(c['pubkey'])})")
+            # Wrapped: clipped, a long name would hide the key that confirms who this is.
+            cb = Gtk.CheckButton()
+            cb.set_child(Gtk.Label(label=f"{c['name']} ({short(c['pubkey'])})", wrap=True, wrap_mode=2, xalign=0))
             box.append(cb)
             checks.append((cb, c["pubkey"]))
-        scroller = Gtk.ScrolledWindow(propagate_natural_height=True)
+        scroller = Gtk.ScrolledWindow(propagate_natural_height=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
         scroller.set_min_content_height(80)
         scroller.set_max_content_height(260)
         scroller.set_child(box)
@@ -936,7 +1465,7 @@ class Window(Adw.ApplicationWindow):
         entry2 = None
         if confirm:
             entry2 = Gtk.PasswordEntry(show_peek_icon=True, activates_default=True)
-            box.append(Gtk.Label(label="Repeat passphrase", xalign=0))
+            box.append(Gtk.Label(label="Repeat it", xalign=0))  # a passphrase, or a vault's password
             box.append(entry2)
         dlg.set_extra_child(box)
         dlg.add_response("cancel", "Cancel")
@@ -955,7 +1484,7 @@ class Window(Adw.ApplicationWindow):
             elif confirm and len(p) < MIN_PASSPHRASE_LEN:
                 problem = f"Use at least {MIN_PASSPHRASE_LEN} characters — a few random words works well."
             elif confirm and entry2 is not None and p != entry2.get_text():
-                problem = "Those passphrases don't match."
+                problem = "Those don't match."
             if problem:
                 self.error(problem)
                 # Creating a key: ask again. On first run nothing else in the
@@ -967,9 +1496,10 @@ class Window(Adw.ApplicationWindow):
             on_ok(p)
 
         dlg.connect("response", resp)
+        dlg.set_focus(entry)  # ready to type into, without reaching for the mouse
         dlg.present(self)
 
-    def add_contact_dialog(self):
+    def add_contact_dialog(self, on_added=None):
         dlg = Adw.AlertDialog(heading="Add contact", body="Paste the public key they shared with you.")
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         name = Gtk.Entry(placeholder_text="Name")
@@ -982,6 +1512,15 @@ class Window(Adw.ApplicationWindow):
         dlg.set_response_appearance("add", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("add")
         dlg.set_close_response("cancel")
+
+        def update_add(*_):
+            # Answering closes the dialog, so Add can't be offered until there's something to add.
+            complete = name.get_text().strip() and key.get_text().strip().startswith("age1")
+            dlg.set_response_enabled("add", bool(complete))
+
+        name.connect("changed", update_add)
+        key.connect("changed", update_add)
+        update_add()
 
         def resp(_d, r):
             if r != "add":
@@ -1001,8 +1540,11 @@ class Window(Adw.ApplicationWindow):
             save_contacts(self.contacts)
             self._refresh_contacts()
             self.toast(f"Added {n}.")
+            if on_added:
+                on_added()
 
         dlg.connect("response", resp)
+        dlg.set_focus(name)
         dlg.present(self)
 
     def on_show_key(self, *_):
@@ -1035,6 +1577,1027 @@ class Window(Adw.ApplicationWindow):
         )
         about.present(self)
 
+    # -- Remembered passphrases -----------------------------------------------
+    def with_passphrase(self, key, on_ok, **dialog):
+        """Call on_ok with the remembered passphrase for `key`, or ask for it."""
+        cached = self.cache.get(key)
+        if cached is not None:
+            on_ok(cached)
+            return
+
+        def typed(passphrase):
+            self.cache.put(key, passphrase)
+            on_ok(passphrase)
+
+        self.ask_passphrase(typed, **dialog)
+
+    def on_remember_changed(self, action, value):
+        choice = value.get_string()
+        action.set_state(value)
+        self.cache.set_enabled(choice != "off")
+        self.settings["remember"] = choice
+        if choice != "off" and not self.settings["cache_explained"]:
+            self.settings["cache_explained"] = True
+            dlg = Adw.AlertDialog(
+                heading="Remembering your passphrase",
+                body="While remembered, your passphrase is held in this window's memory. It is "
+                "never written to disk, but unlike the backend, this part of the app isn't locked "
+                "out of swap, and Python can't reliably wipe text from memory. Use Lock now to "
+                "forget it at any time.",
+            )
+            dlg.add_response("ok", "Got it")
+            dlg.present(self)
+        save_json(SETTINGS_FILE, self.settings)
+
+    def on_lock_now(self, *_):
+        def lock():
+            self.cache.clear()
+            self._discard_copies()
+            if self.vault:
+                self._show_locked()
+            self.toast("Locked. Passphrases forgotten and opened files deleted.")
+
+        self._confirm_discard(None, lock)
+
+    # -- Vault list -----------------------------------------------------------
+    def _refresh_vaults(self):
+        child = self.vault_list.get_first_child()
+        while child:
+            self.vault_list.remove(child)
+            child = self.vault_list.get_first_child()
+        if not self.vaults:
+            row = Adw.ActionRow(title="No vaults yet", subtitle="Create an encrypted folder, or add one you already have.")
+            row.set_activatable(False)
+            row.set_selectable(False)
+            self.vault_list.append(row)
+            return
+        for v in self.vaults:
+            kind = "Password" if v["mode"] == "password" else "Your key"
+            found = read_vault_mode(v["path"]) is not None
+            subtitle = f"{kind} · {short_path(v['path'])}" if found else "Not found"
+            row = plain_row(v["name"], subtitle)  # names can come from folder names on disk
+            row.set_activatable(found)
+            row.set_selectable(found)
+            row.connect("activated", lambda _r, vault=v: self.select_vault(vault))
+            self._attach_vault_menu(row, v)
+            self.vault_list.append(row)
+            if v is self.vault:
+                self.vault_list.select_row(row)
+
+    def _attach_vault_menu(self, row, vault):
+        click = Gtk.GestureClick(button=Gdk.BUTTON_SECONDARY)
+        click.connect("pressed", lambda _g, _n, x, y: self._show_vault_menu(row, vault, x, y))
+        row.add_controller(click)
+        press = Gtk.GestureLongPress()
+        press.connect("pressed", lambda _g, x, y: self._show_vault_menu(row, vault, x, y))
+        row.add_controller(press)
+
+    def _show_vault_menu(self, row, vault, x, y):
+        pop = Gtk.Popover(has_arrow=False, autohide=True)
+        pop.set_parent(row)
+        rect = Gdk.Rectangle()
+        rect.x, rect.y, rect.width, rect.height = int(x), int(y), 1, 1
+        pop.set_pointing_to(rect)
+
+        btn = Gtk.Button()
+        btn.add_css_class("flat")
+        btn.add_css_class("vaultsend-delete")
+        content = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        content.append(Gtk.Image.new_from_icon_name("list-remove-symbolic"))
+        content.append(Gtk.Label(label="Remove from list"))
+        btn.set_child(content)
+
+        def on_click(_b):
+            pop.popdown()
+            self._confirm_forget_vault(vault)
+
+        btn.connect("clicked", on_click)
+        pop.set_child(btn)
+        pop.connect("closed", lambda p: GLib.idle_add(lambda: p.unparent() or False))
+        pop.popup()
+        return pop
+
+    def _confirm_forget_vault(self, vault):
+        dlg = Adw.AlertDialog(
+            heading="Remove from list?",
+            body=f"This only makes VaultSend forget “{vault['name']}”. It does not delete the "
+            "vault or any file in it, which stay here:",
+        )
+        # Its own label: the text of a dialog's body can't be selected.
+        where = Gtk.Box(spacing=6)
+        path = Gtk.Label(label=vault["path"], selectable=True, wrap=True, wrap_mode=2, xalign=0, hexpand=True)
+        path.add_css_class("monospace")
+        copy = Gtk.Button(icon_name="edit-copy-symbolic", valign=Gtk.Align.CENTER, tooltip_text="Copy path")
+        copy.add_css_class("flat")
+        copy.connect("clicked", lambda _b: self.copy(vault["path"], "Path copied."))
+        where.append(path)
+        where.append(copy)
+        dlg.set_extra_child(where)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("remove", "Remove from list")
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r != "remove":
+                return
+            self.vaults = [v for v in self.vaults if v is not vault]
+            save_json(VAULTS_FILE, self.vaults)
+            if self.vault is vault:
+                self.vault = None
+                self.content_stack.set_visible_child_name("send")
+            self._refresh_vaults()
+
+        dlg.connect("response", resp)
+        dlg.present(self)
+
+    def select_vault(self, vault):
+        if vault is not self.vault:
+            self.vault = vault
+            self.vault_title.set_label(vault["name"])
+            self._show_locked()
+        self.content_stack.set_visible_child_name("vault")
+
+    # -- Adding a vault -------------------------------------------------------
+    def add_vault_dialog(self):
+        dlg = Adw.AlertDialog(heading="Add vault", body="A vault is an encrypted folder of files.")
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        name = Gtk.Entry(placeholder_text="Vault name", activates_default=True)
+        box.append(name)
+
+        how = Gtk.Label(label="Protection", xalign=0, margin_top=8)
+        how.add_css_class("heading")
+        box.append(how)
+        with_key = Gtk.CheckButton(label="Encrypt with my key (simplest, secure)", active=True)
+        with_password = Gtk.CheckButton(label="Use a password (shareable)")
+        with_password.set_group(with_key)
+        box.append(with_key)
+        box.append(with_password)
+
+        where = Gtk.Label(label="Location", xalign=0, margin_top=8)
+        where.add_css_class("heading")
+        box.append(where)
+        default_place = Gtk.CheckButton(label="Default", active=True)
+        chosen_place = Gtk.CheckButton(label="Select a location…")
+        chosen_place.set_group(default_place)
+        default_path = Gtk.Label(xalign=0, wrap=True, wrap_mode=2, margin_start=28)
+        default_path.add_css_class("dim-label")
+        default_path.add_css_class("caption")
+        box.append(default_place)
+        box.append(default_path)
+        box.append(chosen_place)
+
+        def show_default_path(*_):
+            default_path.set_label(str(VAULTS_DIR / (name.get_text().strip() + VAULT_SUFFIX)))
+
+        name.connect("changed", show_default_path)
+        show_default_path()
+
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("existing", "Add existing vault…")
+        dlg.add_response("create", "Create")
+        dlg.set_response_appearance("create", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("create")
+        dlg.set_close_response("cancel")
+
+        def update_create(*_):
+            # Answering closes the dialog, so Create can't be offered until the name will do.
+            text = name.get_text().strip()
+            usable = is_valid_vault_name(text)
+            dlg.set_response_enabled("create", usable)
+            (name.remove_css_class if usable or not text else name.add_css_class)("error")
+
+        name.connect("changed", update_create)
+        update_create()
+
+        def resp(_d, r):
+            if r == "existing":
+                self._pick_folder("Add existing vault", self._add_existing_vault)
+            if r != "create":
+                return
+            n = name.get_text().strip()
+            if not is_valid_vault_name(n):
+                self.error("Give the vault a name, without any “/” in it.")
+                return
+            mode = "password" if with_password.get_active() else "self"
+            if chosen_place.get_active():
+                self._pick_folder(
+                    "Where should the vault go?",
+                    lambda folder: self._begin_create(n, os.path.join(folder, n + VAULT_SUFFIX), mode),
+                )
+            else:
+                self._begin_create(n, str(VAULTS_DIR / (n + VAULT_SUFFIX)), mode)
+
+        dlg.connect("response", resp)
+        dlg.set_focus(name)
+        dlg.present(self)
+        return dlg
+
+    def _pick_folder(self, title, on_ok):
+        # Folders only, and checked again below, because the filter is a request: a desktop's
+        # own file chooser can ignore it, and some return a file picked in folder mode.
+        folders = Gtk.FileFilter(name="Folders")
+        folders.add_mime_type("inode/directory")
+        only_folders = Gio.ListStore.new(Gtk.FileFilter)
+        only_folders.append(folders)
+        dialog = Gtk.FileDialog(title=title, filters=only_folders, default_filter=folders)
+
+        def done(dlg, res):
+            try:
+                f = dlg.select_folder_finish(res)
+            except GLib.Error:
+                return
+            if f and f.get_path():
+                self._folder_chosen(f.get_path(), on_ok)
+
+        dialog.select_folder(self, None, done)
+
+    def _folder_chosen(self, path, on_ok):
+        if os.path.isdir(path):
+            on_ok(path)
+        else:
+            self.error("That's a file. Choose a folder.")
+
+    def _begin_create(self, name, path, mode):
+        if mode == "password":
+            self.ask_passphrase(
+                lambda p: self._create_vault(name, path, mode, p),
+                heading="Choose a vault password",
+                body="Anyone with this password and a copy of the vault can open it. "
+                "If you lose it, the files can't be recovered.",
+                confirm=True,
+            )
+        elif self.my_pubkey is None:
+            self.error("Your key isn't ready yet.")
+        else:
+            # Sealing the vault's key takes your private key, not just the public one.
+            self.with_passphrase("identity", lambda p: self._create_vault(name, path, mode, p))
+
+    def _create_vault(self, name, path, mode, secret):
+        try:
+            run_backend(["vault-create", "--dir", path, "--mode", mode], passphrase=secret)
+        except BackendError as e:
+            if "wrong passphrase" in str(e):
+                self.cache.forget("identity")
+            self._vault_error("Couldn't create the vault", str(e))
+            return
+        vault = self._remember_vault(name, path, mode)
+        self.cache.put(self._secret_key(vault), secret)
+        self.toast("Vault created.")
+
+    def _add_existing_vault(self, path):
+        mode = read_vault_mode(path)
+        if mode is None:
+            self._vault_error("That isn't a vault", "The folder you chose has no valid VAULT file.")
+            return
+        if any(v["path"] == path for v in self.vaults):
+            self.error("That vault is already in your list.")
+            return
+        self._remember_vault(vault_name_from_path(path), path, mode)
+
+    def _remember_vault(self, name, path, mode):
+        vault = {"name": name, "path": path, "mode": mode, "last_generation": 0}
+        self.vaults.append(vault)
+        save_json(VAULTS_FILE, self.vaults)
+        self.select_vault(vault)
+        self._refresh_vaults()
+        return vault
+
+    # -- Vault page -----------------------------------------------------------
+    def _build_vault_page(self):
+        # No tightening: it would narrow the page until the buttons wrapped, with room to spare.
+        clamp = Adw.Clamp(maximum_size=760, tightening_threshold=760, margin_top=24, margin_bottom=24, margin_start=16, margin_end=16)
+        col = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=16)
+        clamp.set_child(col)
+
+        self.vault_title = Gtk.Label(xalign=0, wrap=True, wrap_mode=2)
+        self.vault_title.add_css_class("title-2")
+        col.append(self.vault_title)
+
+        files_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        self.files_heading = Gtk.Label(label="Files", xalign=0, hexpand=True, ellipsize=3)  # 3: at the end
+        self.files_heading.add_css_class("heading")
+        # A toggle, lit while everything is selected; see _update_selection.
+        self.select_all_btn = Gtk.ToggleButton(label="Select all", tooltip_text="Select every file and folder in this vault")
+        self.select_all_btn.add_css_class("flat")
+        self.select_all_btn.connect("toggled", self._on_select_all)
+        self.select_mode_btn = Gtk.ToggleButton(tooltip_text="Select several at once")
+        self.select_mode_btn.set_child(Gtk.Label(label="Select multiple"))
+        self.select_mode_btn.add_css_class("flat")
+        self.select_mode_btn.add_css_class("vaultsend-select-mode")
+        self.select_mode_btn.connect("toggled", self._on_select_mode_toggled)
+        self.verify_btn = Gtk.Button(label="Verify all", tooltip_text="Check every file in this vault for tampering")
+        self.verify_btn.add_css_class("flat")
+        self.verify_btn.connect("clicked", lambda *_: self.vault_verify())
+        files_row.append(self.files_heading)
+        files_row.append(self.select_all_btn)
+        files_row.append(self.select_mode_btn)
+        files_row.append(self.verify_btn)
+        col.append(files_row)
+
+        unlock = Gtk.Button(label="Unlock", halign=Gtk.Align.CENTER)
+        unlock.add_css_class("pill")
+        unlock.add_css_class("suggested-action")
+        unlock.connect("clicked", lambda *_: self.vault_unlock())
+        locked = Adw.StatusPage(icon_name="changes-prevent-symbolic", title="Locked")
+        locked.set_child(unlock)
+
+        self.file_list = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE, valign=Gtk.Align.START)
+        self.file_list.add_css_class("boxed-list")
+        file_scroller = Gtk.ScrolledWindow(vexpand=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        file_scroller.set_child(self.file_list)
+
+        self.vault_body = Gtk.Stack(vexpand=True)
+        self.vault_body.add_named(locked, "locked")
+        self.vault_body.add_named(file_scroller, "files")
+        col.append(self.vault_body)
+
+        # Two groups that share a line when they fit and wrap when they don't. In one fixed
+        # row, these buttons would set the minimum width of the whole window, on every page.
+        self.vault_actions = Gtk.FlowBox(
+            selection_mode=Gtk.SelectionMode.NONE, max_children_per_line=2, row_spacing=8, column_spacing=6,
+        )
+        self.vault_actions.add_css_class("vaultsend-actions")
+        self.selection_buttons = []  # the ones with nothing to do until something is selected
+        for halign, buttons in (
+            (Gtk.Align.START, (("Add files…", self.vault_add_files), ("Add folder…", self.vault_add_folder))),
+            (Gtk.Align.END, (
+                ("Open", self.vault_open),
+                ("Extract…", self.vault_extract),
+                ("Share…", self.vault_share),
+                ("Delete", self.vault_delete),
+                ("Lock", self.vault_lock),
+            )),
+        ):
+            group = Gtk.Box(spacing=6, halign=halign)
+            for label, handler in buttons:
+                btn = Gtk.Button(label=label)
+                btn.connect("clicked", lambda _b, fn=handler: fn())
+                group.append(btn)
+                if handler in (self.vault_open, self.vault_extract, self.vault_share, self.vault_delete):
+                    self.selection_buttons.append(btn)
+            self.vault_actions.append(group)
+            group.get_parent().set_focusable(False)  # Tab goes to the buttons, not around them
+        col.append(self.vault_actions)
+
+        drop = Gtk.DropTarget.new(Gdk.FileList, Gdk.DragAction.COPY)
+        drop.connect("drop", self.on_vault_drop)
+        clamp.add_controller(drop)
+        self._show_locked()
+        return clamp
+
+    def _clear_files(self):
+        self.vault_entries = None
+        self.selected_entry = None
+        self.entry_checks = {}
+        child = self.file_list.get_first_child()
+        while child:
+            self.file_list.remove(child)
+            child = self.file_list.get_first_child()
+
+    def _show_locked(self):
+        """Drop the listing. It is only metadata, but locked means locked."""
+        self._clear_files()
+        self.select_mode_btn.set_active(False)
+        self.vault_body.set_visible_child_name("locked")
+        self.vault_actions.set_sensitive(False)
+        self.verify_btn.set_sensitive(False)
+        self.select_mode_btn.set_sensitive(False)
+        self._update_selection()
+
+    def _show_files(self, entries, ticked=()):
+        self._clear_files()
+        self.vault_entries = {e["path"]: e for e in entries}
+        several = self.select_mode_btn.get_active()
+        if not entries:
+            row = Adw.ActionRow(title="Nothing in this vault yet", subtitle="Add files or a folder, or drop them here.")
+            row.set_activatable(False)
+            self.file_list.append(row)
+
+        # Selecting one at a time, this is one radio group across every row, however deeply
+        # nested, with nothing selected until you pick. There's no hidden default for the
+        # actions: they wait. Selecting several, the same rows have independent boxes.
+        first_radio = None
+        folders = {}
+        for e in entries:
+            parent, _, name = e["path"].rpartition("/")
+            radio = Gtk.CheckButton(valign=Gtk.Align.CENTER, margin_start=entry_indent(e["path"]))
+            self.entry_checks[e["path"]] = radio
+            if several:
+                radio.connect("toggled", self._on_entry_ticked, e["path"])
+            else:
+                radio.set_group(first_radio)
+                first_radio = first_radio or radio
+                radio.connect("toggled", self._on_entry_toggled, e["path"])
+            if e["is_dir"]:
+                row = Adw.ExpanderRow(title=name + "/", use_markup=False)
+                row.set_expanded(e["path"] in self.expanded)
+                row.connect("notify::expanded", self._on_folder_expanded, e["path"])
+                folders[e["path"]] = row
+            else:
+                row = plain_row(name, human_bytes(e["size"]))
+                row.set_activatable_widget(radio)
+            row.add_prefix(radio)
+            if parent in folders:
+                folders[parent].add_row(row)
+            else:
+                self.file_list.append(row)
+
+        for path in ticked:
+            self.entry_checks[path].set_active(True)
+
+        self.vault_body.set_visible_child_name("files")
+        self.vault_actions.set_sensitive(True)
+        self.verify_btn.set_sensitive(True)
+        self.select_mode_btn.set_sensitive(True)
+        self._update_selection()
+
+    def _on_select_mode_toggled(self, btn):
+        if self.vault_entries is None:
+            return
+        # Whatever was selected stays selected on the way in. On the way out, a selection of
+        # several can't become one, so it starts over.
+        chosen = self.selected_entry
+        self._show_files(list(self.vault_entries.values()), ticked=[chosen] if chosen and btn.get_active() else [])
+
+    def _selection(self):
+        """What the actions act on: paths, with none inside another, ROOT_ENTRY for every
+        row in the vault, or nothing at all."""
+        if not self.select_mode_btn.get_active():
+            return [self.selected_entry] if self.selected_entry else []
+        boxes = self.entry_checks
+        if boxes and all(box.get_active() for box in boxes.values()):
+            return [ROOT_ENTRY]
+        return top_level_selection(p for p, box in boxes.items() if box.get_active())
+
+    def _update_selection(self):
+        chosen = self._selection() if self.vault_entries is not None else []
+        if self.vault_entries is None:
+            summary = "Files"
+        elif chosen == [ROOT_ENTRY]:
+            summary = "Files · all selected"
+        elif self.select_mode_btn.get_active():
+            summary = f"Files · {len(chosen)} selected"
+        else:
+            files = [e for e in self.vault_entries.values() if not e["is_dir"]]
+            count = "1 file" if len(files) == 1 else f"{len(files)} files"
+            summary = f"Files · {count}, {human_bytes(sum(e['size'] for e in files))}"
+        self.files_heading.set_label(summary)
+        for btn in self.selection_buttons:
+            btn.set_sensitive(bool(chosen))
+        everything = chosen == [ROOT_ENTRY]
+        self.select_all_btn.set_label("Select none" if everything else "Select all")
+        self.select_all_btn.set_sensitive(bool(self.vault_entries))
+        # Only one of the two is lit: Select all while everything is selected, else Select
+        # multiple while it's on.
+        self.syncing_select_all = True
+        self.select_all_btn.set_active(everything)
+        self.syncing_select_all = False
+        (self.select_mode_btn.add_css_class if everything else self.select_mode_btn.remove_css_class)(
+            "vaultsend-outranked"
+        )
+
+    def _on_select_all(self, _btn):
+        """Selecting everything takes the tick boxes, so this turns them on if they aren't."""
+        if self.syncing_select_all:
+            return
+        everything = self._selection() != [ROOT_ENTRY]
+        self.select_mode_btn.set_active(True)
+        self.syncing_checks = True
+        self._set_ticks(self.entry_checks, everything)
+        self.syncing_checks = False
+        self._update_selection()
+
+    def _on_entry_toggled(self, radio, path):
+        if radio.get_active():
+            self.selected_entry = path
+            self._update_selection()
+
+    def _set_ticks(self, paths, active):
+        for path in paths:
+            self.entry_checks[path].set_active(active)
+
+    def _on_entry_ticked(self, box, path):
+        """A folder's box speaks for what's inside it, so it is ticked only while all of that
+        is. The guard is for the boxes set from here."""
+        if self.syncing_checks:
+            return
+        self.syncing_checks = True
+        active = box.get_active()
+        self._set_ticks([p for p in self.entry_checks if p.startswith(path + "/")], active)
+        if not active:
+            self._set_ticks(parent_folders(path), False)
+        self.syncing_checks = False
+        self._update_selection()
+
+    def _on_folder_expanded(self, row, _pspec, path):
+        (self.expanded.add if row.get_expanded() else self.expanded.discard)(path)
+        if row.get_expanded():
+            return
+        # The actions follow the selection, so it can't stay on a row that's now hidden.
+        # Ticked itself, a folder is still in sight, and says what it's acting on.
+        if self.select_mode_btn.get_active():
+            if path in self.entry_checks and not self.entry_checks[path].get_active():
+                self.syncing_checks = True
+                self._set_ticks([p for p in self.entry_checks if p.startswith(path + "/")], False)
+                self.syncing_checks = False
+                self._update_selection()
+        elif self.selected_entry and self.selected_entry.startswith(path + "/"):
+            self.entry_checks[self.selected_entry].set_active(False)
+            self.selected_entry = None
+            self._update_selection()
+
+    # -- Vault operations -----------------------------------------------------
+    def _secret_key(self, vault):
+        return "identity" if vault["mode"] == "self" else ("vault", vault["path"])
+
+    def _vault_error(self, heading, message):
+        # A dialog, not a toast: a failed integrity check must not fade away by itself.
+        dlg = Adw.AlertDialog(heading=heading, body=message)
+        dlg.add_response("close", "Close")
+        dlg.present(self)
+
+    def _vault_failed(self, vault, message):
+        if "wrong pass" in message:
+            self.cache.forget(self._secret_key(vault))
+        if KEY_MISMATCH in message:
+            self._vault_error(
+                "Your key doesn't match this vault",
+                f"“{vault['name']}” was made for a different recipient, or with a different key, "
+                f"so yours can't unlock it.\n\nThe details: {message}.",
+            )
+            return
+        self._vault_error(f"Problem with “{vault['name']}”", message)
+
+    def with_vault_secret(self, vault, on_ok):
+        """The way into every operation: ask for (or recall) the vault's secret."""
+        if vault["mode"] == "self":
+            self.with_passphrase("identity", on_ok)
+        else:
+            self.with_passphrase(
+                self._secret_key(vault), on_ok,
+                heading="Unlock vault", body=f"Enter the password for “{vault['name']}”.",
+            )
+
+    def _vault_args(self, vault, command, *rest):
+        return [command, "--dir", vault["path"], *rest]
+
+    def vault_unlock(self):
+        vault = self.vault
+        self.with_vault_secret(vault, lambda p: self._list_vault(vault, p))
+
+    def _list_vault(self, vault, passphrase):
+        try:
+            out = run_backend(self._vault_args(vault, "vault-list"), passphrase=passphrase)
+            generation, entries = parse_listing(out.decode("utf-8"))
+        except (BackendError, ValueError, IndexError) as e:
+            self._vault_failed(vault, str(e))
+            return
+        self._apply_listing(vault, generation, entries)
+
+    def _apply_listing(self, vault, generation, entries):
+        if self.vault is not vault:
+            return
+        if generation >= vault["last_generation"]:
+            self._accept_listing(vault, generation, entries)
+            return
+        dlg = Adw.AlertDialog(
+            heading="This vault looks older",
+            body="This vault is older than the last version this device saw. It may have been "
+            "restored from a backup — or rolled back by someone else.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("open", "Open anyway")
+        dlg.set_response_appearance("open", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r == "open":
+                self._accept_listing(vault, generation, entries)
+            else:
+                self._show_locked()
+
+        dlg.connect("response", resp)
+        dlg.present(self)
+
+    def _accept_listing(self, vault, generation, entries):
+        vault["last_generation"] = generation
+        save_json(VAULTS_FILE, self.vaults)
+        self._show_files(entries)
+
+    def _run_vault_op(self, vault, passphrase, args, *, heading, subject, note, partial=None, relist=False, after=None):
+        def done(failure):
+            if failure is not None:
+                self._vault_failed(vault, failure)
+            elif relist and self.vault is vault:
+                self._list_vault(vault, passphrase)  # same secret, so no second prompt
+            if after:
+                after()
+
+        self._start_op(VaultOperation(
+            self, self._vault_args(vault, *args), passphrase=passphrase,
+            heading=heading, subject=subject, note=note, partial=partial, on_done=done,
+        ))
+
+    def vault_add_files(self):
+        dialog = Gtk.FileDialog(title="Add files")
+
+        def done(dlg, res):
+            try:
+                files = dlg.open_multiple_finish(res)
+            except GLib.Error:
+                return
+            self._add_paths([f.get_path() for f in files if f.get_path()])
+
+        dialog.open_multiple(self, None, done)
+
+    def vault_add_folder(self):
+        self._pick_folder("Add folder", lambda path: self._add_paths([path]))
+
+    def on_vault_drop(self, _target, value, _x, _y):
+        if self.vault_entries is None:
+            self.error("Unlock the vault first.")
+            return False
+        # The drag left the keyboard with the other app: without this, a passphrase typed
+        # into the prompt that comes next would go there instead.
+        self.present()
+        self._add_paths([f.get_path() for f in value.get_files() if f.get_path()])
+        return True
+
+    def _add_paths(self, paths):
+        if not paths or self.vault_entries is None:
+            return
+        # Into the selected folder, or the folder of the selected file. With several
+        # selected there's no one place that could mean, so into the top of the vault.
+        chosen = self._selection()
+        one = chosen[0] if len(chosen) == 1 else ROOT_ENTRY
+        selected = self.vault_entries.get(one)
+        dest = one if selected and selected["is_dir"] else one.rpartition("/")[0]
+        targets =[f"{dest}/{os.path.basename(p.rstrip('/'))}".lstrip("/") for p in paths]
+        clashes = [t for t in targets if t in self.vault_entries]
+        vault = self.vault
+
+        def run(replace):
+            args = ["vault-add"]
+            for p in paths:
+                args += ["--src", p]
+            if dest:
+                args += ["--dest", dest]
+            if replace:
+                args.append("--replace")
+            self.with_vault_secret(vault, lambda s: self._run_vault_op(
+                vault, s, args, heading="Adding to vault…", subject=vault["name"],
+                note="Added to the vault.", relist=True,
+            ))
+
+        if not clashes:
+            run(False)
+            return
+        dlg = Adw.AlertDialog(
+            heading="Replace existing items?",
+            body="Already in this vault:\n" + "\n".join(clashes[:5]) + ("\n…" if len(clashes) > 5 else ""),
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("replace", "Replace")
+        dlg.set_response_appearance("replace", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: run(True) if r == "replace" else None)
+        dlg.present(self)
+
+    def vault_extract(self):
+        vault, chosen = self.vault, self._selection()
+        if len(chosen) > 1:
+            suggested = f"{vault['name']} selection"
+        else:
+            suggested = vault["name"] if chosen == [ROOT_ENTRY] else os.path.basename(chosen[0])
+        self.with_vault_secret(vault, lambda s: self._save_then(
+            suggested,
+            lambda out: self._run_vault_op(
+                vault, s, ["vault-extract", *entry_args(chosen), "--out", out],
+                heading="Extracting…", subject=suggested, note="Extracted.", partial=out + STAGING_SUFFIX,
+            ),
+        ))
+
+    def vault_share(self):
+        """Pick who it's for, then where to save it. Adding someone new happens on top of this
+        dialog, so neither the selection nor the place in the flow is lost."""
+        vault, chosen = self.vault, self._selection()
+        if self.my_pubkey is None:
+            self.error("Your key isn't ready yet.")
+            return
+        what = vault["name"] if chosen == [ROOT_ENTRY] else os.path.basename(chosen[0])
+        if len(chosen) > 1:
+            what = f"{len(chosen)} items"
+        one_file = len(chosen) == 1 and chosen != [ROOT_ENTRY] and not self.vault_entries[chosen[0]]["is_dir"]
+        dlg = Adw.AlertDialog(
+            heading=f"Share “{what}”",
+            body="Encrypted so only you and the person you choose can read it. They open it by "
+            "dropping it on VaultSend's main page"
+            + (", which gives them this file." if one_file else ", which gives them a .tar archive of it all."),
+        )
+        contacts = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        contacts.add_css_class("boxed-list")
+
+        def show_contacts(focus_last=False):
+            child = contacts.get_first_child()
+            while child:
+                contacts.remove(child)
+                child = contacts.get_first_child()
+            if not self.contacts:
+                row = Adw.ActionRow(title="No contacts yet")
+                row.set_activatable(False)
+                contacts.append(row)
+                return
+            for c in self.contacts:
+                row = plain_row(c["name"], short(c["pubkey"]))
+                row.set_activatable(True)
+                row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+                row.connect("activated", lambda _r, contact=c: (dlg.close(), self._share_with(vault, chosen, contact)))
+                contacts.append(row)
+            if focus_last:
+                row.grab_focus()  # brings someone just added into view, ready to pick
+
+        show_contacts()
+        scroller = Gtk.ScrolledWindow(propagate_natural_height=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_max_content_height(260)
+        scroller.set_child(contacts)
+        add_new = Gtk.Label(label='<a href="add-contact">Add new contact</a>', use_markup=True, xalign=0)
+
+        def on_add_new(_label, _uri):
+            self.add_contact_dialog(on_added=lambda: show_contacts(focus_last=True))
+            return True  # handled: this isn't a link for a browser to follow
+
+        add_new.connect("activate-link", on_add_new)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        box.append(scroller)
+        box.append(add_new)
+        dlg.set_extra_child(box)
+        dlg.add_response("cancel", "Cancel")
+        dlg.set_close_response("cancel")
+        dlg.present(self)
+
+    def _share_with(self, vault, chosen, contact):
+        suggested = share_file_name(vault["name"], chosen, self.vault_entries)
+        # You as well, as when encrypting anything else: you can still read what you sent.
+        recipients = dict.fromkeys((contact["pubkey"], self.my_pubkey))
+        to = [arg for pubkey in recipients for arg in ("--to", pubkey)]
+        self.with_vault_secret(vault, lambda s: self._save_then(
+            suggested,
+            lambda out: self._run_vault_op(
+                vault, s, ["vault-share", *entry_args(chosen), *to, "--out", out],
+                heading=f"Encrypting for {contact['name']}…", subject=suggested,
+                note=f"Encrypted for {contact['name']}. Send them the saved file.",
+                partial=out + STAGING_SUFFIX,
+            ),
+        ))
+
+    def vault_delete(self):
+        vault, chosen = self.vault, self._selection()
+        args = ["vault-remove", *entry_args(chosen)]
+        if chosen == [ROOT_ENTRY]:
+            count = len(files_in_selection(chosen, self.vault_entries))
+            heading = "Delete everything in this vault?"
+            body = (f"Everything in “{vault['name']}” ({'1 file' if count == 1 else f'{count} files'}, "
+                    "plus any folders) will be permanently deleted. The vault itself stays, empty. "
+                    "This can't be undone.")
+            subject = vault["name"]
+            args = ["vault-remove", "--all"]
+        elif len(chosen) > 1:
+            heading = f"Delete {len(chosen)} items from vault?"
+            body = ("These, and everything in any folders among them, will be permanently deleted "
+                    "from this vault. This can't be undone.\n\n"
+                    + "\n".join(chosen[:5]) + ("\n…" if len(chosen) > 5 else ""))
+            subject = f"{len(chosen)} items"
+        else:
+            entry = chosen[0]
+            is_dir = self.vault_entries[entry]["is_dir"]
+            heading = "Delete from vault?"
+            body = (f"“{entry}”{' and everything in it' if is_dir else ''} will be permanently "
+                    "deleted from this vault. This can't be undone.")
+            subject = os.path.basename(entry)
+        dlg = Adw.AlertDialog(heading=heading, body=body)
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("delete", "Delete")
+        dlg.set_response_appearance("delete", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r == "delete":
+                self.with_vault_secret(vault, lambda s: self._run_vault_op(
+                    vault, s, args, heading="Deleting…", subject=subject, note="Deleted.", relist=True,
+                ))
+
+        dlg.connect("response", resp)
+        dlg.present(self)
+
+    def vault_verify(self):
+        vault = self.vault
+        self.with_vault_secret(vault, lambda s: self._run_vault_op(
+            vault, s, ["vault-check"],
+            heading="Verifying…", subject=vault["name"], note="Every file verified.",
+        ))
+
+    def vault_lock(self):
+        vault = self.vault
+
+        def lock():
+            self.cache.forget(self._secret_key(vault))
+            self._discard_copies(vault)
+            self._show_locked()
+
+        self._confirm_discard(vault, lock)
+
+    # -- Opening a file in another app ----------------------------------------
+    def vault_open(self):
+        """The backend decrypts a copy into a private in-memory folder, and the file's
+        default app opens it from there. This process only ever handles its path.
+
+        Once another app has the file, this one can't vouch for it: the app can write
+        its own copies to disk. So the first use says so and asks for an acknowledgement."""
+        vault = self.vault
+        files = files_in_selection(self._selection(), self.vault_entries)
+        selected = self.vault_entries.get(self.selected_entry)
+        if not self.select_mode_btn.get_active() and (selected is None or selected["is_dir"]):
+            self.error("Select a file to open.")
+            return
+        if not files:
+            self.error("Those are empty folders: there's no file in them to open.")
+            return
+        if self.settings["open_explained"]:
+            self._ask_then_open(vault, files)
+            return
+        dlg = Adw.AlertDialog(
+            heading="Opening outside the vault",
+            body="VaultSend will decrypt a copy into memory and open it in another app. That app "
+            "may save its own unencrypted copies to your disk, such as recovery files and "
+            "thumbnails, and VaultSend can't remove those.\n\nThe copy is deleted when you lock "
+            "the vault or close VaultSend. Changes aren't saved back to the vault.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("understand", "I understand")
+        dlg.set_response_appearance("understand", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r == "understand":
+                self.settings["open_explained"] = True
+                save_json(SETTINGS_FILE, self.settings)
+                self._ask_then_open(vault, files)
+
+        dlg.connect("response", resp)
+        dlg.present(self)
+
+    def _ask_then_open(self, vault, files):
+        if len(files) <= OPEN_ASK_ABOVE:
+            self._open_entries(vault, files)
+            return
+        dlg = Adw.AlertDialog(heading=f"Open {len(files)} files?", body="Each one starts in its default app.")
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("open", "Open them all")
+        dlg.set_response_appearance("open", Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: self._open_entries(vault, files) if r == "open" else None)
+        dlg.present(self)
+
+    def _open_entries(self, vault, entries):
+        base = memory_folder()
+        if base is None:
+            self._vault_error(
+                "Can't open this file",
+                "This system has no in-memory folder to put it in, and VaultSend won't write it to "
+                "disk by itself. Use Extract… to save it somewhere you choose.",
+            )
+            return
+        if self.current_op is not None:
+            self.error("Another file is still being processed.")
+            return
+
+        def extract(secret):
+            # Several come out together, with one unlock and one percentage, into a folder
+            # of their own, and then move to a folder each, as a single file gets.
+            several = len(entries) > 1
+            name = "several files" if several else os.path.basename(entries[0])
+            try:
+                folder = tempfile.mkdtemp(prefix=OPEN_PREFIX, dir=base)
+            except OSError as e:
+                self._vault_error("Can't open this file", str(e))
+                return
+            # Tracked from here on, so it is deleted however this goes.
+            copy = {"vault": vault["path"], "name": name, "folder": folder,
+                    "path": os.path.join(folder, name), "stamp": None}
+            self.opened.append(copy)
+
+            def extracted():
+                if several:
+                    copies = self._separate_copies(vault, entries, copy["path"], base)
+                    self._discard_copy(copy)
+                    for each in copies:
+                        self._launch_copy(each)
+                    return
+                copy["stamp"] = file_stamp(copy["path"])
+                if copy["stamp"] is None:  # failed or cancelled: the reason is already shown
+                    self._discard_copy(copy)
+                else:
+                    self._launch_copy(copy)
+
+            self._run_vault_op(
+                vault, secret, ["vault-extract", *entry_args(entries), "--out", copy["path"]],
+                heading="Opening…", subject=f"{len(entries)} files" if several else name,
+                note=f"Opening {len(entries)} files in their default apps." if several else "Opening in its default app.",
+                partial=copy["path"] + STAGING_SUFFIX, after=extracted,
+            )
+
+        self.with_vault_secret(vault, extract)
+
+    def _separate_copies(self, vault, entries, extracted_to, base):
+        """Move each file of a joint extract to its own folder, so that its name is its own
+        and one can be deleted without the rest. Only ever a rename in memory: this process
+        doesn't read them. No file there means it failed, and the reason is already shown."""
+        copies = []
+        for entry in entries:
+            source = os.path.join(extracted_to, entry)
+            if not os.path.isfile(source):
+                continue
+            name = os.path.basename(entry)
+            folder = tempfile.mkdtemp(prefix=OPEN_PREFIX, dir=base)
+            copy = {"vault": vault["path"], "name": name, "folder": folder,
+                    "path": os.path.join(folder, name), "stamp": None}
+            self.opened.append(copy)
+            os.rename(source, copy["path"])
+            copy["stamp"] = file_stamp(copy["path"])
+            copies.append(copy)
+        return copies
+
+    def _launch_copy(self, copy):
+        def done(launcher, res):
+            try:
+                launcher.launch_finish(res)
+            except GLib.Error:
+                self._discard_copy(copy)
+                self._vault_error(
+                    "Couldn't open that file",
+                    "No app on this system could open it. Use Extract… to save it somewhere you "
+                    "choose instead.",
+                )
+
+        Gtk.FileLauncher(file=Gio.File.new_for_path(copy["path"])).launch(self, None, done)
+
+    def _copies(self, vault=None):
+        return [c for c in self.opened if vault is None or c["vault"] == vault["path"]]
+
+    def _discard_copy(self, copy):
+        shutil.rmtree(copy["folder"], ignore_errors=True)
+        self.opened.remove(copy)
+
+    def _discard_copies(self, vault=None):
+        for copy in self._copies(vault):
+            self._discard_copy(copy)
+
+    def _edited_copies(self, vault=None):
+        return [
+            c["name"] for c in self._copies(vault)
+            if c["stamp"] is not None and file_stamp(c["path"]) != c["stamp"]
+        ]
+
+    def _confirm_discard(self, vault, then):
+        """Run `then`, which deletes opened copies, asking first if any have been edited,
+        because that work has nowhere else to go. Edits still unsaved in another app can't
+        be seen from here; the warning before the first Open covers those."""
+        edited = self._edited_copies(vault)
+        if not edited:
+            then()
+            return
+        dlg = Adw.AlertDialog(
+            heading="Changes will be lost",
+            body="These opened files have changed, and changes aren't saved back to the vault:\n"
+            + "\n".join(edited[:5]) + ("\n…" if len(edited) > 5 else "")
+            + "\n\nTo keep them, use Save As in that app to save elsewhere, then add the file back.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        dlg.add_response("discard", "Delete changes")
+        dlg.set_response_appearance("discard", Adw.ResponseAppearance.DESTRUCTIVE)
+        dlg.set_default_response("cancel")
+        dlg.set_close_response("cancel")
+        dlg.connect("response", lambda _d, r: then() if r == "discard" else None)
+        dlg.present(self)
+
+    def _on_close_request(self, _window):
+        if not self._edited_copies():
+            return False  # nothing to lose; do_shutdown deletes the copies
+
+        def close():
+            self._discard_copies()
+            self.close()
+
+        self._confirm_discard(None, close)
+        return True
+
 
 class VaultSend(Adw.Application):
     def __init__(self):
@@ -1046,6 +2609,12 @@ class VaultSend(Adw.Application):
             self.window = Window(self)
         self.window.present()
         self.window.ensure_identity()
+
+    def do_shutdown(self):
+        if self.window:
+            self.window.cache.clear()
+            self.window._discard_copies()
+        Adw.Application.do_shutdown(self)
 
 
 def main():
