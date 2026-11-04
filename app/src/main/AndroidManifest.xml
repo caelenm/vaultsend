@@ -34,6 +34,14 @@
                 <data android:mimeType="*/*" />
             </intent-filter>
 
+            <!-- Several files at once: added to the vault that's open (the desktop's
+                 drop onto a vault). -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+
             <!-- Receive plain text shared into the app (drops into the box). -->
             <intent-filter>
                 <action android:name="android.intent.action.SEND" />
@@ -61,5 +69,19 @@
                 <data android:pathPattern=".*\\.age" />
             </intent-filter>
         </activity>
+
+        <!-- Open: hands a decrypted copy from a vault to another app, read-only,
+             through a content:// URI granted for that one view. Only the cache's
+             open/ folder is reachable through it (res/xml/file_paths.xml), and
+             the provider isn't exported, so nothing can ask it for anything else. -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.open"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
     </application>
 </manifest>

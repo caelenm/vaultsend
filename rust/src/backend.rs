@@ -23,6 +23,7 @@ use std::io::{self, BufReader, Read, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::collections::BTreeMap;
 use std::sync::Mutex;
 
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
@@ -38,7 +39,7 @@ pub type R<T> = Result<T, String>;
 fn identity_path(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("identity.age")
 }
-fn pubkey_path(data_dir: &str) -> PathBuf {
+pub(crate) fn pubkey_path(data_dir: &str) -> PathBuf {
     Path::new(data_dir).join("pubkey")
 }
 
@@ -50,7 +51,7 @@ fn pubkey_path(data_dir: &str) -> PathBuf {
 // what this device accepts (its own target + 4), so importing it failed with
 // "wrong passphrase". 18 is what age, rage, the desktop app and the web build
 // use, so an identity.age made anywhere opens everywhere.
-const SCRYPT_LOG_N: u8 = 18;
+pub(crate) const SCRYPT_LOG_N: u8 = 18;
 // Highest work factor accepted when unlocking or importing. Above the fixed
 // value so keys from earlier, calibrating builds still open; capped at 2^20
 // (scrypt then needs 1 GiB) because a phone cannot afford more, and the web
@@ -58,7 +59,7 @@ const SCRYPT_LOG_N: u8 = 18;
 const SCRYPT_MAX_LOG_N: u8 = 20;
 
 /// Encryptor for the identity file at the fixed work factor.
-fn identity_encryptor(passphrase: SecretString) -> R<age::Encryptor> {
+pub(crate) fn identity_encryptor(passphrase: SecretString) -> R<age::Encryptor> {
     let mut recipient = age::scrypt::Recipient::new(passphrase);
     recipient.set_work_factor(SCRYPT_LOG_N);
     age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
@@ -93,9 +94,13 @@ fn decrypt_identity<'a, RR: Read + 'a>(
 // CR/LF without allocating an un-zeroed copy, and move the validated text into a
 // SecretString (wiped on drop). Mirrors the desktop `read_passphrase`, minus the
 // pipe — there is no fd to read on Android.
+//
+// The returned RamLock keeps the passphrase's bytes out of swap; hold it for as
+// long as the SecretString is in use.
 // ---------------------------------------------------------------------------
-fn passphrase_from_bytes(raw: &[u8]) -> R<SecretString> {
-    let buf: Zeroizing<Vec<u8>> = Zeroizing::new(raw.to_vec());
+pub(crate) fn passphrase_from_bytes(raw: &[u8]) -> R<(SecretString, RamLock)> {
+    let mut buf = secret_buffer();
+    buf.extend_from_slice(raw);
     let end = buf
         .iter()
         .rposition(|&b| b != b'\n' && b != b'\r')
@@ -105,7 +110,137 @@ fn passphrase_from_bytes(raw: &[u8]) -> R<SecretString> {
     }
     let pass =
         std::str::from_utf8(&buf[..end]).map_err(|_| "passphrase is not valid UTF-8".to_string())?;
-    Ok(SecretString::from(pass.to_owned()))
+    // The owned String moved into SecretString is zeroized on drop; `buf` is too.
+    let passphrase = SecretString::from(pass.to_owned());
+    let ram = lock_in_ram(passphrase.expose_secret().as_bytes());
+    Ok((passphrase, ram))
+}
+
+// ---------------------------------------------------------------------------
+// Keeping secret buffers out of swap (ported from the desktop vaults branch).
+//
+// The desktop backend calls mlockall once, and since that's all or nothing, also
+// locks each secret buffer with mlock (`lock_in_ram`), never unlocking because the
+// process exits when the operation ends. This library lives in the long-lived app
+// process instead (see lib.rs), so each lock is undone when its buffer is dropped:
+// otherwise locked pages would pile up for the life of the app, and Android's
+// limit on locked memory is small. mlock isn't counted per call, and two small
+// buffers can share a page, so pages are reference-counted here and a page is only
+// unlocked once nothing locked on it is left. Best-effort, as on desktop: a refused
+// mlock is ignored.
+// ---------------------------------------------------------------------------
+static LOCKED_PAGES: Mutex<BTreeMap<usize, usize>> = Mutex::new(BTreeMap::new());
+
+fn page_size() -> usize {
+    // SAFETY: sysconf only reads a configuration value.
+    let size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if size > 0 { size as usize } else { 4096 }
+}
+
+/// Pages locked on behalf of one buffer; unlocks them (when no other buffer still
+/// needs them) when dropped. Bind it alongside the secret it covers.
+#[must_use = "the buffer is unlocked again as soon as this is dropped"]
+pub(crate) struct RamLock {
+    pages: Option<(usize, usize)>,
+}
+
+/// Keep one secret buffer out of swap until the returned guard is dropped.
+pub(crate) fn lock_in_ram<T>(buffer: &[T]) -> RamLock {
+    let len = std::mem::size_of_val(buffer);
+    if len == 0 {
+        return RamLock { pages: None };
+    }
+    let size = page_size();
+    let first = buffer.as_ptr() as usize & !(size - 1);
+    let last = (buffer.as_ptr() as usize + len - 1) & !(size - 1);
+    let mut pages = LOCKED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+    for page in (first..=last).step_by(size) {
+        let count = pages.entry(page).or_insert(0);
+        if *count == 0 {
+            // SAFETY: mlock only reads the address range, which `buffer` borrows.
+            let _ = unsafe { libc::mlock(page as *const libc::c_void, size) };
+        }
+        *count += 1;
+    }
+    RamLock { pages: Some((first, last)) }
+}
+
+impl Drop for RamLock {
+    fn drop(&mut self) {
+        let Some((first, last)) = self.pages else { return };
+        let size = page_size();
+        let mut pages = LOCKED_PAGES.lock().unwrap_or_else(|e| e.into_inner());
+        for page in (first..=last).step_by(size) {
+            if let Some(count) = pages.get_mut(&page) {
+                *count -= 1;
+                if *count == 0 {
+                    pages.remove(&page);
+                    // SAFETY: munlock only changes the page's residency. If the memory
+                    // has been returned to the system since, it fails, harmlessly.
+                    let _ = unsafe { libc::munlock(page as *const libc::c_void, size) };
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn page_of(address: usize) -> usize {
+    address & !(page_size() - 1)
+}
+
+/// How many live RamLocks cover this page.
+#[cfg(test)]
+pub(crate) fn lock_count(page: usize) -> usize {
+    LOCKED_PAGES.lock().unwrap_or_else(|e| e.into_inner()).get(&page).copied().unwrap_or(0)
+}
+
+/// Room for a passphrase or a key's text without reallocating, which would leave an
+/// unlocked, unwiped copy behind. A longer passphrase still works; its growth just isn't locked.
+const SECRET_CAPACITY: usize = 1024;
+
+/// A buffer for secret bytes: wiped on drop, locked before anything is put in it.
+/// Fields drop in order, so it is wiped before it is unlocked.
+pub(crate) struct SecretBuf {
+    buf: Zeroizing<Vec<u8>>,
+    _ram: RamLock,
+}
+
+impl std::ops::Deref for SecretBuf {
+    type Target = Vec<u8>;
+    fn deref(&self) -> &Vec<u8> {
+        &self.buf
+    }
+}
+
+impl std::ops::DerefMut for SecretBuf {
+    fn deref_mut(&mut self) -> &mut Vec<u8> {
+        &mut self.buf
+    }
+}
+
+pub(crate) fn secret_buffer() -> SecretBuf {
+    let mut buf = Zeroizing::new(Vec::with_capacity(SECRET_CAPACITY));
+    let ram = lock_in_ram(buf.spare_capacity_mut());
+    SecretBuf { buf, _ram: ram }
+}
+
+/// A secret held for longer than one call (the session key, a remembered vault
+/// key), locked in RAM for as long as it is held. Wiped, then unlocked, on drop.
+pub(crate) struct Held {
+    secret: SecretString,
+    _ram: RamLock,
+}
+
+impl Held {
+    pub(crate) fn new(secret: SecretString) -> Held {
+        let ram = lock_in_ram(secret.expose_secret().as_bytes());
+        Held { secret, _ram: ram }
+    }
+
+    pub(crate) fn expose(&self) -> &str {
+        self.secret.expose_secret()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -131,7 +266,13 @@ fn passphrase_from_bytes(raw: &[u8]) -> R<SecretString> {
 // ultimately protects it is the same one the README describes — the app's private
 // UID sandbox plus SELinux.
 // ---------------------------------------------------------------------------
-static SESSION: Mutex<Option<SecretString>> = Mutex::new(None);
+static SESSION: Mutex<Option<Held>> = Mutex::new(None);
+
+fn hold_session(identity: &x25519::Identity) {
+    if let Ok(mut guard) = SESSION.lock() {
+        *guard = Some(Held::new(identity.to_string()));
+    }
+}
 
 /// Verify `passphrase` against the stored identity and, on success, cache the
 /// unlocked secret key for this session. Returns the public key. A wrong
@@ -143,15 +284,17 @@ pub fn unlock(data_dir: &str, passphrase: &[u8]) -> R<String> {
     let mut guard = SESSION
         .lock()
         .map_err(|_| "internal error: session lock poisoned".to_string())?;
-    *guard = Some(identity.to_string());
+    *guard = Some(Held::new(identity.to_string()));
     Ok(public)
 }
 
-/// Drop the cached secret key (zeroized on drop). Safe to call when already locked.
+/// Drop the cached secret key (zeroized on drop), and every remembered vault key
+/// with it. Safe to call when already locked.
 pub fn lock() {
     if let Ok(mut guard) = SESSION.lock() {
         *guard = None;
     }
+    crate::vault::forget_all();
 }
 
 /// True if a secret key is currently held for this session.
@@ -162,17 +305,19 @@ pub fn is_unlocked() -> bool {
 /// Parse the cached secret into an identity for one operation. The lock is held
 /// only long enough to copy the secret text out (into zeroizing storage), so a
 /// long file decrypt never blocks `lock()`/`is_unlocked()`.
-fn session_identity() -> R<x25519::Identity> {
-    let secret_copy: Zeroizing<String> = {
+pub(crate) fn session_identity() -> R<x25519::Identity> {
+    let mut secret_copy = secret_buffer();
+    {
         let guard = SESSION
             .lock()
             .map_err(|_| "internal error: session lock poisoned".to_string())?;
         let secret = guard
             .as_ref()
             .ok_or_else(|| "locked — enter your passphrase to unlock".to_string())?;
-        Zeroizing::new(secret.expose_secret().to_owned())
-    };
-    secret_copy
+        secret_copy.extend_from_slice(secret.expose().as_bytes());
+    }
+    std::str::from_utf8(&secret_copy)
+        .map_err(|_| "session identity is corrupt".to_string())?
         .trim()
         .parse::<x25519::Identity>()
         .map_err(|e| format!("session identity is corrupt: {e}"))
@@ -187,7 +332,7 @@ fn session_identity() -> R<x25519::Identity> {
 /// recreated, so we never write through a pre-placed symlink. On Android the
 /// containing directory is already the app's private storage, but the 0600 mode
 /// and no-clobber semantics are kept exactly.
-fn open_private_new(path: &Path) -> R<File> {
+pub(crate) fn open_private_new(path: &Path) -> R<File> {
     fn create(path: &Path) -> io::Result<File> {
         fs::OpenOptions::new()
             .write(true)
@@ -230,11 +375,12 @@ pub fn keygen(data_dir: &str, passphrase: &[u8]) -> R<String> {
     if identity_is_valid(data_dir) {
         return Err("an identity already exists; refusing to overwrite it".into());
     }
-    let passphrase = passphrase_from_bytes(passphrase)?;
+    let (passphrase, _pass_ram) = passphrase_from_bytes(passphrase)?;
 
     let identity = x25519::Identity::generate();
     let public = identity.to_public().to_string(); // "age1..."
     let secret = identity.to_string(); // SecretString "AGE-SECRET-KEY-1..."
+    let _secret_ram = lock_in_ram(secret.expose_secret().as_bytes());
 
     // Write to a temp file then atomically rename into place, so identity.age is
     // only ever absent or fully written — never a partial/empty file a later run
@@ -271,9 +417,7 @@ pub fn keygen(data_dir: &str, passphrase: &[u8]) -> R<String> {
 
     // The user just proved knowledge of the passphrase by choosing it; unlock the
     // session so the first decrypt doesn't immediately re-ask for it.
-    if let Ok(mut guard) = SESSION.lock() {
-        *guard = Some(identity.to_string());
-    }
+    hold_session(&identity);
     Ok(public)
 }
 
@@ -301,12 +445,12 @@ pub fn import_identity<R2: Read>(data_dir: &str, passphrase: &[u8], mut input: R
 
     // Verify structure + passphrase by fully decrypting to the secret key. If any
     // of this fails, nothing has been written and the device is unchanged.
-    let pass = passphrase_from_bytes(passphrase)?;
+    let (pass, _pass_ram) = passphrase_from_bytes(passphrase)?;
     let dec = age::Decryptor::new(BufReader::new(io::Cursor::new(&bytes)))
         .map_err(|_| "that file is not a valid age identity".to_string())?;
     let mut id_reader =
         decrypt_identity(dec, pass, "wrong passphrase, or that is not a VaultSend identity file")?;
-    let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut secret_bytes = secret_buffer();
     id_reader
         .read_to_end(&mut secret_bytes)
         .map_err(|e| format!("reading identity: {e}"))?;
@@ -340,9 +484,7 @@ pub fn import_identity<R2: Read>(data_dir: &str, passphrase: &[u8], mut input: R
     fs::write(pubkey_path(data_dir), &public).map_err(|e| format!("writing public key: {e}"))?;
 
     // Unlock the freshly imported identity for this session.
-    if let Ok(mut guard) = SESSION.lock() {
-        *guard = Some(identity.to_string());
-    }
+    hold_session(&identity);
     Ok(public)
 }
 pub fn pubkey(data_dir: &str) -> R<String> {
@@ -374,8 +516,8 @@ pub fn status(data_dir: &str) -> R<String> {
 }
 
 /// Decrypt identity.age with the passphrase and return the parsed identity.
-fn load_identity(data_dir: &str, passphrase: &[u8]) -> R<x25519::Identity> {
-    let passphrase = passphrase_from_bytes(passphrase)?;
+pub(crate) fn load_identity(data_dir: &str, passphrase: &[u8]) -> R<x25519::Identity> {
+    let (passphrase, _pass_ram) = passphrase_from_bytes(passphrase)?;
     let id_file = File::open(identity_path(data_dir))
         .map_err(|_| "no identity yet — run keygen first".to_string())?;
     let dec = age::Decryptor::new(BufReader::new(id_file))
@@ -384,7 +526,7 @@ fn load_identity(data_dir: &str, passphrase: &[u8]) -> R<x25519::Identity> {
         decrypt_identity(dec, passphrase, "wrong passphrase, or the identity file is damaged")?;
     // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
     // drop rather than left behind in freed heap.
-    let mut secret_bytes: Zeroizing<Vec<u8>> = Zeroizing::new(Vec::new());
+    let mut secret_bytes = secret_buffer();
     id_reader
         .read_to_end(&mut secret_bytes)
         .map_err(|e| format!("reading identity: {e}"))?;
@@ -431,21 +573,25 @@ pub fn encrypt<R2: Read, W: Write>(
     let encryptor =
         age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
             .map_err(|e| format!("preparing encryption: {e}"))?;
-
-    let format = if armor {
-        Format::AsciiArmor
-    } else {
-        Format::Binary
-    };
-    let armored =
-        ArmoredWriter::wrap_output(output, format).map_err(|e| format!("preparing output: {e}"))?;
-    let mut stream = encryptor
-        .wrap_output(armored)
-        .map_err(|e| format!("encrypting: {e}"))?;
-    io::copy(&mut input, &mut stream).map_err(|e| format!("encrypting: {e}"))?;
-    let armored = stream.finish().map_err(|e| format!("finishing: {e}"))?;
-    armored.finish().map_err(|e| format!("finishing: {e}"))?;
+    encrypt_to(encryptor, armor, &mut input, output)?;
     Ok(())
+}
+
+/// Stream `reader` through `encryptor` into `out`, returning `out` once finished.
+/// The same helper the desktop backend's encrypt and vault code share.
+pub(crate) fn encrypt_to<W: Write>(
+    encryptor: age::Encryptor,
+    armor: bool,
+    mut reader: impl Read,
+    out: W,
+) -> R<W> {
+    let format = if armor { Format::AsciiArmor } else { Format::Binary };
+    let armored =
+        ArmoredWriter::wrap_output(out, format).map_err(|e| format!("preparing output: {e}"))?;
+    let mut stream = encryptor.wrap_output(armored).map_err(|e| format!("encrypting: {e}"))?;
+    io::copy(&mut reader, &mut stream).map_err(|e| format!("encrypting: {e}"))?;
+    let armored = stream.finish().map_err(|e| format!("finishing: {e}"))?;
+    armored.finish().map_err(|e| format!("finishing: {e}"))
 }
 
 /// Decrypt `input` (binary or ASCII-armored, detected automatically) to `output`,
@@ -574,14 +720,17 @@ fn decrypt_file_staged<R2: Read, W: Write>(
     result
 }
 
+/// The session store, the remembered vault keys and tmpdir() naming are
+/// process-global; tests that touch them hold this, so one test's keygen, unlock or
+/// lock can't perturb another's view of that shared state.
+#[cfg(test)]
+pub(crate) static TEST_GUARD: Mutex<()> = Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
 
-    // The session store and tmpdir() naming are process-global; serialize tests so
-    // one test's keygen/unlock can't perturb another's view of that shared state.
-    static TEST_GUARD: Mutex<()> = Mutex::new(());
 
     fn tmpdir() -> String {
         let p = std::env::temp_dir().join(format!("vaultsend-test-{}", std::process::id()));

@@ -28,7 +28,10 @@ class MainActivity : ComponentActivity() {
     // simply left in the background). Long enough to survive a trip through the
     // system file picker, which also puts this activity in the background.
     private val lockHandler = Handler(Looper.getMainLooper())
-    private val backgroundLock = Runnable { vm.lockSession() }
+    // Opened vault copies are kept: the user is probably looking at one in
+    // another app, which is what put this one in the background. They go on
+    // Lock now, a vault's Lock, and when the app closes.
+    private val backgroundLock = Runnable { vm.lockForBackground() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -43,7 +46,11 @@ class MainActivity : ComponentActivity() {
         // Handle a share/"open with" intent only on a fresh start; on rotation
         // (savedInstanceState != null) the pending content is already in the VM
         // and must not be re-applied.
-        if (savedInstanceState == null) handleShareIntent(intent)
+        if (savedInstanceState == null) {
+            // Copies Open left behind when the app was last killed (see OpenCopies.kt).
+            vm.backend.discardCopies()
+            handleShareIntent(intent)
+        }
 
         setContent {
             VaultSendTheme {
@@ -70,6 +77,12 @@ class MainActivity : ComponentActivity() {
     private fun handleShareIntent(intent: Intent?) {
         if (intent == null) return
         when (intent.action) {
+            Intent.ACTION_SEND_MULTIPLE -> {
+                // Several files at once only make sense for a vault: added to the open one.
+                val uris = IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
+                    ?.filter { isContentUri(it) }
+                if (!uris.isNullOrEmpty()) vm.offerShareMany(uris)
+            }
             Intent.ACTION_SEND -> {
                 val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
                 if (uri != null) {
@@ -114,6 +127,7 @@ class MainActivity : ComponentActivity() {
         if (isFinishing) {
             lockHandler.removeCallbacks(backgroundLock)
             vm.backend.lock()
+            vm.discardCopies()
         }
     }
 

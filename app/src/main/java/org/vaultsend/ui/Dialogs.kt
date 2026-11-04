@@ -11,7 +11,6 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
@@ -22,15 +21,14 @@ import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -39,6 +37,8 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -51,43 +51,27 @@ import org.vaultsend.Contact
 import org.vaultsend.looksLikePubkey
 import org.vaultsend.shortKey
 
-// --- Contacts drawer --------------------------------------------------------
+// --- Contacts (in the side drawer; see SidebarDrawer) ----------------------
 
 @Composable
-fun ContactsDrawer(
+fun ContactsList(
     contacts: List<Contact>,
-    onAdd: () -> Unit,
     onCopy: (Contact) -> Unit,
     onDelete: (Contact) -> Unit,
 ) {
-    ModalDrawerSheet {
-        Column(modifier = Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically,
-            ) {
-                Text("Contacts", style = MaterialTheme.typography.titleLarge)
-                IconButton(onClick = onAdd) {
-                    Icon(Icons.Filled.Add, contentDescription = "Add contact")
-                }
-            }
-            HorizontalDivider()
-            if (contacts.isEmpty()) {
-                Text(
-                    "No contacts yet. Add someone's public key so you can encrypt to them.",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
-            } else {
-                Column(
-                    modifier = Modifier.verticalScroll(rememberScrollState()),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    for (contact in contacts) {
-                        ContactRow(contact = contact, onCopy = { onCopy(contact) }, onDelete = { onDelete(contact) })
-                    }
-                }
+    if (contacts.isEmpty()) {
+        Text(
+            "No contacts yet. Add someone's public key so you can encrypt to them.",
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    } else {
+        Column(
+            modifier = Modifier.verticalScroll(rememberScrollState()),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+        ) {
+            for (contact in contacts) {
+                ContactRow(contact = contact, onCopy = { onCopy(contact) }, onDelete = { onDelete(contact) })
             }
         }
     }
@@ -152,6 +136,9 @@ const val MIN_PASSPHRASE_LEN = 10
  *
  * In the [validate] path the bytes are wiped by this dialog after use; the
  * proceed action ([onSubmit]) does not receive live key material there.
+ *
+ * The same dialog chooses and asks for a vault's password; [fieldLabel] names
+ * what's typed.
  */
 @Composable
 fun PassphraseDialog(
@@ -161,6 +148,7 @@ fun PassphraseDialog(
     onCancel: () -> Unit,
     onSubmit: (ByteArray) -> Unit,
     validate: (suspend (ByteArray) -> String?)? = null,
+    fieldLabel: String = "Passphrase",
 ) {
     val scope = rememberCoroutineScope()
     var pass by remember { mutableStateOf("") }
@@ -168,16 +156,19 @@ fun PassphraseDialog(
     var visible by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var busy by remember { mutableStateOf(false) }
+    // The field has the keyboard as soon as the dialog opens, so typing goes there.
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { runCatching { focus.requestFocus() } }
 
     val transformation: VisualTransformation =
         if (visible) VisualTransformation.None else PasswordVisualTransformation()
 
     fun submit() {
         when {
-            pass.isEmpty() -> error = "Passphrase can't be empty."
+            pass.isEmpty() -> error = "$fieldLabel can't be empty."
             confirm && pass.length < MIN_PASSPHRASE_LEN ->
                 error = "Use at least $MIN_PASSPHRASE_LEN characters — a few random words works well."
-            confirm && pass != repeat -> error = "Those passphrases don't match."
+            confirm && pass != repeat -> error = "Those don't match."
             validate != null -> {
                 val bytes = pass.toByteArray(Charsets.UTF_8)
                 busy = true
@@ -210,9 +201,10 @@ fun PassphraseDialog(
                 OutlinedTextField(
                     value = pass,
                     onValueChange = { pass = it; error = null },
-                    label = { Text("Passphrase") },
+                    label = { Text(fieldLabel) },
                     singleLine = true,
                     enabled = !busy,
+                    modifier = Modifier.focusRequester(focus),
                     visualTransformation = transformation,
                     keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password),
                     trailingIcon = {
@@ -228,7 +220,7 @@ fun PassphraseDialog(
                     OutlinedTextField(
                         value = repeat,
                         onValueChange = { repeat = it; error = null },
-                        label = { Text("Repeat passphrase") },
+                        label = { Text("Repeat it") },
                         singleLine = true,
                         enabled = !busy,
                         visualTransformation = transformation,
@@ -341,17 +333,16 @@ fun AddContactDialog(
             }
         },
         confirmButton = {
-            TextButton(onClick = {
-                when {
-                    name.isBlank() -> error = "Give this contact a name."
-                    !looksLikePubkey(key) -> error = "That doesn't look like an age public key."
-                    else -> {
-                        val problem = checkKey(key.trim())
-                        error = problem
-                        if (problem == null) onAdd(name, key)
-                    }
-                }
-            }) { Text("Add") }
+            // Waits for a name and an age1… key, as on desktop: a slip here would
+            // otherwise throw away what was typed part way through Share.
+            TextButton(
+                onClick = {
+                    val problem = checkKey(key.trim())
+                    error = problem
+                    if (problem == null) onAdd(name, key)
+                },
+                enabled = name.isNotBlank() && looksLikePubkey(key),
+            ) { Text("Add") }
         },
         dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
     )
@@ -380,11 +371,24 @@ fun FileActionDialog(
     onEncrypt: () -> Unit,
     onDecrypt: () -> Unit,
     onCancel: () -> Unit,
+    // The name of the vault that's open and unlocked, if any: the file can go in it.
+    addTo: String? = null,
+    onAdd: () -> Unit = {},
 ) {
     AlertDialog(
         onDismissRequest = onCancel,
         title = { Text("Opened: $filename") },
-        text = { Text("Encrypt this file for others, or decrypt it with your passphrase?") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text("Encrypt this file for others, or decrypt it with your passphrase?")
+                if (addTo != null) {
+                    TextButton(
+                        onClick = onAdd,
+                        contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
+                    ) { Text("Add it to “$addTo” instead") }
+                }
+            }
+        },
         confirmButton = {
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                 TextButton(onClick = onDecrypt) { Text("Decrypt") }
@@ -434,7 +438,7 @@ fun AboutDialog(onClose: () -> Unit) {
         title = { Text("VaultSend") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Version 0.1.0", style = MaterialTheme.typography.bodyMedium)
+                Text("Version 0.2.0", style = MaterialTheme.typography.bodyMedium)
                 Text(
                     "File and text encryption using the age format.\n" +
                         "All cryptography is performed by a small separate backend.\n" +

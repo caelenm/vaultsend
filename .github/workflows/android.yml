@@ -32,6 +32,14 @@ jobs:
         working-directory: rust
         run: cargo test
 
+      # The desktop vaults branch's end-to-end script, run against the same vault
+      # code through a host-side CLI (examples/vault_cli.rs, not shipped).
+      - name: Vault round trip
+        working-directory: rust
+        run: |
+          cargo build --release --locked --example vault_cli --features cli
+          bash tests/vault_roundtrip.sh
+
       - name: Install cargo-ndk
         run: cargo install cargo-ndk --version 3.5.4 --locked
 
@@ -42,6 +50,10 @@ jobs:
       # cargo-ndk finds the NDK through ANDROID_NDK_ROOT, which the runner sets.
       - name: Assemble debug APK (runs build-rust.sh via preBuild)
         run: ./gradlew assembleDebug --stacktrace
+
+      # VaultHelpersTest: the desktop's test_frontend_helpers.py, ported.
+      - name: Kotlin unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
 
       - uses: actions/upload-artifact@v4
         with:
