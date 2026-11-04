@@ -32,7 +32,7 @@ equivalent is used (an "Open file…" button, a contacts drawer).
 ## App verifier Details
 
 org.vaultsend
-8B:33:70:31:E1:73:06:22:24:98:E6:24:53:F6:6C:57:8D:5F:9C:73:51:73:CE:32:57:16:B0:1F:9C:BA:85:82
+01:DA:07:1F:28:FD:27:38:02:D8:2D:23:BC:1C:AD:64:55:00:11:33:3D:1C:A0:91:85:58:33:E2:59:93:BF:0D
 
 ## Project layout
 
