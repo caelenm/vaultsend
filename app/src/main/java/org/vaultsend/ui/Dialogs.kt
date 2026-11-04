@@ -7,6 +7,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
@@ -14,9 +16,11 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.MoreVert
+import androidx.compose.material.icons.filled.Share
 import androidx.compose.material.icons.filled.Visibility
 import androidx.compose.material.icons.filled.VisibilityOff
 import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -24,6 +28,7 @@ import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -296,6 +301,37 @@ fun RecipientsDialog(
             }) { Text("Encrypt") }
         },
         dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
+}
+
+// --- Save or share (after choosing who it's for) ----------------------------
+
+/** Where encrypted output goes: saved to a file you pick, or the Android share sheet. */
+@Composable
+fun SaveOrShareDialog(
+    title: String,
+    body: String,
+    onSave: () -> Unit,
+    onShare: () -> Unit,
+    onCancel: () -> Unit,
+    dismissLabel: String = "Cancel",
+) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text(title) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(body, style = MaterialTheme.typography.bodyMedium)
+                Button(onClick = onSave, modifier = Modifier.fillMaxWidth()) { Text("Save File") }
+                OutlinedButton(onClick = onShare, modifier = Modifier.fillMaxWidth()) {
+                    Icon(Icons.Filled.Share, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text("Share")
+                }
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onCancel) { Text(dismissLabel) } },
     )
 }
 

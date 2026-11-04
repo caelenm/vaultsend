@@ -59,8 +59,10 @@ import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.unit.dp
 import androidx.core.content.FileProvider
 import androidx.lifecycle.viewmodel.compose.viewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.vaultsend.Backend
 import org.vaultsend.Contact
 import org.vaultsend.KEY_MISMATCH
@@ -94,6 +96,14 @@ private data class AskPassphrase(
     val onSubmit: (ByteArray) -> Unit,
 ) : DialogState
 private data class PickRecipients(val onConfirm: (List<String>) -> Unit) : DialogState
+// After choosing who it's for: save the encrypted result to a file, or hand it to the share sheet.
+private data class SaveOrShare(
+    val title: String,
+    val body: String,
+    val dismissLabel: String = "Cancel",
+    val onSave: () -> Unit,
+    val onShare: () -> Unit,
+) : DialogState
 private data object AddContactDialogState : DialogState
 private data class DeleteContactDialogState(val contact: Contact) : DialogState
 private data class FileActionDialogState(val uri: Uri) : DialogState
@@ -113,7 +123,12 @@ private data class Confirm(
     val onConfirm: () -> Unit,
 ) : DialogState
 private data class RemoveFromList(val vault: VaultRecord) : DialogState
-private data class Share(val vault: VaultRecord, val chosen: List<String>) : DialogState
+private data class Share(
+    val vault: VaultRecord,
+    val chosen: List<String>,
+    // Contacts ticked so far (pubkeys), kept across Add new contact.
+    val picked: Set<String> = emptySet(),
+) : DialogState
 // Add contact on top of Share: back to the same Share afterwards.
 private data class ShareAddContact(val share: Share) : DialogState
 private data object RememberChoices : DialogState
@@ -153,6 +168,33 @@ fun App(vm: AppViewModel = viewModel()) {
     fun saveThen(suggestedName: String, onPicked: (Uri) -> Unit) {
         saveCallback = onPicked
         createDocument.launch(suggestedName)
+    }
+
+    // --- Android share sheet ---------------------------------------------------
+    /** A content:// URI for a file staged by Backend.newShareFile. */
+    fun shareUri(file: File): Uri = FileProvider.getUriForFile(context, "${context.packageName}.open", file)
+
+    fun launchChooser(send: Intent) {
+        try {
+            context.startActivity(Intent.createChooser(send, "Share"))
+        } catch (e: ActivityNotFoundException) {
+            toast("No app on this device can share it. Use Save File instead.")
+        }
+    }
+
+    /** Hand an encrypted file staged by Backend.newShareFile to the share sheet. */
+    fun shareFile(file: File) {
+        val uri = shareUri(file)
+        val send = Intent(Intent.ACTION_SEND)
+            .setType("application/octet-stream")
+            .putExtra(Intent.EXTRA_STREAM, uri)
+            .addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        send.clipData = android.content.ClipData.newRawUri(file.name, uri)
+        launchChooser(send)
+    }
+
+    fun shareText(text: String) {
+        launchChooser(Intent(Intent.ACTION_SEND).setType("text/plain").putExtra(Intent.EXTRA_TEXT, text))
     }
 
     // In-app "Open file…" button: routes the picked file to the encrypt/decrypt
@@ -220,12 +262,39 @@ fun App(vm: AppViewModel = viewModel()) {
         dialog = PickRecipients { recipients ->
             dialog = null
             scope.launch {
-                try {
-                    vm.message = vm.backend.encryptText(recipients, text)
-                    toast("Encrypted. Copy the text and share it.")
+                val encrypted = try {
+                    vm.backend.encryptText(recipients, text)
                 } catch (e: Exception) {
                     toast(e.message ?: "The operation failed.")
+                    return@launch
                 }
+                vm.message = encrypted
+                dialog = SaveOrShare(
+                    "Encrypted",
+                    "Encrypted to ${recipients.size} recipient(s). Save it to a file, or share it. " +
+                        "It's also in the text box to copy.",
+                    dismissLabel = "Close",
+                    onSave = {
+                        dialog = null
+                        saveThen("message.age") { output ->
+                            scope.launch {
+                                try {
+                                    withContext(Dispatchers.IO) {
+                                        context.contentResolver.openOutputStream(output, "wt").use { out ->
+                                            requireNotNull(out) { "Couldn't open the destination." }
+                                            out.write(encrypted.toByteArray(Charsets.UTF_8))
+                                        }
+                                    }
+                                    toast("Saved.")
+                                } catch (e: Exception) {
+                                    vm.backend.discardOutput(output)
+                                    toast(e.message ?: "The operation failed.")
+                                }
+                            }
+                        }
+                    },
+                    onShare = { dialog = null; shareText(encrypted) },
+                )
             }
         }
     }
@@ -252,18 +321,43 @@ fun App(vm: AppViewModel = viewModel()) {
         if (pk == null) { toast("Your key isn't ready yet."); return }
         val base = vm.backend.displayName(input)
         dialog = PickRecipients { recipients ->
-            dialog = null
-            saveThen("$base.age") { output ->
-                scope.launch {
-                    try {
-                        vm.backend.encryptFile(recipients, input, output)
-                        toast("Encrypted to ${recipients.size} recipient(s).")
-                    } catch (e: Exception) {
-                        vm.backend.discardOutput(output)
-                        toast(e.message ?: "The operation failed.")
+            dialog = SaveOrShare(
+                "Encrypt “$base”",
+                "Encrypting to ${recipients.size} recipient(s). Save the encrypted file, or share it.",
+                onSave = {
+                    dialog = null
+                    saveThen("$base.age") { output ->
+                        scope.launch {
+                            try {
+                                vm.backend.encryptFile(recipients, input, output)
+                                toast("Encrypted to ${recipients.size} recipient(s).")
+                            } catch (e: Exception) {
+                                vm.backend.discardOutput(output)
+                                toast(e.message ?: "The operation failed.")
+                            }
+                        }
                     }
-                }
-            }
+                },
+                onShare = {
+                    dialog = null
+                    scope.launch {
+                        val staged = try {
+                            withContext(Dispatchers.IO) { vm.backend.newShareFile("$base.age") }
+                        } catch (e: Exception) {
+                            toast(e.message ?: "The operation failed.")
+                            return@launch
+                        }
+                        try {
+                            vm.backend.encryptFile(recipients, input, shareUri(staged))
+                        } catch (e: Exception) {
+                            staged.delete()
+                            toast(e.message ?: "The operation failed.")
+                            return@launch
+                        }
+                        shareFile(staged)
+                    }
+                },
+            )
         }
     }
 
@@ -777,20 +871,43 @@ fun App(vm: AppViewModel = viewModel()) {
         }
     }
 
-    fun shareWith(share: Share, contact: Contact) {
-        val (vault, chosen) = share
+    fun shareWith(share: Share, contacts: List<Contact>) {
+        val vault = share.vault
+        val chosen = share.chosen
         val page = vm.vaultPage ?: return
         val me = vm.myPubkey ?: return
+        if (contacts.isEmpty()) return
         val suggested = shareFileName(vault.name, chosen, page.entries)
-        val recipients = listOf(contact.pubkey, me).distinct()
-        saveThen(suggested) { output ->
-            withVaultSecret(vault, onCancel = { vm.backend.discardOutput(output) }) { secret ->
-                runVaultOp(
-                    vault, secret, "Encrypting for ${contact.name}…",
-                    "Encrypted for ${contact.name}. Send them the saved file.",
-                ) { sink -> vm.backend.vaultShare(vault, secret, chosen, recipients, output, sink) }
-            }
-        }
+        val recipients = (contacts.map { it.pubkey } + me).distinct()
+        val who = if (contacts.size <= 2) contacts.joinToString(" and ") { it.name } else "${contacts.size} people"
+        dialog = SaveOrShare(
+            "Share with $who",
+            "Save the encrypted file, or share it.",
+            onSave = {
+                dialog = null
+                saveThen(suggested) { output ->
+                    withVaultSecret(vault, onCancel = { vm.backend.discardOutput(output) }) { secret ->
+                        runVaultOp(
+                            vault, secret, "Encrypting for $who…",
+                            "Encrypted for $who. Send them the saved file.",
+                        ) { sink -> vm.backend.vaultShare(vault, secret, chosen, recipients, output, sink) }
+                    }
+                }
+            },
+            onShare = {
+                dialog = null
+                val staged = runCatching { vm.backend.newShareFile(suggested) }.getOrElse { e ->
+                    toast(e.message ?: "The operation failed.")
+                    null
+                }
+                if (staged != null) withVaultSecret(vault, onCancel = { staged.delete() }) { secret ->
+                    val ok = runVaultOp(vault, secret, "Encrypting for $who…", "Encrypted for $who.") { sink ->
+                        vm.backend.vaultShare(vault, secret, chosen, recipients, shareUri(staged), sink)
+                    }
+                    if (ok) shareFile(staged) else staged.delete()
+                }
+            },
+        )
     }
 
     fun vaultShare() {
@@ -1114,6 +1231,14 @@ fun App(vm: AppViewModel = viewModel()) {
                 )
             }
         }
+        is SaveOrShare -> SaveOrShareDialog(
+            title = d.title,
+            body = d.body,
+            dismissLabel = d.dismissLabel,
+            onSave = d.onSave,
+            onShare = d.onShare,
+            onCancel = { dialog = null },
+        )
         AddContactDialogState -> AddContactDialog(
             onCancel = { dialog = null },
             onAdd = { name, key ->
@@ -1211,8 +1336,9 @@ fun App(vm: AppViewModel = viewModel()) {
                     what = what,
                     oneFile = chosen.size == 1 && page.entries[chosen[0]]?.isDir == false,
                     contacts = vm.contacts,
-                    onAddNew = { dialog = ShareAddContact(d) },
-                    onPick = { contact -> dialog = null; shareWith(d, contact) },
+                    initiallyPicked = d.picked,
+                    onAddNew = { picked -> dialog = ShareAddContact(d.copy(picked = picked)) },
+                    onConfirm = { contacts -> dialog = null; shareWith(d, contacts) },
                     onCancel = { dialog = null },
                 )
             }
@@ -1221,7 +1347,7 @@ fun App(vm: AppViewModel = viewModel()) {
             onCancel = { dialog = d.share },
             onAdd = { name, key ->
                 vm.addContact(name, key)
-                dialog = d.share
+                dialog = d.share.copy(picked = d.share.picked + key.trim())
                 toast("Contact added.")
             },
             checkKey = { key ->

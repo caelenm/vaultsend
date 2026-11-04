@@ -71,8 +71,9 @@
         </activity>
 
         <!-- Open: hands a decrypted copy from a vault to another app, read-only,
-             through a content:// URI granted for that one view. Only the cache's
-             open/ folder is reachable through it (res/xml/file_paths.xml), and
+             through a content:// URI granted for that one view. Share also hands
+             encrypted output to the share sheet through it. Only the cache's
+             open/ and share/ folders are reachable (res/xml/file_paths.xml), and
              the provider isn't exported, so nothing can ask it for anything else. -->
         <provider
             android:name="androidx.core.content.FileProvider"
