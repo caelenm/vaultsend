@@ -294,6 +294,55 @@ cp -a "$XDG_DATA_HOME/." "$SECOND/"
 XDG_DATA_HOME="$SECOND" XDG_CONFIG_HOME="$T/second-config" check "the same key on another device opens it" vault vault-list >/dev/null
 
 # ---------------------------------------------------------------------------
+echo "== 6b. Selecting several, Share, emptying a vault and progress reports"
+# ---------------------------------------------------------------------------
+EARLIER_VAULT=$V
+V="$T/batch.vsvault"
+SECRET=$VAULT_PASS
+check "a vault for these" vault vault-create --mode password
+LONG="$T/src2/$(printf 'd%.0s' {1..150})"
+mkdir -p "$LONG"
+printf 'a long way down\n' >"$LONG/deep.txt"
+check "filled with the tree" vault vault-add --src "$SRC"
+check "and a path too long for a plain tar header" vault vault-add --src "$T/src2/$(basename "$LONG")"
+
+FRIEND="$T/friend"
+mkdir -p "$FRIEND"
+FRIEND_KEY=$(XDG_DATA_HOME="$FRIEND" "$BIN" keygen --pass-fd 3 3<<<"$ID_PASS")
+friend_decrypt() { XDG_DATA_HOME="$FRIEND" "$BIN" decrypt --in "$1" --out "$2" --pass-fd 3 3<<<"$ID_PASS"; }
+
+check "share one file" vault vault-share --entry tree/one-byte.bin --to "$FRIEND_KEY" --out "$T/one.age"
+check "the contact can decrypt it" friend_decrypt "$T/one.age" "$T/one.out"
+check "and gets the file itself" cmp "$T/one.out" "$SRC/one-byte.bin"
+refuses_and_writes_nothing "someone else can't" "$T/not-yours" "$BIN" decrypt --in "$T/one.age" --out "$T/not-yours" --pass-fd 3 3<<<"$ID_PASS"
+refuses_and_writes_nothing "share to a bad key" "$T/bad.age" vault vault-share --entry tree/one-byte.bin --to age1nope --out "$T/bad.age"
+refuses_and_writes_nothing "share something absent" "$T/bad.age" vault vault-share --entry nope --to "$FRIEND_KEY" --out "$T/bad.age"
+
+check "share a folder and a file" vault vault-share --entry tree --entry "$(basename "$LONG")/deep.txt" --to "$FRIEND_KEY" --out "$T/many.tar.age"
+check "the contact can decrypt that" friend_decrypt "$T/many.tar.age" "$T/many.tar"
+mkdir -p "$T/untarred"
+check "and tar reads the archive" tar -xf "$T/many.tar" -C "$T/untarred"
+check "with the folder exactly as it was, empty folder included" same_tree "$SRC" "$T/untarred/tree"
+check "and the long path whole" cmp "$T/untarred/$(basename "$LONG")/deep.txt" "$LONG/deep.txt"
+
+check "extract several" vault vault-extract --entry tree/nested --entry tree/one-byte.bin --out "$T/several"
+check "they keep their paths" cmp "$T/several/tree/nested/random-3mib.bin" "$SRC/nested/random-3mib.bin"
+[ ! -e "$T/several/tree/empty.txt" ] && ok "and nothing else came with them" || bad "an unselected file was extracted"
+
+check "extract with progress" vault vault-extract --entry tree --out "$T/with-progress" --progress-fd 4 4>"$T/progress"
+[ "$(tail -n 1 "$T/progress")" = 100 ] && ok "progress reaches 100" || bad "progress ended at $(tail -n 1 "$T/progress")"
+[ "$(sort -n "$T/progress" | uniq)" = "$(cat "$T/progress")" ] && ok "and only ever climbs" || bad "progress went backwards or repeated"
+
+check "remove several at once" vault vault-remove --entry tree/one-byte.bin --entry tree/nested
+vault vault-list | grep -q one-byte && bad "a removed file is still listed" || ok "they are gone"
+vault vault-remove --entry / 2>/dev/null && bad "--entry / emptied the vault" || ok "--entry / can't empty a vault"
+check "--all can" vault vault-remove --all
+[ "$(vault vault-list | wc -l)" = 1 ] && ok "and leaves an empty vault that still opens" || bad "vault isn't empty after --all"
+check "with nothing left over" vault vault-check
+[ -z "$(find "$V/blobs" -name '*.age')" ] && ok "and no blobs" || bad "blobs left after --all"
+V=$EARLIER_VAULT
+
+# ---------------------------------------------------------------------------
 echo "== 7. (optional) strace: output opened only after every blob was read"
 # ---------------------------------------------------------------------------
 if command -v strace >/dev/null; then

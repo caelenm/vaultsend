@@ -14,12 +14,17 @@
 // before a byte reaches disk, and age recipients being anonymous (the vault's public
 // key is stored nowhere in the clear, so a manifest can't be forged without the key).
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::cell::Cell;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Cursor, Read, Write};
 use std::iter::once;
+use std::mem::ManuallyDrop;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::{ExposeSecret, SecretString};
 use age::x25519;
@@ -29,7 +34,7 @@ use zeroize::Zeroizing;
 
 use crate::{
     commit_staged, encrypt_to, load_identity, lock_in_ram, open_private_new, read_passphrase,
-    secret_buffer, staging_path, R, SCRYPT_LOG_N,
+    secret_buffer, staging_path, tar, R, SCRYPT_LOG_N,
 };
 
 const VAULT_FILE: &str = "VAULT";
@@ -46,6 +51,8 @@ const BLOBS_DIR: &str = "blobs";
 const ROOT_ENTRY: &str = "/";
 /// Same floor as the identity passphrase (MIN_PASSPHRASE_LEN in the frontend).
 const MIN_PASSWORD_CHARS: usize = 10;
+/// How much plaintext goes by between progress reports, at most.
+const PROGRESS_CHUNK: usize = 1 << 20;
 
 // ---------------------------------------------------------------------------
 // Vault paths.  The one validator used by add, remove, extract and the manifest
@@ -197,6 +204,30 @@ impl Manifest {
         }
         Ok(Manifest { generation, entries })
     }
+
+    /// Plaintext bytes in these paths; folders count for nothing.
+    fn size_of<'a>(&self, paths: impl Iterator<Item = &'a str>) -> u64 {
+        paths.fold(0, |sum, path| match self.entries.get(path) {
+            Some(Entry::File { size, .. }) => sum.saturating_add(*size),
+            _ => sum,
+        })
+    }
+
+    /// Everything `entries` covers and the folders leading to it, parents first. Overlaps
+    /// (a folder and a file inside it) just count once. Every entry must exist.
+    fn selection<'a>(&'a self, entries: &[&str]) -> R<BTreeSet<&'a str>> {
+        if let Some(missing) = entries.iter().find(|e| **e != ROOT_ENTRY && !self.entries.contains_key(**e)) {
+            return Err(format!("'{missing}' is not in the vault"));
+        }
+        let mut chosen = BTreeSet::new();
+        for path in self.entries.keys() {
+            if entries.iter().any(|e| within(path, e).is_some()) {
+                chosen.extend(ancestors(path));
+                chosen.insert(path.as_str());
+            }
+        }
+        Ok(chosen)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +291,100 @@ impl<W: Write> Write for HashingWriter<W> {
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
     }
+}
+
+/// Whole percent, one per line, on a pipe from the frontend, as much as anyone can tell
+/// with age storing no plaintext length: the frontend can't read this process's memory
+/// (harden_process) and a vault write has no one output file to measure. Only numbers, so
+/// nothing about the vault's contents. At most 101 short lines, and the frontend marks the
+/// pipe non-blocking, so this can never stall; a report that doesn't fit is just dropped.
+#[derive(Default)]
+struct Progress {
+    /// Not ours to close: a bad number from the command line must not abort at exit.
+    pipe: Option<ManuallyDrop<File>>,
+    total: Cell<u64>,
+    done: Cell<u64>,
+    shown: Cell<Option<u64>>,
+}
+
+impl Progress {
+    fn to_fd(fd: i32) -> R<Progress> {
+        if fd < 3 {
+            return Err("--progress-fd must refer to a dedicated pipe (fd >= 3)".into());
+        }
+        // SAFETY: only ever written to, and never closed, so it needs nothing of the fd.
+        // A number that isn't open just fails each write, which is ignored.
+        Ok(Progress { pipe: Some(ManuallyDrop::new(unsafe { File::from_raw_fd(fd) })), ..Default::default() })
+    }
+
+    fn start(&self, total: u64) {
+        self.total.set(total);
+        self.done.set(0);
+    }
+
+    fn advance(&self, n: u64) {
+        let (Some(pipe), total) = (&self.pipe, self.total.get()) else { return };
+        if total == 0 {
+            return;
+        }
+        let done = self.done.get().saturating_add(n);
+        self.done.set(done);
+        let percent = (u128::from(done) * 100 / u128::from(total)).min(100) as u64;
+        if self.shown.get() != Some(percent) {
+            self.shown.set(Some(percent));
+            let mut pipe: &File = pipe;
+            let _ = pipe.write_all(format!("{percent}\n").as_bytes());
+        }
+    }
+}
+
+/// Counts what's read through it, for encrypting a source file into a blob.
+struct CountingReader<R> {
+    inner: R,
+    progress: Rc<Progress>,
+}
+
+impl<R: Read> Read for CountingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.progress.advance(n as u64);
+        Ok(n)
+    }
+}
+
+/// Reads a list of buffers in order, wiping each one as soon as it has been read.
+struct Parts {
+    parts: VecDeque<Zeroizing<Vec<u8>>>,
+    position: usize,
+    progress: Rc<Progress>,
+}
+
+impl Read for Parts {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        while let Some(part) = self.parts.front() {
+            let rest = &part[self.position..];
+            if rest.is_empty() {
+                self.parts.pop_front();
+                self.position = 0;
+                continue;
+            }
+            let n = rest.len().min(buf.len());
+            buf[..n].copy_from_slice(&rest[..n]);
+            self.position += n;
+            self.progress.advance(n as u64);
+            return Ok(n);
+        }
+        Ok(0)
+    }
+}
+
+/// write_all, in pieces small enough for the percentage to keep moving.
+fn write_counted(file: &mut File, data: &[u8], progress: &Progress, path: &str) -> R<()> {
+    for piece in data.chunks(PROGRESS_CHUNK) {
+        file.write_all(piece).map_err(|e| format!("writing {path}: {e}"))?;
+        progress.advance(piece.len() as u64);
+    }
+    Ok(())
 }
 
 /// Hold a lock on the vault for the life of the process, so one process's garbage
@@ -379,7 +504,7 @@ fn plan_source(src: &Path, target: &str, plan: &mut BTreeMap<String, Option<Path
     Ok(())
 }
 
-fn write_tree(root: &str, tree: &[(&str, Option<Zeroizing<Vec<u8>>>)]) -> R<()> {
+fn write_tree(root: &str, tree: &[(&str, Option<Zeroizing<Vec<u8>>>)], progress: &Progress) -> R<()> {
     private_dir(root, false)?;
     // In manifest order, so every folder is created before its contents.
     for (rel, data) in tree {
@@ -393,7 +518,7 @@ fn write_tree(root: &str, tree: &[(&str, Option<Zeroizing<Vec<u8>>>)]) -> R<()> 
                     return Err(format!("{path}: two names in the vault collide on this disk"));
                 }
                 let mut file = open_private_new(&path)?;
-                file.write_all(data).map_err(|e| format!("writing {path}: {e}"))?;
+                write_counted(&mut file, data, progress, &path)?;
                 file.sync_all().map_err(|e| format!("flushing {path}: {e}"))?;
             }
         }
@@ -409,18 +534,19 @@ struct Vault {
     key: x25519::Identity,
     /// Held only for its flock, released when this is dropped.
     _lock: Option<File>,
+    progress: Rc<Progress>,
 }
 
 impl Vault {
     fn open(dir: &str, pass_fd: i32, exclusive: bool) -> R<Vault> {
         let lock = lock_vault(dir, exclusive)?;
-        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd)?, _lock: Some(lock) })
+        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd)?, _lock: Some(lock), progress: Rc::default() })
     }
 
     /// `wrap` already holds key.age's wrapped file key, so scrypt (for a password
     /// vault) has run by now. VAULT goes last: its presence marks a complete vault.
     fn create(dir: &str, mode: &str, wrap: age::Encryptor) -> R<Vault> {
-        let v = Vault { dir: dir.to_string(), key: x25519::Identity::generate(), _lock: None };
+        let v = Vault { dir: dir.to_string(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default() };
         let populate = || -> R<()> {
             private_dir(dir, true)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{dir}: {e}"))?;
@@ -461,18 +587,23 @@ impl Vault {
     /// every chunk and the final-chunk flag. Plaintext is never longer than its
     /// ciphertext, so this buffer never reallocates (which would leave an unwiped
     /// copy behind in freed heap).
-    fn decrypt_in_ram(&self, ciphertext: &[u8]) -> R<Zeroizing<Vec<u8>>> {
+    fn decrypt_in_ram(&self, ciphertext: &[u8], on_read: impl Fn(u64)) -> R<Zeroizing<Vec<u8>>> {
         let dec = age::Decryptor::new(ciphertext).map_err(|e| e.to_string())?;
         let mut stream = dec.decrypt(once(&self.key as &dyn age::Identity)).map_err(|e| e.to_string())?;
         let mut plain = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
-        stream.read_to_end(&mut plain).map_err(|e| e.to_string())?;
-        Ok(plain)
+        loop {
+            let n = (&mut stream).take(PROGRESS_CHUNK as u64).read_to_end(&mut plain).map_err(|e| e.to_string())?;
+            if n == 0 {
+                return Ok(plain);
+            }
+            on_read(n as u64);
+        }
     }
 
     fn load_manifest(&self) -> R<Manifest> {
         let data = read_regular(&format!("{}/{MANIFEST_FILE}", self.dir))
             .map_err(|e| format!("reading the vault's manifest: {e}"))?;
-        let text = self.decrypt_in_ram(&data).map_err(|_| "the vault's manifest is damaged or was replaced".to_string())?;
+        let text = self.decrypt_in_ram(&data, |_| ()).map_err(|_| "the vault's manifest is damaged or was replaced".to_string())?;
         let text = std::str::from_utf8(&text).map_err(|_| "the vault's manifest is not valid text".to_string())?;
         Manifest::parse(text).map_err(|e| format!("the vault's manifest is invalid: {e}"))
     }
@@ -488,7 +619,7 @@ impl Vault {
         if hex(&Sha256::digest(&data)) != sha256 {
             return Err(format!("'{path}' failed verification: its encrypted data was changed or replaced"));
         }
-        self.decrypt_in_ram(&data).map_err(|e| format!("'{path}' failed to decrypt: {e}"))
+        self.decrypt_in_ram(&data, |n| self.progress.advance(n)).map_err(|e| format!("'{path}' failed to decrypt: {e}"))
     }
 
     fn write_manifest(&self, m: &Manifest) -> R<()> {
@@ -555,7 +686,15 @@ impl Vault {
     /// already correct and the next change will try again.
     fn collect_garbage(&self, m: &Manifest) {
         let removed = self.orphans(m).and_then(|list| {
-            list.iter().try_for_each(|p| fs::remove_file(p).map_err(|e| format!("{p}: {e}")))
+            // Deleting has no bytes to measure, so it counts blobs instead.
+            if self.progress.total.get() == 0 {
+                self.progress.start(list.len() as u64);
+            }
+            list.iter().try_for_each(|p| {
+                fs::remove_file(p).map_err(|e| format!("{p}: {e}"))?;
+                self.progress.advance(1);
+                Ok(())
+            })
         });
         if let Err(e) = removed {
             eprintln!("warning: could not remove an unused blob: {e}");
@@ -577,7 +716,8 @@ impl Vault {
         let mut sha256 = String::new();
         write_atomic(&path, |out| {
             let hashing = HashingWriter { inner: out, hasher: Sha256::new() };
-            let hashing = self.encrypt_stream(Box::new(file), hashing)?;
+            let reader = CountingReader { inner: file, progress: self.progress.clone() };
+            let hashing = self.encrypt_stream(Box::new(reader), hashing)?;
             sha256 = hex(&hashing.hasher.finalize());
             Ok(hashing.inner)
         })?;
@@ -632,6 +772,8 @@ impl Vault {
                 return Err(format!("'{path}': a file can't replace a folder, or a folder a file"));
             }
         }
+        let sizes = plan.values().flatten().map(|src| fs::symlink_metadata(src).map_or(0, |meta| meta.len()));
+        self.progress.start(sizes.fold(0, u64::saturating_add));
         for (path, source) in plan {
             let entry = match source {
                 None => Entry::Dir,
@@ -646,15 +788,24 @@ impl Vault {
         Ok(())
     }
 
-    fn remove(&self, entry: &str) -> R<()> {
-        if !valid_vault_path(entry) {
-            return Err(format!("invalid vault path: {entry}"));
+    /// All of these or none of them: one new manifest, so one new generation.
+    fn remove(&self, entries: &[&str]) -> R<()> {
+        if let Some(bad) = entries.iter().find(|e| !valid_vault_path(e)) {
+            return Err(format!("invalid vault path: {bad}"));
         }
         let mut m = self.load_manifest()?;
-        if !m.entries.contains_key(entry) {
-            return Err(format!("'{entry}' is not in the vault"));
+        if let Some(missing) = entries.iter().find(|e| !m.entries.contains_key(**e)) {
+            return Err(format!("'{missing}' is not in the vault"));
         }
-        m.entries.retain(|path, _| within(path, entry).is_none());
+        m.entries.retain(|path, _| entries.iter().all(|entry| within(path, entry).is_none()));
+        self.commit_next(m)
+    }
+
+    /// Empties the vault and leaves it in place. Its own command-line flag rather than
+    /// `--entry /`, so that no path, however it got built, can mean this by accident.
+    fn remove_everything(&self) -> R<()> {
+        let mut m = self.load_manifest()?;
+        m.entries.clear();
         self.commit_next(m)
     }
 
@@ -662,11 +813,12 @@ impl Vault {
         refuse_out_inside_vault(&self.dir, out)?;
         let m = self.load_manifest()?;
         match m.entries.get(entry) {
-            Some(Entry::File { blob, sha256, .. }) => {
+            Some(Entry::File { blob, sha256, size }) => {
+                self.progress.start(size.saturating_mul(2)); // once decrypting, once writing
                 let plain = self.read_verified(entry, blob, sha256)?;
                 // Only now does anything reach the disk.
                 write_atomic(out, |mut file| {
-                    file.write_all(&plain).map_err(|e| format!("writing {out}: {e}"))?;
+                    write_counted(&mut file, &plain, &self.progress, out)?;
                     Ok(file)
                 })?;
                 sync_dir(parent_of(out));
@@ -678,29 +830,100 @@ impl Vault {
         }
     }
 
+    fn extract_folder(&self, m: &Manifest, entry: &str, out: &str) -> R<()> {
+        let wanted = m.entries.keys().filter_map(|path| {
+            within(path, entry).filter(|rel| !rel.is_empty()).map(|rel| (path.as_str(), rel))
+        });
+        self.extract_tree(m, wanted.collect(), out)
+    }
+
+    /// Several entries into a new folder `out`, each keeping its path from the top of the
+    /// vault, so two files with one name can't collide.
+    fn extract_many(&self, entries: &[&str], out: &str) -> R<()> {
+        refuse_out_inside_vault(&self.dir, out)?;
+        let m = self.load_manifest()?;
+        let wanted = m.selection(entries)?.into_iter().map(|path| (path, path));
+        self.extract_tree(&m, wanted.collect(), out)
+    }
+
+    /// `wanted` is (path in the vault, path under `out`), parents first.
     /// Verify and decrypt every file first; if any fails, nothing at all is written.
     /// The tree is then built under a staging name and renamed into place, so `out`
     /// is only ever absent or complete.
-    fn extract_folder(&self, m: &Manifest, entry: &str, out: &str) -> R<()> {
+    fn extract_tree(&self, m: &Manifest, wanted: Vec<(&str, &str)>, out: &str) -> R<()> {
         if fs::symlink_metadata(out).is_ok() {
             return Err(format!("{out} already exists; choose a new folder name"));
         }
+        self.progress.start(m.size_of(wanted.iter().map(|(path, _)| *path)).saturating_mul(2));
         let mut tree = Vec::new();
-        for (path, e) in &m.entries {
-            let Some(rel) = within(path, entry).filter(|r| !r.is_empty()) else { continue };
-            tree.push((rel, match e {
+        for (path, rel) in wanted {
+            tree.push((rel, match &m.entries[path] {
                 Entry::Dir => None,
                 Entry::File { blob, sha256, .. } => Some(self.read_verified(path, blob, sha256)?),
             }));
         }
         let tmp = staging_path(out);
         let _ = fs::remove_dir_all(&tmp); // a killed run's leftovers; the suffix is ours
-        let staged = write_tree(&tmp, &tree)
+        let staged = write_tree(&tmp, &tree, &self.progress)
             .and_then(|_| fs::rename(&tmp, out).map_err(|e| format!("finalizing {out}: {e}")));
         if staged.is_err() {
             let _ = fs::remove_dir_all(&tmp);
         }
         staged?;
+        sync_dir(parent_of(out));
+        Ok(())
+    }
+
+    /// Re-encrypt entries for other people, as a plain age file anyone with VaultSend or the
+    /// `age` tool can open: not a vault, because `self` vaults only open for whoever sealed
+    /// them. One file stays that file; anything else becomes a tar archive inside the age
+    /// file. Same RAM-only rule as extract: everything verifies before `out` is touched.
+    fn share(&self, entries: &[&str], to: &[&str], out: &str) -> R<()> {
+        refuse_out_inside_vault(&self.dir, out)?;
+        let recipients: Vec<x25519::Recipient> = to.iter()
+            .map(|r| r.parse().map_err(|e| format!("invalid recipient '{r}': {e}")))
+            .collect::<R<_>>()?;
+        if recipients.is_empty() {
+            return Err("--to is required".into());
+        }
+        let encryptor = age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
+            .map_err(|e| format!("preparing encryption: {e}"))?;
+
+        let m = self.load_manifest()?;
+        let chosen = m.selection(entries)?;
+        if chosen.is_empty() {
+            return Err("there is nothing in the vault to share".into());
+        }
+        let one_file = matches!(entries, [one] if matches!(m.entries.get(*one), Some(Entry::File { .. })));
+        let plain_bytes = m.size_of(chosen.iter().copied());
+        // Decrypting counts once and encrypting again, with the archive's headers on top.
+        let overhead = if one_file { 0 } else { (chosen.len() as u64 + 2) * 512 };
+        self.progress.start(plain_bytes.saturating_mul(2).saturating_add(overhead));
+
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |t| t.as_secs());
+        let mut parts = VecDeque::new();
+        for path in chosen {
+            match &m.entries[path] {
+                Entry::Dir if one_file => {} // only the folders leading to it
+                Entry::Dir => parts.push_back(Zeroizing::new(tar::dir_header(path, now))),
+                Entry::File { blob, sha256, .. } => {
+                    let plain = self.read_verified(path, blob, sha256)?;
+                    let size = plain.len() as u64;
+                    if one_file {
+                        parts.push_back(plain);
+                    } else {
+                        parts.push_back(Zeroizing::new(tar::file_header(path, size, now)?));
+                        parts.push_back(plain);
+                        parts.push_back(Zeroizing::new(tar::padding(size)));
+                    }
+                }
+            }
+        }
+        if !one_file {
+            parts.push_back(Zeroizing::new(tar::END.to_vec()));
+        }
+        let reader = Parts { parts, position: 0, progress: self.progress.clone() };
+        write_atomic(out, |file| encrypt_to(encryptor, false, Box::new(reader), file))?;
         sync_dir(parent_of(out));
         Ok(())
     }
@@ -728,6 +951,7 @@ impl Vault {
         if !orphans.is_empty() {
             eprintln!("warning: {} blob file(s) on disk are not in the manifest", orphans.len());
         }
+        self.progress.start(m.size_of(m.entries.keys().map(String::as_str)));
         let mut report = String::new();
         for orphan in &orphans {
             report.push_str(&format!("orphan {}\n", &orphan[self.dir.len() + 1..]));
@@ -750,18 +974,20 @@ impl Vault {
 struct Opts<'a> {
     pairs: Vec<(&'a str, &'a str)>,
     replace: bool,
+    everything: bool,
 }
 
 /// Strict "--name value" pairs, unlike the scanning helpers in main.rs, because
 /// values here can be names out of a vault: a folder called "--replace" must not
 /// read as the flag.
 fn parse_opts(args: &[String]) -> R<Opts<'_>> {
-    let mut o = Opts { pairs: Vec::new(), replace: false };
+    let mut o = Opts { pairs: Vec::new(), replace: false, everything: false };
     let mut it = args.iter().map(String::as_str);
     while let Some(name) = it.next() {
         match name {
             "--replace" => o.replace = true,
-            "--dir" | "--mode" | "--pass-fd" | "--src" | "--dest" | "--entry" | "--out" => {
+            "--all" => o.everything = true,
+            "--dir" | "--mode" | "--pass-fd" | "--progress-fd" | "--src" | "--dest" | "--entry" | "--out" | "--to" => {
                 o.pairs.push((name, it.next().ok_or_else(|| format!("{name} needs a value"))?))
             }
             other => return Err(format!("unknown option '{other}'")),
@@ -782,6 +1008,10 @@ impl<'a> Opts<'a> {
     }
     fn pass_fd(&self) -> R<i32> {
         self.need("--pass-fd")?.parse().map_err(|_| "--pass-fd must be a number".to_string())
+    }
+    fn entries(&self) -> R<Vec<&'a str>> {
+        self.need("--entry")?;
+        Ok(self.all("--entry"))
     }
 }
 
@@ -820,13 +1050,25 @@ fn print_out(text: &str) -> R<()> {
 pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
     let o = parse_opts(args)?;
     let dir = o.need("--dir")?;
-    let open = |exclusive| Vault::open(dir, o.pass_fd()?, exclusive);
+    let open = |exclusive| -> R<Vault> {
+        let mut vault = Vault::open(dir, o.pass_fd()?, exclusive)?;
+        if let Some(fd) = o.get("--progress-fd") {
+            let fd = fd.parse().map_err(|_| "--progress-fd must be a number".to_string())?;
+            vault.progress = Rc::new(Progress::to_fd(fd)?);
+        }
+        Ok(vault)
+    };
     match cmd {
         "vault-create" => cmd_create(dir, &o),
         "vault-list" => print_out(&open(false)?.listing()?),
         "vault-add" => open(true)?.add(&o.all("--src"), o.get("--dest"), o.replace),
-        "vault-remove" => open(true)?.remove(o.need("--entry")?),
-        "vault-extract" => open(false)?.extract(o.need("--entry")?, o.need("--out")?),
+        "vault-remove" if o.everything => open(true)?.remove_everything(),
+        "vault-remove" => open(true)?.remove(&o.entries()?),
+        "vault-extract" => match o.entries()?[..] {
+            [one] => open(false)?.extract(one, o.need("--out")?),
+            ref many => open(false)?.extract_many(many, o.need("--out")?),
+        },
+        "vault-share" => open(false)?.share(&o.entries()?, &o.all("--to"), o.need("--out")?),
         "vault-check" => print_out(&open(false)?.check()?),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -1248,7 +1490,7 @@ mod tests {
 
         // A manifest encrypted to some other key: what a forger without the vault's
         // public key would have to produce.
-        let other = Vault { dir: v.dir.clone(), key: x25519::Identity::generate(), _lock: None };
+        let other = Vault { dir: v.dir.clone(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default() };
         other.write_manifest(&Manifest::default()).unwrap();
         assert!(v.load_manifest().unwrap_err().contains("damaged"));
     }
@@ -1373,21 +1615,21 @@ mod tests {
         let keep_bytes = fs::read(&keep).unwrap();
         let dropped = [blob_of(&v, "drop.txt"), blob_of(&v, "dir/sub/x.txt"), blob_of(&v, "dir/y.txt")];
 
-        v.remove("drop.txt").unwrap();
+        v.remove(&["drop.txt"]).unwrap();
         assert!(!Path::new(&dropped[0]).exists());
         assert_eq!(fs::read(&keep).unwrap(), keep_bytes);
 
         // Recursive for a folder; a sibling sharing the prefix survives.
         add(&v, &t.write("dir2", b"sibling"));
-        v.remove("dir").unwrap();
+        v.remove(&["dir"]).unwrap();
         assert!(!Path::new(&dropped[1]).exists() && !Path::new(&dropped[2]).exists());
         let m = v.load_manifest().unwrap();
         let names: Vec<&str> = m.entries.keys().map(String::as_str).collect();
         assert_eq!(names, ["dir2", "keep.txt"]);
 
-        assert!(v.remove("missing").unwrap_err().contains("not in the vault"));
-        assert!(v.remove("/").unwrap_err().contains("invalid"));
-        assert!(v.remove("../keep.txt").unwrap_err().contains("invalid"));
+        assert!(v.remove(&["missing"]).unwrap_err().contains("not in the vault"));
+        assert!(v.remove(&["/"]).unwrap_err().contains("invalid"));
+        assert!(v.remove(&["../keep.txt"]).unwrap_err().contains("invalid"));
     }
 
     #[test]
@@ -1444,7 +1686,7 @@ mod tests {
         std::os::unix::fs::symlink(parent_of(&outside), t.path("v.vsvault/blobs/cd")).unwrap();
 
         add(&v, &t.write("a.txt", b"aaa"));
-        v.remove("a.txt").unwrap();
+        v.remove(&["a.txt"]).unwrap();
         for f in safe.iter().chain([&outside]) {
             assert_eq!(fs::read(f).unwrap(), b"mine", "{f} was touched");
         }
@@ -1462,13 +1704,13 @@ mod tests {
         // Several sources in one call are one change.
         v.add(&[t.write("b.txt", b"b"), t.write("c.txt", b"c")], None, false).unwrap();
         assert_eq!(generation(&v), 3);
-        v.remove("a.txt").unwrap();
+        v.remove(&["a.txt"]).unwrap();
         assert_eq!(generation(&v), 4);
         // Reads don't count, and a refused change doesn't either.
         v.extract("b.txt", &t.path("out.txt")).unwrap();
         v.check().unwrap();
         v.listing().unwrap();
-        assert!(v.remove("nope").is_err());
+        assert!(v.remove(&["nope"]).is_err());
         assert!(v.add(&[t.path("b.txt")], None, false).is_err());
         assert_eq!(generation(&v), 4);
     }
@@ -1529,7 +1771,7 @@ mod tests {
         // Two entries landing on one file, as "A" and "a" do on a case-insensitive disk.
         let data = Some(Zeroizing::new(b"y".to_vec()));
         let items = [("Name", data.clone()), ("Name", data)];
-        assert!(write_tree(&t.path("root"), &items).unwrap_err().contains("collide"));
+        assert!(write_tree(&t.path("root"), &items, &Progress::default()).unwrap_err().contains("collide"));
     }
 
     #[test]
@@ -1588,6 +1830,206 @@ mod tests {
         assert!(lock_vault(&v.dir, true).unwrap_err().contains("another"));
         drop((reader_one, reader_two));
         lock_vault(&v.dir, true).unwrap();
+    }
+
+    /// A vault holding a/1.txt, a/2.txt, a/sub/3.txt and top.txt.
+    fn tree_vault(t: &TempDir) -> Vault {
+        let v = quick_vault(t);
+        let a = t.path("src/a");
+        t.write("src/a/1.txt", b"one");
+        t.write("src/a/2.txt", b"two");
+        t.write("src/a/sub/3.txt", b"three");
+        add(&v, &a);
+        add(&v, &t.write("src/top.txt", b"top"));
+        v
+    }
+
+    fn paths(v: &Vault) -> Vec<String> {
+        v.load_manifest().unwrap().entries.into_keys().collect()
+    }
+
+    #[test]
+    fn removing_several_is_one_change_and_overlaps_are_fine() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let before = generation(&v);
+        v.remove(&["a/1.txt", "a/sub", "a/sub/3.txt", "top.txt"]).unwrap();
+        assert_eq!(paths(&v), ["a", "a/2.txt"]);
+        assert_eq!(generation(&v), before + 1);
+    }
+
+    #[test]
+    fn removing_several_with_one_missing_changes_nothing() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let before = paths(&v);
+        assert!(v.remove(&["top.txt", "nope"]).unwrap_err().contains("not in the vault"));
+        assert_eq!(paths(&v), before);
+    }
+
+    #[test]
+    fn removing_everything_empties_the_vault_and_its_blobs() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let before = generation(&v);
+        v.remove_everything().unwrap();
+        assert!(paths(&v).is_empty());
+        assert_eq!(generation(&v), before + 1);
+        assert!(v.orphans(&v.load_manifest().unwrap()).unwrap().is_empty());
+        let blobs: Vec<_> = fs::read_dir(format!("{}/{BLOBS_DIR}", v.dir)).unwrap()
+            .flatten().flat_map(|d| fs::read_dir(d.path()).unwrap().flatten()).collect();
+        assert!(blobs.is_empty(), "{blobs:?}");
+    }
+
+    #[test]
+    fn root_is_only_removable_by_its_own_flag() {
+        let t = TempDir::new();
+        let dir = t.path("vault.vsvault");
+        let pass = |p: &str| pass_fd(p).to_string();
+        run("vault-create", &args(&["--dir", &dir, "--mode", "password", "--pass-fd", &pass(VAULT_PASS)])).unwrap();
+        run("vault-add", &args(&["--dir", &dir, "--src", &t.write("f.txt", b"x"), "--pass-fd", &pass(VAULT_PASS)])).unwrap();
+        let by_entry = run("vault-remove", &args(&["--dir", &dir, "--entry", "/", "--pass-fd", &pass(VAULT_PASS)]));
+        assert!(by_entry.unwrap_err().contains("invalid"));
+        let neither = run("vault-remove", &args(&["--dir", &dir, "--pass-fd", &pass(VAULT_PASS)]));
+        assert!(neither.unwrap_err().contains("--entry is required"));
+        run("vault-remove", &args(&["--dir", &dir, "--all", "--pass-fd", &pass(VAULT_PASS)])).unwrap();
+    }
+
+    #[test]
+    fn extracting_several_keeps_paths_and_skips_what_was_not_chosen() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let out = t.path("out");
+        v.extract_many(&["a/sub", "a/sub/3.txt", "top.txt"], &out).unwrap();
+        assert_eq!(fs::read(format!("{out}/a/sub/3.txt")).unwrap(), b"three");
+        assert_eq!(fs::read(format!("{out}/top.txt")).unwrap(), b"top");
+        assert!(!Path::new(&format!("{out}/a/1.txt")).exists());
+        assert!(!Path::new(&staging_path(&out)).exists());
+    }
+
+    #[test]
+    fn extracting_several_is_all_or_nothing() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let out = t.path("out");
+        assert!(v.extract_many(&["top.txt", "nope"], &out).unwrap_err().contains("not in the vault"));
+        assert_nothing_written(&out);
+        fs::write(blob_of(&v, "a/2.txt"), b"tampered").unwrap();
+        assert!(v.extract_many(&["top.txt", "a/2.txt"], &out).unwrap_err().contains("failed verification"));
+        assert_nothing_written(&out);
+    }
+
+    /// What a contact does: decrypt with their private key.
+    fn decrypt_as(identity: &x25519::Identity, path: &str) -> Vec<u8> {
+        let data = fs::read(path).unwrap();
+        let dec = age::Decryptor::new(&data[..]).unwrap();
+        let mut stream = dec.decrypt(once(identity as &dyn age::Identity)).unwrap();
+        let mut plain = Vec::new();
+        stream.read_to_end(&mut plain).unwrap();
+        plain
+    }
+
+    #[test]
+    fn sharing_one_file_is_that_file_for_that_recipient_only() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let (friend, stranger) = (x25519::Identity::generate(), x25519::Identity::generate());
+        let out = t.path("top.txt.age");
+        v.share(&["top.txt"], &[&friend.to_public().to_string()], &out).unwrap();
+        assert_eq!(decrypt_as(&friend, &out), b"top");
+        let data = fs::read(&out).unwrap();
+        let dec = age::Decryptor::new(&data[..]).unwrap();
+        assert!(dec.decrypt(once(&stranger as &dyn age::Identity)).is_err());
+        assert!(dec_fails_with_vault_key(&v, &data), "the vault's own key must not open a share");
+    }
+
+    fn dec_fails_with_vault_key(v: &Vault, data: &[u8]) -> bool {
+        let dec = age::Decryptor::new(data).unwrap();
+        dec.decrypt(once(&v.key as &dyn age::Identity)).is_err()
+    }
+
+    #[test]
+    fn sharing_several_is_an_archive_of_only_what_was_chosen() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let friend = x25519::Identity::generate();
+        let out = t.path("many.tar.age");
+        v.share(&["a/sub", "top.txt"], &[&friend.to_public().to_string()], &out).unwrap();
+        let tar = decrypt_as(&friend, &out);
+        assert_eq!(tar.len() % 512, 0);
+        assert!(tar.ends_with(&[0; 1024]));
+        let names: Vec<String> = tar.chunks(512)
+            .filter(|b| &b[257..262] == b"ustar")
+            .map(|b| String::from_utf8_lossy(&b[..100]).trim_end_matches('\0').to_string())
+            .collect();
+        assert_eq!(names, ["a/", "a/sub/", "a/sub/3.txt", "top.txt"]);
+    }
+
+    #[test]
+    fn sharing_refuses_bad_input_and_tampered_files_write_nothing() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let friend = x25519::Identity::generate().to_public().to_string();
+        let out = t.path("out.age");
+        assert!(v.share(&["top.txt"], &[], &out).unwrap_err().contains("--to"));
+        assert!(v.share(&["top.txt"], &["age1nonsense"], &out).unwrap_err().contains("invalid recipient"));
+        assert!(v.share(&["nope"], &[&friend], &out).unwrap_err().contains("not in the vault"));
+        assert!(v.share(&["top.txt"], &[&friend], &format!("{}/x.age", v.dir)).unwrap_err().contains("inside the vault"));
+        fs::write(blob_of(&v, "a/2.txt"), b"tampered").unwrap();
+        assert!(v.share(&[ROOT_ENTRY], &[&friend], &out).unwrap_err().contains("failed verification"));
+        assert_nothing_written(&out);
+        v.remove_everything().unwrap();
+        assert!(v.share(&[ROOT_ENTRY], &[&friend], &out).unwrap_err().contains("nothing"));
+    }
+
+    #[test]
+    fn selection_covers_folders_their_contents_and_the_way_to_them() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let m = v.load_manifest().unwrap();
+        let chosen: Vec<_> = m.selection(&["a/sub/3.txt"]).unwrap().into_iter().collect();
+        assert_eq!(chosen, ["a", "a/sub", "a/sub/3.txt"]);
+        assert_eq!(m.selection(&[ROOT_ENTRY]).unwrap().len(), m.entries.len());
+        assert_eq!(m.size_of(m.selection(&["a"]).unwrap().into_iter()), 11);
+    }
+
+    /// A pipe as the frontend sets one up, and what arrived on it once `work` is done.
+    fn reports(work: impl FnOnce(i32)) -> Vec<u64> {
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        work(fds[1]);
+        unsafe { libc::close(fds[1]) };
+        let mut text = String::new();
+        unsafe { File::from_raw_fd(fds[0]) }.read_to_string(&mut text).unwrap();
+        text.lines().map(|l| l.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn progress_climbs_to_100_without_repeating_itself() {
+        let t = TempDir::new();
+        let mut v = quick_vault(&t);
+        let big = t.write("big.bin", &vec![7u8; 5 << 20]);
+        for step in 0..2 {
+            let got = reports(|fd| {
+                v.progress = Rc::new(Progress::to_fd(fd).unwrap());
+                if step == 0 {
+                    v.add(&[big.clone()], None, false).unwrap();
+                } else {
+                    v.extract("big.bin", &t.path("out.bin")).unwrap();
+                }
+            });
+            assert!(got.len() > 3, "step {step}: {got:?}");
+            assert!(got.windows(2).all(|w| w[0] < w[1]), "step {step}: {got:?}");
+            assert_eq!(*got.last().unwrap(), 100, "step {step}: {got:?}");
+        }
+    }
+
+    #[test]
+    fn a_bad_progress_fd_is_harmless_or_refused() {
+        assert!(Progress::to_fd(1).is_err());
+        let progress = Progress::to_fd(987_654).unwrap(); // not open: writes just fail
+        progress.start(10);
+        progress.advance(5);
     }
 
     #[test]

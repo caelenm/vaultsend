@@ -569,7 +569,7 @@ def section_fuzz():
     print("== bad arguments and secrets never panic", flush=True)
     random.seed(7)
     v = new_vault("fuzz.vsvault", "password", VAULT_PASS)
-    commands = ["vault-create", "vault-list", "vault-add", "vault-remove", "vault-extract", "vault-check", "vault-nonsense", "", "--help"]
+    commands = ["vault-create", "vault-list", "vault-add", "vault-remove", "vault-extract", "vault-share", "vault-check", "vault-nonsense", "", "--help"]
     options = ["--dir", "--mode", "--pass-fd", "--src", "--dest", "--entry", "--out", "--replace", "--key-sha256", "--bogus", "-", "--"]
     values = [str(v), str(T / "missing"), "/", "", ".", "..", "../x", "a/../b", "self", "password", "root", "0", "1", "2", "3", "99", "-1", "99999999999999999999",
               "‮", "x" * 5000, "a" * 300 + "/b", "/dev/null", "/proc/self/mem", "%", "%2F", "é", "--replace", str(T)]
