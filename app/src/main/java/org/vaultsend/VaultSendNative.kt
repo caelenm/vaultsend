@@ -67,4 +67,95 @@ object VaultSendNative {
     /** Decrypt a file with the unlocked session key (no passphrase). */
     @Throws(BackendException::class)
     external fun decryptFdSession(dataDir: String, inFd: Int, outFd: Int)
+
+    // --- Vaults (vault.rs, through ffi.rs) ------------------------------------
+    //
+    // One call per desktop vault-* command. `tree` is the vault's folder;
+    // `secret` carries what the desktop's --pass-fd carried (the identity
+    // passphrase for a "self" vault, the password for a "password" vault) or
+    // null to use the unlocked session or a remembered key. Calls that return a
+    // String end with any warnings, one "warning: ..." line each.
+
+    @Throws(BackendException::class)
+    external fun vaultCreate(dataDir: String, tree: VaultTree, mode: String, secret: ByteArray?)
+
+    /** "generation N", then "D path" and "F size path" lines (paths %-escaped). */
+    @Throws(BackendException::class)
+    external fun vaultList(dataDir: String, tree: VaultTree, secret: ByteArray?): String
+
+    /** "orphan ..." lines, then "ok N file(s) verified". */
+    @Throws(BackendException::class)
+    external fun vaultCheck(dataDir: String, tree: VaultTree, secret: ByteArray?, progress: ProgressSink?): String
+
+    @Throws(BackendException::class)
+    external fun vaultAdd(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        targets: Array<String>,
+        isDir: BooleanArray,
+        sizes: LongArray,
+        skipped: Int,
+        sources: VaultSources,
+        dest: String?,
+        replace: Boolean,
+        progress: ProgressSink?,
+    ): String
+
+    @Throws(BackendException::class)
+    external fun vaultRemove(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        entries: Array<String>,
+        all: Boolean,
+        progress: ProgressSink?,
+    ): String
+
+    /** One file into [outFd], a document the caller made and removes if this fails. */
+    @Throws(BackendException::class)
+    external fun vaultExtractFile(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        entry: String,
+        outFd: Int,
+        progress: ProgressSink?,
+    ): String
+
+    /** A folder, or several entries keeping their paths, into a new folder [name] in [outTree]. */
+    @Throws(BackendException::class)
+    external fun vaultExtractTree(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        entries: Array<String>,
+        outTree: VaultTree,
+        name: String,
+        progress: ProgressSink?,
+    ): String
+
+    /** A plain age file for [recipients] into [outFd]: one file as itself, anything else as a tar. */
+    @Throws(BackendException::class)
+    external fun vaultShare(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        entries: Array<String>,
+        recipients: Array<String>,
+        outFd: Int,
+        progress: ProgressSink?,
+    ): String
+
+    /** 0 remembers no vault key, negative until the app closes, else seconds. Forgets all. */
+    external fun vaultSetRemember(seconds: Long)
+
+    /** Forget one vault's remembered key, by [VaultTree.key]. */
+    external fun vaultForget(key: String)
+
+    external fun vaultIsRemembered(key: String): Boolean
+
+    /** Forget remembered keys whose time is up. */
+    external fun vaultSweep()
 }
+

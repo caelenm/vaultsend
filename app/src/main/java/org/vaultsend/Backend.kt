@@ -2,10 +2,14 @@ package org.vaultsend
 
 import android.content.Context
 import android.net.Uri
+import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import java.io.File
+import java.nio.file.Files
+import java.nio.file.attribute.PosixFilePermissions
 
 /**
  * Thin wrapper over [VaultSendNative]. It owns the data directory (the app's
@@ -180,4 +184,214 @@ class Backend(private val context: Context) {
             }
         return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
     }
+
+    // --- Vaults ---------------------------------------------------------------
+    //
+    // Thin wrappers over the vault calls in VaultSendNative, on the IO dispatcher.
+    // Each returns the core's output with the warnings split off. `secret` is the
+    // identity passphrase (a "self" vault), the vault password (a "password"
+    // vault), or null for the unlocked session or a remembered key; the caller
+    // wipes it afterwards.
+
+    /** Output of a vault call, and what the desktop would have printed as warnings. */
+    data class VaultResult(val output: String, val warnings: List<String>)
+
+    private fun result(text: String): VaultResult {
+        val (warnings, rest) = text.lines().partition { it.startsWith("warning: ") }
+        return VaultResult(rest.joinToString("\n"), warnings.map { it.removePrefix("warning: ") })
+    }
+
+    fun vaultTree(record: VaultRecord): VaultTree = VaultTree.fromDocumentUri(context, Uri.parse(record.uri))
+
+    /** The vault folder a user picked as itself (Add existing vault), and its mode, or null. */
+    suspend fun inspectVault(tree: Uri): Pair<VaultTree, String?> = withContext(Dispatchers.IO) {
+        val vault = VaultTree.fromTree(context, tree)
+        vault to readVaultMode(vault.vaultFileText())
+    }
+
+    /** The mode a known vault's VAULT file names now, or null if it isn't there or isn't a vault. */
+    suspend fun vaultMode(record: VaultRecord): String? = withContext(Dispatchers.IO) {
+        runCatching { readVaultMode(vaultTree(record).vaultFileText()) }.getOrNull()
+    }
+
+    /**
+     * Make a vault called `name` inside the folder `parent` (a tree the user
+     * picked), as `name.vsvault`. An empty folder of that name is used; anything
+     * else is refused by the core, as on desktop. Returns the new vault's folder.
+     */
+    suspend fun vaultCreate(parent: Uri, name: String, mode: String, secret: ByteArray?): VaultTree =
+        withContext(Dispatchers.IO) {
+            val parentTree = VaultTree.fromTree(context, parent)
+            val folder = name + VAULT_SUFFIX
+            if (parentTree.kind(folder) == 0) parentTree.mkdir(folder, false)
+            if (parentTree.kind(folder) != 2) throw BackendException("${parentTree.show(folder)} is not a folder.")
+            val vault = VaultTree(context, parent, childId(parentTree, folder))
+            VaultSendNative.vaultCreate(dataDir, vault, mode, secret)
+            vault
+        }
+
+    /** The document ID of `name` directly inside `tree`. */
+    private fun childId(tree: VaultTree, name: String): String {
+        val children = DocumentsContract.buildChildDocumentsUriUsingTree(tree.treeUri, tree.rootId)
+        val columns = arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID, DocumentsContract.Document.COLUMN_DISPLAY_NAME)
+        context.contentResolver.query(children, columns, null, null, null)?.use { c ->
+            while (c.moveToNext()) if (c.getString(1) == name) return c.getString(0)
+        }
+        throw BackendException("${tree.show(name)} could not be found after creating it.")
+    }
+
+    suspend fun vaultList(record: VaultRecord, secret: ByteArray?): VaultResult = withContext(Dispatchers.IO) {
+        result(VaultSendNative.vaultList(dataDir, vaultTree(record), secret))
+    }
+
+    suspend fun vaultCheck(record: VaultRecord, secret: ByteArray?, progress: ProgressSink?): VaultResult =
+        withContext(Dispatchers.IO) {
+            result(VaultSendNative.vaultCheck(dataDir, vaultTree(record), secret, progress))
+        }
+
+    /** Add picked files and folders, under `dest` (null for the top of the vault). */
+    suspend fun vaultAdd(
+        record: VaultRecord,
+        secret: ByteArray?,
+        files: List<Uri>,
+        folders: List<Uri>,
+        dest: String?,
+        replace: Boolean,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val sources = VaultSources.walk(context, files, folders)
+        result(
+            VaultSendNative.vaultAdd(
+                dataDir, vaultTree(record), secret, sources.targets, sources.isDir, sources.sizes,
+                sources.skipped, sources, dest, replace, progress,
+            ),
+        )
+    }
+
+    /** Remove `entries`, or empty the vault if `all`. */
+    suspend fun vaultRemove(
+        record: VaultRecord,
+        secret: ByteArray?,
+        entries: List<String>,
+        all: Boolean,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        result(VaultSendNative.vaultRemove(dataDir, vaultTree(record), secret, entries.toTypedArray(), all, progress))
+    }
+
+    private fun refuseInside(vault: VaultTree, out: Uri) {
+        if (vault.contains(out)) throw BackendException("the output path must not be inside the vault")
+    }
+
+    /** One file into `output`, a document from "Save as", which is removed if this fails. */
+    suspend fun vaultExtractFile(
+        record: VaultRecord,
+        secret: ByteArray?,
+        entry: String,
+        output: Uri,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val vault = vaultTree(record)
+        try {
+            refuseInside(vault, output)
+            context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
+                requireNotNull(pfd) { "Couldn't open the destination." }
+                result(VaultSendNative.vaultExtractFile(dataDir, vault, secret, entry, pfd.fd, progress))
+            }
+        } catch (e: Exception) {
+            discardOutput(output)
+            throw e
+        }
+    }
+
+    /** A folder, or several entries, into a new folder `name` inside the picked folder `outTree`. */
+    suspend fun vaultExtractTree(
+        record: VaultRecord,
+        secret: ByteArray?,
+        entries: List<String>,
+        outTree: Uri,
+        name: String,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val vault = vaultTree(record)
+        refuseInside(vault, outTree)
+        val folder = VaultTree.fromTree(context, outTree)
+        result(VaultSendNative.vaultExtractTree(dataDir, vault, secret, entries.toTypedArray(), folder, name, progress))
+    }
+
+    /** Share as a plain age file for `recipients` into `output`, removed if this fails. */
+    suspend fun vaultShare(
+        record: VaultRecord,
+        secret: ByteArray?,
+        entries: List<String>,
+        recipients: List<String>,
+        output: Uri,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val vault = vaultTree(record)
+        try {
+            refuseInside(vault, output)
+            context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
+                requireNotNull(pfd) { "Couldn't open the destination." }
+                result(
+                    VaultSendNative.vaultShare(
+                        dataDir, vault, secret, entries.toTypedArray(), recipients.toTypedArray(), pfd.fd, progress,
+                    ),
+                )
+            }
+        } catch (e: Exception) {
+            discardOutput(output)
+            throw e
+        }
+    }
+
+    /** Where Open's copies go: see OpenCopies.kt. */
+    val openRoot: File get() = File(context.cacheDir, OPEN_DIR)
+
+    /**
+     * Decrypt one file for Open into a new private folder in the cache, as
+     * `name`, 0600. Verified in full in the core before a byte is written. Returns
+     * the copy; on failure nothing is left behind.
+     */
+    suspend fun vaultOpenCopy(
+        record: VaultRecord,
+        secret: ByteArray?,
+        entry: String,
+        progress: ProgressSink?,
+    ): File = withContext(Dispatchers.IO) {
+        val folder = newCopyFolder(openRoot)
+        val copy = File(folder, entry.substringAfterLast('/'))
+        try {
+            Files.createFile(copy.toPath(), PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+            ParcelFileDescriptor.open(copy, ParcelFileDescriptor.MODE_WRITE_ONLY).use { pfd ->
+                VaultSendNative.vaultExtractFile(dataDir, vaultTree(record), secret, entry, pfd.fd, progress)
+            }
+            copy
+        } catch (e: Exception) {
+            deleteTree(folder)
+            throw e
+        }
+    }
+
+    /** Delete opened copies: one, or all of them. */
+    fun discardCopies(copies: Collection<File>? = null) {
+        if (copies == null) {
+            clearStaleCopies(openRoot)
+        } else {
+            copies.forEach { deleteTree(it.parentFile ?: it) }
+        }
+    }
+
+    /** How long a password vault's key is remembered: 0 never, null until the app closes. */
+    fun setVaultRemember(seconds: Long?) = VaultSendNative.vaultSetRemember(seconds ?: -1)
+
+    fun forgetVault(record: VaultRecord) {
+        runCatching { VaultSendNative.vaultForget(vaultTree(record).key("")) }
+    }
+
+    fun isVaultRemembered(record: VaultRecord): Boolean =
+        runCatching { VaultSendNative.vaultIsRemembered(vaultTree(record).key("")) }.getOrDefault(false)
+
+    fun sweepVaultKeys() = VaultSendNative.vaultSweep()
 }
+

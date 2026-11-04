@@ -23,16 +23,8 @@ class ContactStore(context: Context) {
         return runCatching { parseContacts(file.readText()) }.getOrDefault(emptyList())
     }
 
-    fun save(contacts: List<Contact>) {
-        val text = serializeContacts(contacts)
-        // Write to a temp file then rename, so contacts.json is never half-written.
-        val tmp = File(file.parentFile, "contacts.json.tmp")
-        tmp.writeText(text)
-        if (!tmp.renameTo(file)) {
-            file.writeText(text)
-            tmp.delete()
-        }
-    }
+    /** Never half-written, and readable by this app alone (see [savePrivately]). */
+    fun save(contacts: List<Contact>) = savePrivately(file, serializeContacts(contacts))
 }
 
 /**
