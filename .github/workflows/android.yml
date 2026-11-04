@@ -51,6 +51,10 @@ jobs:
       - name: Assemble debug APK (runs build-rust.sh via preBuild)
         run: ./gradlew assembleDebug --stacktrace
 
+      # VaultHelpersTest: the desktop's test_frontend_helpers.py, ported.
+      - name: Kotlin unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
       - uses: actions/upload-artifact@v4
         with:
           name: vaultsend-debug-apk

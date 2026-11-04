@@ -40,13 +40,19 @@ org.vaultsend
 vaultsend-android/
 ├── rust/                     # Rust core (the only code that touches the key)
 │   ├── src/backend.rs        #   crypto + identity logic (refactored desktop main.rs)
+│   ├── src/vault.rs          #   vaults: the desktop's vault.rs, behind a Store
+│   ├── src/tar.rs            #   the archive Share writes (desktop's, unchanged)
 │   ├── src/ffi.rs            #   JNI entry points (the whole FFI surface)
+│   ├── src/vault_cli.rs      #   desktop vault-* commands, for host tests only
+│   ├── examples/vault_cli.rs #   ...as a binary the desktop test scripts drive
+│   ├── tests/                #   the desktop's vault_roundtrip.sh, vault_attack.py, verify_deps.sh
 │   └── src/lib.rs
 ├── app/                      # Android app
 │   └── src/main/
 │       ├── java/org/vaultsend/        # Kotlin (UI + native bindings)
 │       ├── res/                       # icon, theme, strings, backup rules
 │       └── AndroidManifest.xml        # no permissions; no network
+│   └── src/test/                      # JVM unit tests (VaultHelpersTest)
 ├── build-rust.sh             # cross-compiles the core for all ABIs -> jniLibs
 └── settings.gradle.kts, build.gradle.kts, app/build.gradle.kts
 ```
@@ -122,7 +128,7 @@ is the device-independent default requested here.)
   out ASCII-armored so it pastes into any chat or email.
 - **Decrypt** text or a file. The first decrypt of a session asks for your
   passphrase to **unlock**; after that you stay unlocked until you close the app,
-  tap **Lock** in the ⋮ menu, or leave the app in the background for 2 minutes
+  tap **Lock now** in the ⋮ menu, or leave the app in the background for 2 minutes
   (see the security note below). File decryption stages
   the output to a private temp file and only writes it to your chosen destination
   after the whole stream authenticates, so a tampered or truncated file never
@@ -135,6 +141,25 @@ is the device-independent default requested here.)
 - **Contacts** are stored as `contacts.json` in the same `[{name, pubkey}]` shape
   as desktop, so the file is interchangeable between the two. Contacts never reach
   the crypto core.
+- **Vaults.** Keep a whole folder encrypted and change it one file at a time, as in
+  the desktop app, in the same format, so a vault moves between the two. Open the
+  drawer, switch it to **Vaults**, tap **+**, name it, choose how to protect it (your
+  key, or a password you can share), then choose the folder it goes in. It stays
+  there, where your file manager shows it, and VaultSend asks for access to that
+  folder only. Tap a vault, then **Unlock**, to see its files. **Add files…** and
+  **Add folder…** add into the selected folder, if one is. **Open**, **Extract…**,
+  **Share…** and **Delete** act on what's selected, and wait until something is.
+  **Select multiple** turns the rows into tick boxes, **Select all** ticks every row,
+  and **Verify all** checks every file for tampering. **Share…** encrypts what's
+  selected for a contact, as an ordinary `.age` file they decrypt in VaultSend (a
+  folder or several items arrive as a `.tar` inside it). **Remove from list** only
+  forgets a vault; its files stay where they are. To add a vault you already have
+  (a backup, a copy from your computer, or one someone shared), use **Add existing
+  vault…**, or pick its `VAULT` file with **Open file…** and choose its folder.
+- **Remember passphrase** (⋮ menu): how long your key stays unlocked, and how long a
+  password vault's key is remembered: Off, 5 minutes, 20 minutes, 1 day, 1 week, or
+  until VaultSend closes (the default, which is how this app has always worked).
+  **Lock now** forgets all of it, locks open vaults and deletes opened copies.
 
 ## Security model — what changed in the port
 
@@ -179,7 +204,7 @@ That cache lives in the **Rust library, not the JVM**, on purpose. A Kotlin
 `String`/`ByteArray` cannot be reliably wiped: the garbage collector may copy it
 around the managed heap and leave the original in freed memory until it is
 reclaimed. The native cache is a `SecretString` that zeroes its buffer on drop;
-`lock()` drops it, the ⋮ **Lock** action calls it, and the Activity calls it when
+`lock()` drops it, the ⋮ **Lock now** action calls it, and the Activity calls it when
 the app is finishing or has been in the background for 2 minutes (Android does not
 reliably call `onDestroy()` when an app is swiped away or left running). The key is never written to disk and never crosses back into
 the JVM; for each decrypt it is briefly copied into zeroizing storage, used, and
@@ -191,9 +216,44 @@ widens the window in which it is in memory. That is the cost of the unlock-once
 convenience; it is made as safe as an in-process design allows — zeroizing,
 mutex-guarded, native-only — and the OS sandbox above is the same boundary that
 protects `identity.age` itself. If you prefer the stronger per-operation posture,
-tap **Lock** after each use, or shorten `BACKGROUND_LOCK_MS` in `MainActivity`.
+set **Remember passphrase** to Off, or shorten `BACKGROUND_LOCK_MS` in `MainActivity`.
 The recent-apps thumbnail is disabled (Android 13+) so decrypted text isn't shown
 there.
+
+### Vaults
+
+A vault is the desktop app's: each file is its own age file, a manifest pins each
+one by SHA-256, and the vault's key is sealed with a secret only your private key
+can produce, or with a password. `rust/src/vault.rs` is the desktop's file, with
+its file access behind a `Store`. See the desktop branch's `CHANGES-VAULTS.md` for
+the format and threat model, and this branch's `CHANGES-VAULTS.md` for what differs
+here. In short:
+
+- **Where it lives.** In a folder you choose, through the Storage Access Framework.
+  The app keeps access to that folder and nothing else. Anything that can read the
+  folder sees what the desktop says it would: how many files, roughly how big, when
+  they changed. It doesn't see names or contents.
+- **Nothing is written until it has verified.** As on desktop, a file is decrypted
+  and verified in the library's memory before any of it is written, and only to a
+  place you chose.
+- **Replacing the manifest.** SAF can't rename over a file, so a change deletes the
+  old manifest and then renames the new one in. If the app is killed in between,
+  the next open puts the new one in place, after checking that it's this vault's.
+- **Remembered keys.** A password vault's own key, not its password, is held in the
+  native library, wiped on drop and locked in RAM (see below), and never in the JVM.
+  A vault using your key needs nothing remembered: it opens with your unlocked key.
+- **Locked buffers.** The desktop's per-buffer `mlock` of secrets is kept: the
+  passphrase as read, your key's text, the seal, a vault's key, and here also the
+  unlocked session key. Since this process outlives one operation, each buffer is
+  unlocked again when it's dropped.
+- **Open takes a file outside what VaultSend can protect.** The copy goes in the
+  app's private storage. That's on disk, which Android encrypts, because Android has
+  no RAM folder an app can use. The app that shows it gets read-only access to that
+  one file. It can still keep its own copies (recent files, previews), and VaultSend
+  can't see or remove those; the first Open says so and asks you to acknowledge it.
+  Copies are deleted when you lock the vault, use Lock now, or close the app, and at
+  the next launch if the app was killed. They are not deleted by the 2-minute
+  background lock, since you're probably looking at one in another app.
 
 New keys need a passphrase of at least 10 characters, and the identity is
 encrypted at the standard scrypt work factor of 2^18 (the same as the desktop app,
@@ -202,6 +262,15 @@ here. Files at a work factor above 2^20 are refused with an explicit message:
 scrypt would need more than 1 GiB of memory.
 
 ## Build verification status
+
+**Vaults (0.2.0).** The Rust core passes `cargo test` on Rust 1.75 and current
+stable: 62 tests, including all 48 of the desktop branch's vault and tar tests. The
+desktop's end-to-end `vault_roundtrip.sh` passes 131 of 131 against this code
+(`rust/tests/`, run in CI), and `vault_attack.py` passes everything about vaults
+(211 checks). Its 4 process-hardening checks don't apply here, for the reason given in
+*Security model*. The Kotlin vault helpers have JVM unit tests (`testDebugUnitTest`,
+in CI). The app itself is built by CI; it wasn't built or run on a device or emulator
+for this change. See `CHANGES-VAULTS.md`.
 
 The Rust core in this tree was compiled and unit-tested with `cargo test` —
 encrypt/decrypt round-trips, multi-recipient, key recovery, status transitions,

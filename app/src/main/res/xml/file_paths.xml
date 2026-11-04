@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- What Open's FileProvider may serve: the private copies in the cache's open/
+     folder (OpenCopies.kt), and nothing else. -->
+<paths>
+    <cache-path name="open" path="open/" />
+</paths>

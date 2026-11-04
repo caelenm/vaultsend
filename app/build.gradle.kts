@@ -14,8 +14,8 @@ android {
         applicationId = "org.vaultsend"
         minSdk = 26
         targetSdk = 35
-        versionCode = 3
-        versionName = "0.1.2"
+        versionCode = 4
+        versionName = "0.2.0"
 
         // Device independence: package the native library for every Android ABI
         // into one universal APK, so a single .apk installs on any device.
@@ -69,6 +69,11 @@ dependencies {
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
+
+    // VaultHelpersTest runs the window-free vault helpers on the JVM. org.json is
+    // part of Android, but only as stubs in unit tests, so the real one is added.
+    testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
 
     debugImplementation("androidx.compose.ui:ui-tooling")
     implementation("androidx.compose.ui:ui-tooling-preview")

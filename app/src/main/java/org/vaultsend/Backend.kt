@@ -203,6 +203,25 @@ class Backend(private val context: Context) {
 
     fun vaultTree(record: VaultRecord): VaultTree = VaultTree.fromDocumentUri(context, Uri.parse(record.uri))
 
+    /**
+     * The vault's folder for an operation, refused with a clear message if the
+     * app no longer holds access to it (the grant can be revoked in system
+     * settings), rather than reporting the folder as "not a vault".
+     */
+    private fun openVault(record: VaultRecord): VaultTree {
+        val vault = vaultTree(record)
+        val granted = context.contentResolver.persistedUriPermissions.any {
+            it.uri == vault.treeUri && it.isReadPermission && it.isWritePermission
+        }
+        if (!granted) {
+            throw BackendException(
+                "VaultSend no longer has access to this vault's folder. Remove it from the list, " +
+                    "then add it again with Add existing vault….",
+            )
+        }
+        return vault
+    }
+
     /** The vault folder a user picked as itself (Add existing vault), and its mode, or null. */
     suspend fun inspectVault(tree: Uri): Pair<VaultTree, String?> = withContext(Dispatchers.IO) {
         val vault = VaultTree.fromTree(context, tree)
@@ -241,12 +260,12 @@ class Backend(private val context: Context) {
     }
 
     suspend fun vaultList(record: VaultRecord, secret: ByteArray?): VaultResult = withContext(Dispatchers.IO) {
-        result(VaultSendNative.vaultList(dataDir, vaultTree(record), secret))
+        result(VaultSendNative.vaultList(dataDir, openVault(record), secret))
     }
 
     suspend fun vaultCheck(record: VaultRecord, secret: ByteArray?, progress: ProgressSink?): VaultResult =
         withContext(Dispatchers.IO) {
-            result(VaultSendNative.vaultCheck(dataDir, vaultTree(record), secret, progress))
+            result(VaultSendNative.vaultCheck(dataDir, openVault(record), secret, progress))
         }
 
     /** Add picked files and folders, under `dest` (null for the top of the vault). */
@@ -262,7 +281,7 @@ class Backend(private val context: Context) {
         val sources = VaultSources.walk(context, files, folders)
         result(
             VaultSendNative.vaultAdd(
-                dataDir, vaultTree(record), secret, sources.targets, sources.isDir, sources.sizes,
+                dataDir, openVault(record), secret, sources.targets, sources.isDir, sources.sizes,
                 sources.skipped, sources, dest, replace, progress,
             ),
         )
@@ -276,7 +295,7 @@ class Backend(private val context: Context) {
         all: Boolean,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        result(VaultSendNative.vaultRemove(dataDir, vaultTree(record), secret, entries.toTypedArray(), all, progress))
+        result(VaultSendNative.vaultRemove(dataDir, openVault(record), secret, entries.toTypedArray(), all, progress))
     }
 
     private fun refuseInside(vault: VaultTree, out: Uri) {
@@ -291,7 +310,7 @@ class Backend(private val context: Context) {
         output: Uri,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        val vault = vaultTree(record)
+        val vault = openVault(record)
         try {
             refuseInside(vault, output)
             context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
@@ -313,7 +332,7 @@ class Backend(private val context: Context) {
         name: String,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        val vault = vaultTree(record)
+        val vault = openVault(record)
         refuseInside(vault, outTree)
         val folder = VaultTree.fromTree(context, outTree)
         result(VaultSendNative.vaultExtractTree(dataDir, vault, secret, entries.toTypedArray(), folder, name, progress))
@@ -328,7 +347,7 @@ class Backend(private val context: Context) {
         output: Uri,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        val vault = vaultTree(record)
+        val vault = openVault(record)
         try {
             refuseInside(vault, output)
             context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
@@ -364,7 +383,7 @@ class Backend(private val context: Context) {
         try {
             Files.createFile(copy.toPath(), PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
             ParcelFileDescriptor.open(copy, ParcelFileDescriptor.MODE_WRITE_ONLY).use { pfd ->
-                VaultSendNative.vaultExtractFile(dataDir, vaultTree(record), secret, entry, pfd.fd, progress)
+                VaultSendNative.vaultExtractFile(dataDir, openVault(record), secret, entry, pfd.fd, progress)
             }
             copy
         } catch (e: Exception) {
