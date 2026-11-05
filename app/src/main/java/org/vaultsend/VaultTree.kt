@@ -361,7 +361,16 @@ class VaultSources private constructor(
     }
 }
 
-/** Called from Rust with whole percents as a vault operation goes. */
-fun interface ProgressSink {
-    fun report(percent: Int)
+/**
+ * Called from Rust with whole percents as a vault operation goes, and asked by it
+ * whether the user has pressed Cancel. A class rather than a fun interface, so
+ * both methods exist on the object the native side calls, however it was made.
+ */
+open class ProgressSink(private val onReport: (Int) -> Unit = {}) {
+    @Volatile
+    var cancelled: Boolean = false
+
+    fun report(percent: Int) = onReport(percent)
+
+    fun isCancelled(): Boolean = cancelled
 }

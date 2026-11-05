@@ -149,6 +149,42 @@ fun shareFileName(vaultName: String, selection: List<String>, entries: Map<Strin
     return only.substringAfterLast('/') + if (entries.getValue(only).isDir) ".tar.age" else ".age"
 }
 
+/** What Share names an archive ends with. */
+const val ARCHIVE_SUFFIX = ".tar.age"
+
+/** Whether a shared file's name says it's an archive of several files (Share's naming). */
+fun isArchiveName(name: String): Boolean =
+    name.lowercase().let { it.endsWith(ARCHIVE_SUFFIX) || it.endsWith(".tar") }
+
+private fun withoutAge(name: String): String =
+    if (name.lowercase().endsWith(".age")) name.dropLast(4) else name
+
+private fun withoutTar(name: String): String =
+    if (name.lowercase().endsWith(".tar")) name.dropLast(4) else name
+
+/** The folder an archive unpacks into: "Holiday.tar.age" gives "Holiday". */
+fun archiveFolderName(fileName: String): String =
+    withoutTar(withoutAge(fileName)).trim().takeIf { isValidVaultName(it) } ?: "Shared files"
+
+/** A single shared file's own name, as it goes into a vault: "photo.jpg.age" gives "photo.jpg". */
+fun singleNameFromShared(fileName: String): String =
+    withoutAge(fileName).trim().takeIf { it.isNotEmpty() && '/' !in it && it != "." && it != ".." } ?: "shared file"
+
+/**
+ * The name to suggest for a vault made from a shared file: the vault it came from,
+ * as Share named it ("Holiday.tar.age", "Holiday selection.tar.age"), or a single
+ * file's name without its extension.
+ */
+fun vaultNameFromShared(fileName: String): String {
+    val base = withoutAge(fileName)
+    val name = if (base.lowercase().endsWith(".tar")) {
+        withoutTar(base).removeSuffix(" selection")
+    } else {
+        base.substringBeforeLast('.', base).ifEmpty { base }
+    }
+    return name.trim().takeIf { isValidVaultName(it) } ?: "Shared vault"
+}
+
 fun vaultNameFromPath(path: String): String =
     path.trimEnd('/').substringAfterLast('/').removeSuffix(VAULT_SUFFIX)
 
@@ -215,6 +251,32 @@ data class VaultSelection(
         } else {
             copy(ticked = ticked - inside.toSet() - parentFolders(path).toSet())
         }
+    }
+
+    /**
+     * Invert selection, with Select multiple on: every file and empty folder flips,
+     * hidden ones too, and a folder is ticked exactly when everything in it is, so a
+     * ticked folder still means the whole folder. Off, it does nothing.
+     */
+    fun invert(): VaultSelection {
+        if (!multiple) return this
+        val holding = entries.keys.flatMapTo(HashSet()) { parentFolders(it) }
+        val leaves = entries.values.filter { !it.isDir || it.path !in holding }.map { it.path }
+        val flipped = leaves.filterTo(HashSet()) { it !in ticked }
+        // A folder is whole when no leaf below it is left unticked.
+        val partial = leaves.filter { it !in flipped }.flatMapTo(HashSet()) { parentFolders(it) }
+        val folders = holding.filter { it in entries && it !in partial }
+        return copy(ticked = flipped + folders)
+    }
+
+    /**
+     * Where Add files… and Add folder… put things: into the one chosen folder, beside
+     * the one chosen file, otherwise at the top of the vault ("").
+     */
+    fun addDestination(): String {
+        val chosen = chosen()
+        val one = if (chosen.size == 1) chosen[0] else ROOT_ENTRY
+        return if (entries[one]?.isDir == true) one else one.substringBeforeLast('/', "").removePrefix("/")
     }
 
     /** Select all takes the tick boxes; pressed again with everything ticked, Select none. */

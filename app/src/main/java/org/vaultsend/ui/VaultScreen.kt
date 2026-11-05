@@ -1,18 +1,30 @@
 package org.vaultsend.ui
 
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.ExperimentalLayoutApi
-import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.RowScope
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
@@ -21,18 +33,28 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.ArrowDropDown
+import androidx.compose.material.icons.filled.ArrowDropUp
+import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.CreateNewFolder
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RemoveCircleOutline
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.Unarchive
+import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
+import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -42,11 +64,10 @@ import androidx.compose.material3.ModalDrawerSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.RadioButton
-import androidx.compose.material3.SegmentedButton
-import androidx.compose.material3.SegmentedButtonDefaults
-import androidx.compose.material3.SingleChoiceSegmentedButtonRow
+import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.VerticalDivider
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
@@ -55,7 +76,12 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import org.vaultsend.Contact
@@ -101,15 +127,12 @@ fun SidebarDrawer(
                 modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
             ) {
-                SingleChoiceSegmentedButtonRow(modifier = Modifier.weight(1f)) {
-                    SidebarMode.entries.forEachIndexed { i, m ->
-                        SegmentedButton(
-                            selected = mode == m,
-                            onClick = { onMode(m) },
-                            shape = SegmentedButtonDefaults.itemShape(i, SidebarMode.entries.size),
-                        ) { Text(m.name) }
-                    }
-                }
+                SlidingToggle(
+                    options = SidebarMode.entries.map { it.name },
+                    selected = SidebarMode.entries.indexOf(mode),
+                    onSelect = { onMode(SidebarMode.entries[it]) },
+                    modifier = Modifier.weight(1f),
+                )
                 val adding = if (mode == SidebarMode.Contacts) "Add contact" else "Add vault"
                 IconButton(onClick = if (mode == SidebarMode.Contacts) onAddContact else onAddVault) {
                     Icon(Icons.Filled.Add, contentDescription = adding)
@@ -140,6 +163,66 @@ fun SidebarDrawer(
                             )
                         }
                     }
+                }
+            }
+        }
+    }
+}
+
+/** How much of the toggle the chosen side takes; the line between them slides to match. */
+private const val TOGGLE_CHOSEN_SHARE = 0.62f
+
+/**
+ * Two options in one outlined pill. The chosen one is filled and wider, and the
+ * line between them slides across as the choice changes.
+ */
+@Composable
+fun SlidingToggle(
+    options: List<String>,
+    selected: Int,
+    onSelect: (Int) -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val outline = MaterialTheme.colorScheme.outline
+    val shape = RoundedCornerShape(50)
+    Row(
+        modifier = modifier
+            .height(40.dp)
+            .clip(shape)
+            .border(1.dp, outline, shape)
+            .selectableGroup(),
+    ) {
+        options.forEachIndexed { i, label ->
+            val chosen = i == selected
+            val share by animateFloatAsState(
+                targetValue = if (chosen) TOGGLE_CHOSEN_SHARE else (1f - TOGGLE_CHOSEN_SHARE) / (options.size - 1),
+                animationSpec = tween(durationMillis = 250),
+                label = "toggle share",
+            )
+            if (i > 0) VerticalDivider(color = outline)
+            Box(
+                modifier = Modifier
+                    .weight(share)
+                    .fillMaxHeight()
+                    .background(if (chosen) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
+                    .selectable(selected = chosen, role = Role.Tab, onClick = { onSelect(i) }),
+                contentAlignment = Alignment.Center,
+            ) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    AnimatedVisibility(visible = chosen) {
+                        Icon(
+                            Icons.Filled.Check,
+                            contentDescription = null,
+                            modifier = Modifier.padding(end = 4.dp).size(18.dp),
+                        )
+                    }
+                    Text(
+                        label,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        color = if (chosen) MaterialTheme.colorScheme.onSecondaryContainer else MaterialTheme.colorScheme.onSurface,
+                    )
                 }
             }
         }
@@ -205,9 +288,10 @@ class VaultActions(
     val onDelete: () -> Unit,
     val onLock: () -> Unit,
     val onVerify: () -> Unit,
+    /** Stop the operation in progress, where it can be stopped. */
+    val onCancel: () -> Unit = {},
 )
 
-@OptIn(ExperimentalLayoutApi::class)
 @Composable
 fun VaultPage(
     vault: VaultRecord,
@@ -216,6 +300,9 @@ fun VaultPage(
     progressHeading: String,
     onChange: (VaultSelection) -> Unit,
     actions: VaultActions,
+    menuOpen: Boolean,
+    onMenuOpen: (Boolean) -> Unit,
+    canCancel: Boolean,
     modifier: Modifier = Modifier,
 ) {
     Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -231,22 +318,39 @@ fun VaultPage(
             )
         }
         val everything = page?.chosen() == listOf(ROOT_ENTRY)
-        // Only one of Select all and Select multiple is lit at a time: with every row
-        // ticked, Select all is.
-        FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
-            FilterChip(
-                selected = everything,
-                onClick = { page?.let { onChange(it.selectAll()) } },
+        // Four equal buttons. Only one of Select all and Select multiple is lit at a
+        // time: with every row ticked, Select all is. Invert works on tick boxes, so
+        // it waits for Select multiple.
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            val row = Modifier.weight(1f)
+            TopButton(
+                label = if (everything) "Select none" else "Select all",
+                lit = everything,
                 enabled = !page?.entries.isNullOrEmpty(),
-                label = { Text(if (everything) "Select none" else "Select all") },
+                onClick = { page?.let { onChange(it.selectAll()) } },
+                modifier = row,
             )
-            FilterChip(
-                selected = page?.multiple == true && !everything,
-                onClick = { page?.let { onChange(it.withMultiple(!it.multiple)) } },
+            TopButton(
+                label = "Select multiple",
+                lit = page?.multiple == true && !everything,
                 enabled = page != null,
-                label = { Text("Select multiple") },
+                onClick = { page?.let { onChange(it.withMultiple(!it.multiple)) } },
+                modifier = row,
             )
-            TextButton(onClick = actions.onVerify, enabled = page != null) { Text("Verify all") }
+            TopButton(
+                label = "Invert selection",
+                lit = false,
+                enabled = page != null && page.multiple && page.entries.isNotEmpty(),
+                onClick = { page?.let { onChange(it.invert()) } },
+                modifier = row,
+            )
+            TopButton(
+                label = "Verify all",
+                lit = false,
+                enabled = page != null && progress == null,
+                onClick = actions.onVerify,
+                modifier = row,
+            )
         }
 
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
@@ -279,36 +383,131 @@ fun VaultPage(
         }
 
         if (progress != null) {
-            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                Text(
-                    if (progress >= 0) "$progressHeading $progress%" else progressHeading,
-                    style = MaterialTheme.typography.bodySmall,
-                )
-                // Pulses until the first report and once the work is done but not yet committed.
-                if (progress in 0..99) {
-                    LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth())
-                } else {
-                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
-                }
-            }
+            ProgressRow(progress, progressHeading, if (canCancel) actions.onCancel else null)
         }
 
         // Nothing selected means nothing to act on: Open, Extract…, Share… and Delete wait.
-        val chosen = page?.chosen().orEmpty().isNotEmpty()
-        val idle = page != null && progress == null
-        FlowRow(
-            horizontalArrangement = Arrangement.spacedBy(6.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-        ) {
-            OutlinedButton(onClick = actions.onAddFiles, enabled = idle) { Text("Add files…") }
-            OutlinedButton(onClick = actions.onAddFolder, enabled = idle) { Text("Add folder…") }
-            OutlinedButton(onClick = actions.onOpen, enabled = idle && chosen) { Text("Open") }
-            OutlinedButton(onClick = actions.onExtract, enabled = idle && chosen) { Text("Extract…") }
-            OutlinedButton(onClick = actions.onShare, enabled = idle && chosen) { Text("Share…") }
-            OutlinedButton(onClick = actions.onDelete, enabled = idle && chosen) { Text("Delete") }
-            OutlinedButton(onClick = actions.onLock, enabled = page != null) { Text("Lock") }
+        VaultActionSheet(
+            open = menuOpen,
+            onOpen = onMenuOpen,
+            idle = page != null && progress == null,
+            chosen = page?.chosen().orEmpty().isNotEmpty(),
+            unlocked = page != null,
+            actions = actions,
+        )
+    }
+}
+
+/** A progress bar with its heading, and Cancel where the operation can stop. */
+@Composable
+fun ProgressRow(progress: Int, heading: String, onCancel: (() -> Unit)?) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(
+                if (progress >= 0) "$heading $progress%" else heading,
+                style = MaterialTheme.typography.bodySmall,
+                modifier = Modifier.weight(1f),
+            )
+            if (onCancel != null) TextButton(onClick = onCancel) { Text("Cancel") }
         }
-        Spacer(Modifier.padding(bottom = 4.dp))
+        // Pulses until the first report and once the work is done but not yet committed.
+        if (progress in 0..99) {
+            LinearProgressIndicator(progress = { progress / 100f }, modifier = Modifier.fillMaxWidth())
+        } else {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth())
+        }
+    }
+}
+
+/** One of the four buttons above the list: filled while its mode is on. */
+@Composable
+private fun TopButton(label: String, lit: Boolean, enabled: Boolean, onClick: () -> Unit, modifier: Modifier) {
+    val padding = PaddingValues(horizontal = 4.dp, vertical = 6.dp)
+    val content: @Composable RowScope.() -> Unit = {
+        Text(
+            label,
+            style = MaterialTheme.typography.labelMedium,
+            textAlign = TextAlign.Center,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+        )
+    }
+    val shape = RoundedCornerShape(12.dp)
+    val sized = modifier.heightIn(min = 52.dp)
+    if (lit) {
+        FilledTonalButton(onClick = onClick, enabled = enabled, shape = shape, contentPadding = padding, modifier = sized, content = content)
+    } else {
+        OutlinedButton(onClick = onClick, enabled = enabled, shape = shape, contentPadding = padding, modifier = sized, content = content)
+    }
+}
+
+/**
+ * The page's actions, stacked in a panel with rounded top corners that folds away
+ * to its handle, so the list can have the screen.
+ */
+@Composable
+private fun VaultActionSheet(
+    open: Boolean,
+    onOpen: (Boolean) -> Unit,
+    idle: Boolean,
+    chosen: Boolean,
+    unlocked: Boolean,
+    actions: VaultActions,
+) {
+    Surface(
+        shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+        tonalElevation = 2.dp,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column {
+            val toggle = if (open) "Hide actions" else "Show actions"
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClickLabel = toggle) { onOpen(!open) }
+                    .padding(vertical = 2.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    if (open) Icons.Filled.ArrowDropDown else Icons.Filled.ArrowDropUp,
+                    contentDescription = toggle,
+                    modifier = Modifier.size(36.dp),
+                )
+            }
+            AnimatedVisibility(visible = open) {
+                Column(
+                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp),
+                ) {
+                    SheetItem(Icons.Filled.UploadFile, "Add files…", idle, actions.onAddFiles)
+                    SheetItem(Icons.Filled.CreateNewFolder, "Add folder…", idle, actions.onAddFolder)
+                    SheetItem(Icons.Filled.FileOpen, "Open", idle && chosen, actions.onOpen)
+                    SheetItem(Icons.Filled.Unarchive, "Extract…", idle && chosen, actions.onExtract)
+                    SheetItem(Icons.Filled.Share, "Share…", idle && chosen, actions.onShare)
+                    SheetItem(Icons.Filled.Delete, "Delete", idle && chosen, actions.onDelete, destructive = true)
+                    HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                    SheetItem(Icons.Filled.Lock, "Lock", unlocked, actions.onLock)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun SheetItem(icon: ImageVector, label: String, enabled: Boolean, onClick: () -> Unit, destructive: Boolean = false) {
+    val color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+    OutlinedButton(
+        onClick = onClick,
+        enabled = enabled,
+        shape = RoundedCornerShape(12.dp),
+        colors = ButtonDefaults.outlinedButtonColors(contentColor = color),
+        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+    ) {
+        Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(12.dp))
+        Text(label, modifier = Modifier.weight(1f))
     }
 }
 
@@ -409,24 +608,33 @@ fun MessageDialog(heading: String, body: String, onClose: () -> Unit) {
 /**
  * Add vault: a name, how it's protected and where it goes. Create stays off until
  * the name will do, and a name with "/" turns the field red, as on desktop.
+ *
+ * The same form makes a vault from a shared file ("Import as a vault"): then it
+ * starts with the shared vault's name, and has no Add existing vault… link.
  */
 @Composable
 fun AddVaultDialog(
     onCancel: () -> Unit,
-    onExisting: () -> Unit,
+    onExisting: (() -> Unit)?,
     onCreate: (name: String, mode: String) -> Unit,
+    title: String = "Add vault",
+    intro: String = "A vault is an encrypted folder of files.",
+    initialName: String = "",
 ) {
-    var name by remember { mutableStateOf("") }
+    var name by remember { mutableStateOf(initialName) }
     var password by remember { mutableStateOf(false) }
     val trimmed = name.trim()
     val ok = isValidVaultName(trimmed)
 
     AlertDialog(
         onDismissRequest = onCancel,
-        title = { Text("Add vault") },
+        title = { Text(title) },
         text = {
-            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                Text("A vault is an encrypted folder of files.", style = MaterialTheme.typography.bodyMedium)
+            Column(
+                modifier = Modifier.verticalScroll(rememberScrollState()),
+                verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+                Text(intro, style = MaterialTheme.typography.bodyMedium)
                 OutlinedTextField(
                     value = name,
                     onValueChange = { name = it },
@@ -448,7 +656,7 @@ fun AddVaultDialog(
                     modifier = Modifier.clickable { password = true },
                 ) {
                     RadioButton(selected = password, onClick = { password = true })
-                    Text("Use a password (shareable)")
+                    Text("Use a password")
                 }
                 Text(
                     "Next, choose the folder it goes in. It stays there, where your file manager " +
@@ -456,10 +664,9 @@ fun AddVaultDialog(
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                TextButton(
-                    onClick = onExisting,
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
-                ) { Text("Add existing vault…") }
+                if (onExisting != null) {
+                    TextButton(onClick = onExisting, contentPadding = PaddingValues(0.dp)) { Text("Add existing vault…") }
+                }
             }
         },
         confirmButton = {
@@ -494,9 +701,77 @@ fun RemoveFromListDialog(vault: VaultRecord, location: String, onCopy: () -> Uni
 }
 
 /**
+ * Add existing vault…: a vault's folder, as before, or a file someone shared from
+ * their vault (Share…), which becomes a new vault here.
+ */
+@Composable
+fun ExistingVaultDialog(onFolder: () -> Unit, onSharedFile: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Add existing vault") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                ChoiceRow(
+                    "A vault folder…",
+                    "A .vsvault folder on this device: it's added to your list where it is.",
+                    onFolder,
+                )
+                ChoiceRow(
+                    "A shared vault file…",
+                    "A file someone made with Share… (like “Holiday.tar.age”). You unlock it, then " +
+                        "choose how the new vault is protected and where it goes.",
+                    onSharedFile,
+                )
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
+}
+
+/**
+ * A decrypted archive: keep it as the one .tar file, or unpack it into a folder.
+ */
+@Composable
+fun ArchiveChoiceDialog(fileName: String, onArchive: () -> Unit, onFolder: () -> Unit, onCancel: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text("Save “$fileName”") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    "This is several files and folders in one archive.",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                ChoiceRow("As an archive (.tar)", "One file, which a file manager or tar can unpack later.", onArchive)
+                ChoiceRow("As a folder", "Unpacked into a new folder, in a folder you choose.", onFolder)
+            }
+        },
+        confirmButton = {},
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
+}
+
+@Composable
+private fun ChoiceRow(title: String, detail: String, onClick: () -> Unit) {
+    Row(
+        modifier = Modifier.fillMaxWidth().clickable(onClick = onClick).padding(vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Column(modifier = Modifier.weight(1f)) {
+            Text(title, style = MaterialTheme.typography.bodyLarge)
+            Text(detail, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, contentDescription = null)
+    }
+}
+
+/**
  * Share…: who it's for. Tick one or more contacts, then Continue goes on to
  * Save File or Share. "Add new contact" opens Add contact over this, so the
  * selection and place are kept.
+ * "Set password instead" makes a file anyone with the password can open, and goes
+ * on to the same Save File or Share.
  */
 @Composable
 fun ShareDialog(
@@ -505,6 +780,7 @@ fun ShareDialog(
     contacts: List<Contact>,
     initiallyPicked: Set<String>,
     onAddNew: (Set<String>) -> Unit,
+    onPassword: () -> Unit,
     onConfirm: (List<Contact>) -> Unit,
     onCancel: () -> Unit,
 ) {
@@ -542,10 +818,8 @@ fun ShareDialog(
                         }
                     }
                 }
-                TextButton(
-                    onClick = { onAddNew(picked()) },
-                    contentPadding = androidx.compose.foundation.layout.PaddingValues(0.dp),
-                ) { Text("Add new contact") }
+                TextButton(onClick = { onAddNew(picked()) }, contentPadding = PaddingValues(0.dp)) { Text("Add new contact") }
+                TextButton(onClick = onPassword, contentPadding = PaddingValues(0.dp)) { Text("Set password instead") }
             }
         },
         confirmButton = {

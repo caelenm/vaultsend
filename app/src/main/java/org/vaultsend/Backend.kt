@@ -364,6 +364,96 @@ class Backend(private val context: Context) {
         }
     }
 
+    /** Share for anyone with `password`, as [vaultShare]: removed if this fails. */
+    suspend fun vaultSharePassword(
+        record: VaultRecord,
+        secret: ByteArray?,
+        entries: List<String>,
+        password: ByteArray,
+        output: Uri,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val vault = openVault(record)
+        try {
+            refuseInside(vault, output)
+            context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
+                requireNotNull(pfd) { "Couldn't open the destination." }
+                result(
+                    VaultSendNative.vaultSharePassword(
+                        dataDir, vault, secret, entries.toTypedArray(), password, pfd.fd, progress,
+                    ),
+                )
+            }
+        } catch (e: Exception) {
+            discardOutput(output)
+            throw e
+        }
+    }
+
+    /**
+     * Add what the shared file `input` holds to a vault, at its top. `password` is
+     * the share's, or null for one made for this person (the unlocked session).
+     */
+    suspend fun vaultImportShared(
+        record: VaultRecord,
+        secret: ByteArray?,
+        password: ByteArray?,
+        input: Uri,
+        singleName: String,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val vault = openVault(record)
+        context.contentResolver.openFileDescriptor(input, "r").use { pfd ->
+            requireNotNull(pfd) { "Couldn't open the shared file." }
+            result(VaultSendNative.vaultImportShared(dataDir, vault, secret, password, pfd.fd, singleName, progress))
+        }
+    }
+
+    // --- Receiving a share ---------------------------------------------------
+
+    private inline fun <T> readFd(input: Uri, block: (Int) -> T): T =
+        context.contentResolver.openFileDescriptor(input, "r").use { pfd ->
+            requireNotNull(pfd) { "Couldn't open the selected file." }
+            block(pfd.fd)
+        }
+
+    /** "password" or "key": which prompt a shared file needs. */
+    suspend fun sharedKind(input: Uri): String = withContext(Dispatchers.IO) {
+        readFd(input) { VaultSendNative.sharedKind(it) }
+    }
+
+    /** Null if `password` opens the file, else what to say. Only the file key is unwrapped. */
+    suspend fun sharedCheckPassword(input: Uri, password: ByteArray): String? = withContext(Dispatchers.IO) {
+        try {
+            readFd(input) { VaultSendNative.sharedCheckPassword(it, password) }
+            null
+        } catch (e: Exception) {
+            e.message ?: "Wrong password."
+        }
+    }
+
+    /** Save a shared file as it is (an archive stays one); `output` is removed if this fails. */
+    suspend fun sharedDecrypt(password: ByteArray?, input: Uri, output: Uri) = withContext(Dispatchers.IO) {
+        try {
+            withFds(input, output) { inFd, outFd -> VaultSendNative.sharedDecrypt(dataDir, password, inFd, outFd) }
+        } catch (e: Exception) {
+            discardOutput(output)
+            throw e
+        }
+    }
+
+    /** Unpack a shared archive into a new folder `name` inside the picked folder `outTree`. */
+    suspend fun sharedExtract(
+        password: ByteArray?,
+        input: Uri,
+        outTree: Uri,
+        name: String,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val folder = VaultTree.fromTree(context, outTree)
+        readFd(input) { result(VaultSendNative.sharedExtract(dataDir, password, it, folder, name, progress)) }
+    }
+
     /** Where Open's copies go: see OpenCopies.kt. */
     val openRoot: File get() = File(context.cacheDir, OPEN_DIR)
 

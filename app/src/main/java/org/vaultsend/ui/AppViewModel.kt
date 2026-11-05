@@ -129,6 +129,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** What the progress bar is for ("Adding to vault…"). */
     var vaultProgressHeading by mutableStateOf("")
 
+    /** The running operation's progress and Cancel, while it can be cancelled. */
+    var cancellable by mutableStateOf<org.vaultsend.ProgressSink?>(null)
+
+    /** Whether the vault page's action panel is open. Starts open; kept for the session. */
+    var vaultMenuOpen by mutableStateOf(true)
+
     /** Copies Open has handed to other apps, deleted on Lock, Lock now and close. */
     val openedCopies = mutableStateListOf<OpenedCopy>()
 

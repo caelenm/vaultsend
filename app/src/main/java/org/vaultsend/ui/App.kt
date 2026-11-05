@@ -74,7 +74,11 @@ import org.vaultsend.ROOT_ENTRY
 import org.vaultsend.VaultEntry
 import org.vaultsend.VaultRecord
 import org.vaultsend.VaultTree
+import org.vaultsend.archiveFolderName
 import org.vaultsend.filesInSelection
+import org.vaultsend.isArchiveName
+import org.vaultsend.singleNameFromShared
+import org.vaultsend.vaultNameFromShared
 import org.vaultsend.parseListing
 import org.vaultsend.shareFileName
 import org.vaultsend.shortPath
@@ -101,6 +105,7 @@ private data class SaveOrShare(
     val title: String,
     val body: String,
     val dismissLabel: String = "Cancel",
+    val onCancel: (() -> Unit)? = null,
     val onSave: () -> Unit,
     val onShare: () -> Unit,
 ) : DialogState
@@ -133,6 +138,12 @@ private data class Share(
 private data class ShareAddContact(val share: Share) : DialogState
 private data object RememberChoices : DialogState
 
+// Receiving a share (shared.rs). `password` is the share's, copied out of the prompt
+// and wiped once used or abandoned; null for one made for this person's key.
+private data object ExistingVaultChoice : DialogState
+private class ArchiveChoice(val uri: Uri, val fileName: String, val password: ByteArray?) : DialogState
+private class ImportVault(val uri: Uri, val fileName: String, val password: ByteArray?) : DialogState
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun App(vm: AppViewModel = viewModel()) {
@@ -158,15 +169,20 @@ fun App(vm: AppViewModel = viewModel()) {
     // --- "Save as" plumbing (mirrors the desktop _save_then) ------------------
     // CreateDocument returns a destination URI; we stash what to do with it.
     var saveCallback by remember { mutableStateOf<((Uri) -> Unit)?>(null) }
+    var saveCancelled by remember { mutableStateOf<(() -> Unit)?>(null) }
     val createDocument = rememberLauncherForActivityResult(
         ActivityResultContracts.CreateDocument("application/octet-stream"),
     ) { uri ->
         val callback = saveCallback
+        val cancelled = saveCancelled
         saveCallback = null
-        if (uri != null && callback != null) callback(uri)
+        saveCancelled = null
+        if (uri != null && callback != null) callback(uri) else cancelled?.invoke()
     }
-    fun saveThen(suggestedName: String, onPicked: (Uri) -> Unit) {
+    /** "Save as", then `onPicked`; `onCancel` if no place was chosen. */
+    fun saveThen(suggestedName: String, onCancel: () -> Unit = {}, onPicked: (Uri) -> Unit) {
         saveCallback = onPicked
+        saveCancelled = onCancel
         createDocument.launch(suggestedName)
     }
 
@@ -361,21 +377,6 @@ fun App(vm: AppViewModel = viewModel()) {
         }
     }
 
-    fun decryptFile(input: Uri) {
-        if (vm.unlocked) { doDecryptFile(input); return }
-        dialog = AskPassphrase(
-            "Unlock your key",
-            "Enter your passphrase to decrypt. You'll stay unlocked until you " +
-                "lock it, close the app, or leave it in the background for 2 minutes.",
-            confirm = false,
-            validate = { bytes -> tryUnlock(bytes) },
-        ) {
-            dialog = null
-            vm.refreshUnlocked()
-            doDecryptFile(input)
-        }
-    }
-
     fun createKey() {
         dialog = AskPassphrase(
             "Create your key",
@@ -507,14 +508,26 @@ fun App(vm: AppViewModel = viewModel()) {
     // system picker only ever returns folders, so the desktop's check afterwards
     // ("That's a file. Choose a folder.") has nothing to catch here.
     var treeCallback by remember { mutableStateOf<((Uri) -> Unit)?>(null) }
+    var treeCancelled by remember { mutableStateOf<(() -> Unit)?>(null) }
     val openTree = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         val callback = treeCallback
+        val cancelled = treeCancelled
         treeCallback = null
-        if (uri != null && callback != null) callback(uri)
+        treeCancelled = null
+        if (uri != null && callback != null) callback(uri) else cancelled?.invoke()
     }
-    fun pickFolder(onPicked: (Uri) -> Unit) {
+    fun pickFolder(onCancel: () -> Unit = {}, onPicked: (Uri) -> Unit) {
         treeCallback = onPicked
+        treeCancelled = onCancel
         openTree.launch(null)
+    }
+
+    // A shared file to import as a vault (Add existing vault… → A shared vault file…).
+    var sharedFileCallback by remember { mutableStateOf<((Uri) -> Unit)?>(null) }
+    val openSharedFile = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        val callback = sharedFileCallback
+        sharedFileCallback = null
+        if (uri != null && callback != null) callback(uri)
     }
 
     var filesCallback by remember { mutableStateOf<((List<Uri>) -> Unit)?>(null) }
@@ -597,8 +610,18 @@ fun App(vm: AppViewModel = viewModel()) {
     }
 
     // Progress reports come from the core on an IO thread; show them on the main one.
+    // A cancellable operation's sink is also what its Cancel button sets.
     val mainThread = remember { Handler(Looper.getMainLooper()) }
-    fun progressSink(): ProgressSink = ProgressSink { percent -> mainThread.post { vm.vaultProgress = percent } }
+    fun progressSink(cancellable: Boolean = false): ProgressSink =
+        ProgressSink { percent -> mainThread.post { vm.vaultProgress = percent } }
+            .also { if (cancellable) vm.cancellable = it }
+
+    fun cancelRunning() {
+        vm.cancellable?.let {
+            it.cancelled = true
+            vm.vaultProgressHeading = "Cancelling…"
+        }
+    }
 
     /** Whether a known vault's folder can be reached now, by URI, for the list's subtitles. */
     val vaultFound = remember { mutableStateMapOf<String, Boolean>() }
@@ -649,6 +672,35 @@ fun App(vm: AppViewModel = viewModel()) {
     }
 
     /**
+     * The progress bar, toast and error for any long operation. A cancelled one
+     * just says so: whatever it was writing has been removed by then.
+     */
+    suspend fun runOp(
+        heading: String,
+        note: String,
+        cancellable: Boolean,
+        onFail: (String) -> Unit,
+        op: suspend (ProgressSink) -> Backend.VaultResult,
+    ): Boolean {
+        vm.vaultProgressHeading = heading
+        vm.vaultProgress = -1
+        val sink = progressSink(cancellable)
+        return try {
+            val result = op(sink)
+            toast(result.warnings.firstOrNull()?.let { "$note Note: $it." } ?: note)
+            true
+        } catch (e: Exception) {
+            if (sink.cancelled) toast("Cancelled.") else onFail(e.message ?: "The operation failed.")
+            false
+        } finally {
+            mainThread.post {
+                vm.vaultProgress = null
+                if (vm.cancellable === sink) vm.cancellable = null
+            }
+        }
+    }
+
+    /**
      * Run one vault operation with a progress bar, then say how it went: a
      * dialog if it failed, else a toast. With `relist`, the page is listed
      * again with the same secret, so no second prompt.
@@ -659,35 +711,39 @@ fun App(vm: AppViewModel = viewModel()) {
         heading: String,
         note: String,
         relist: Boolean = false,
+        cancellable: Boolean = false,
+        onFail: ((String) -> Unit)? = null,
         op: suspend (ProgressSink) -> Backend.VaultResult,
     ): Boolean {
-        vm.vaultProgressHeading = heading
-        vm.vaultProgress = -1
-        val ok = try {
-            val result = op(progressSink())
-            toast(result.warnings.firstOrNull()?.let { "$note Note: $it." } ?: note)
-            true
-        } catch (e: Exception) {
-            vaultFailed(vault, e.message ?: "The operation failed.")
-            false
-        } finally {
-            mainThread.post { vm.vaultProgress = null }
-        }
+        val ok = runOp(heading, note, cancellable, onFail ?: { vaultFailed(vault, it) }, op)
         if (ok && relist && vm.selectedVault?.uri == vault.uri) listVault(vault, secret)
         vm.afterSecretUse()
         return ok
     }
 
-    fun beginCreate(name: String, parent: Uri, mode: String) {
+    /**
+     * Make a vault. `then`, if given, runs once it exists, with the secret that made
+     * it, before Remember-off locks anything; `onGiveUp` if it's never made.
+     */
+    fun beginCreate(
+        name: String,
+        parent: Uri,
+        mode: String,
+        onGiveUp: () -> Unit = {},
+        then: (suspend (VaultRecord, ByteArray?) -> Unit)? = null,
+    ) {
         suspend fun create(secret: ByteArray?) {
-            try {
+            val record = try {
                 val tree = vm.backend.vaultCreate(parent, name, mode, secret)
-                vm.rememberVault(VaultRecord(name, tree.documentUri.toString(), mode, 0))
-                vm.sidebarMode = SidebarMode.Vaults
-                toast("Vault created.")
+                vm.rememberVault(VaultRecord(name, tree.documentUri.toString(), mode, 0)).also {
+                    vm.sidebarMode = SidebarMode.Vaults
+                    if (then == null) toast("Vault created.")
+                }
             } catch (e: Exception) {
                 vaultError("Couldn't create the vault", e.message ?: "The vault couldn't be created.")
+                null
             }
+            if (record == null) onGiveUp() else then?.invoke(record, secret)
             vm.afterSecretUse()
         }
         if (mode == "password") {
@@ -697,6 +753,7 @@ fun App(vm: AppViewModel = viewModel()) {
                     "If you lose it, the files can't be recovered.",
                 confirm = true,
                 fieldLabel = "Password",
+                onCancel = onGiveUp,
             ) { bytes ->
                 dialog = null
                 scope.launch {
@@ -709,9 +766,141 @@ fun App(vm: AppViewModel = viewModel()) {
             }
         } else if (vm.myPubkey == null) {
             toast("Your key isn't ready yet.")
+            onGiveUp()
         } else {
             // Sealing the vault's key takes your private key, not just the public one.
-            withVaultSecret(VaultRecord(name, "", "self", 0)) { create(null) }
+            withVaultSecret(VaultRecord(name, "", "self", 0), onCancel = onGiveUp) { create(null) }
+        }
+    }
+
+    // --- Receiving a share ---------------------------------------------------
+
+    /** Unlock the session if need be, then `then`; `onCancel` if the prompt is cancelled. */
+    fun withSession(onCancel: () -> Unit = {}, then: () -> Unit) {
+        if (vm.unlocked) { then(); return }
+        dialog = AskPassphrase(
+            "Unlock your key",
+            "Enter your passphrase to decrypt. You'll stay unlocked until you " +
+                "lock it, close the app, or leave it in the background for 2 minutes.",
+            confirm = false,
+            validate = { bytes -> tryUnlock(bytes) },
+            onCancel = onCancel,
+        ) {
+            dialog = null
+            vm.refreshUnlocked()
+            then()
+        }
+    }
+
+    /**
+     * The key a shared file needs: its password, checked before the prompt closes
+     * (only the file key is unwrapped), or the unlocked session for one made for
+     * this person. `then` gets a copy of the password, or null; the caller wipes it.
+     */
+    fun unlockShared(input: Uri, then: (fileName: String, password: ByteArray?) -> Unit) {
+        scope.launch {
+            val kind = try {
+                vm.backend.sharedKind(input)
+            } catch (e: Exception) {
+                vaultError("Couldn't open that file", e.message ?: "It isn't a file VaultSend can decrypt.")
+                return@launch
+            }
+            val name = vm.backend.displayName(input)
+            if (kind != "password") {
+                withSession { then(name, null) }
+                return@launch
+            }
+            dialog = AskPassphrase(
+                "Enter the password",
+                "“$name” is protected with a password. Enter the one the person who shared it gave you.",
+                confirm = false,
+                fieldLabel = "Password",
+                validate = { bytes -> vm.backend.sharedCheckPassword(input, bytes) },
+            ) { bytes ->
+                dialog = null
+                // The prompt wipes its own bytes as soon as this returns.
+                then(name, bytes.copyOf())
+            }
+        }
+    }
+
+    /** Save a shared file as it is: one file, or an archive kept as its .tar. */
+    fun saveSharedAsIs(input: Uri, fileName: String, password: ByteArray?) {
+        saveThen(singleNameFromShared(fileName), onCancel = { password?.fill(0) }) { output ->
+            scope.launch {
+                try {
+                    vm.backend.sharedDecrypt(password, input, output)
+                    toast("Decrypted and saved.")
+                } catch (e: Exception) {
+                    toast(e.message ?: "The operation failed.")
+                } finally {
+                    password?.fill(0)
+                    vm.afterSecretUse()
+                }
+            }
+        }
+    }
+
+    /** Unpack a shared archive into a new folder, in a folder the user picks. */
+    fun extractShared(input: Uri, fileName: String, password: ByteArray?) {
+        val folder = archiveFolderName(fileName)
+        pickFolder(onCancel = { password?.fill(0) }) { parent ->
+            scope.launch {
+                try {
+                    runOp("Unpacking…", "Unpacked into “$folder”.", cancellable = true, onFail = {
+                        vaultError("Couldn't unpack “$fileName”", it)
+                    }) { sink -> vm.backend.sharedExtract(password, input, parent, folder, sink) }
+                } finally {
+                    password?.fill(0)
+                    vm.afterSecretUse()
+                }
+            }
+        }
+    }
+
+    /**
+     * Decrypt on the main page. A share made with a password asks for it; an
+     * archive (Share's .tar.age) can be kept as one or unpacked into a folder.
+     */
+    fun decryptFile(input: Uri) {
+        unlockShared(input) { name, password ->
+            when {
+                isArchiveName(name) -> dialog = ArchiveChoice(input, name, password)
+                password == null -> doDecryptFile(input)
+                else -> saveSharedAsIs(input, name, password)
+            }
+        }
+    }
+
+    /** Add existing vault → A shared vault file…: unlock it, then the Add vault form. */
+    fun importSharedFile(input: Uri) {
+        unlockShared(input) { name, password -> dialog = ImportVault(input, name, password) }
+    }
+
+    /** Make the vault the Import form describes, then fill it from the shared file. */
+    fun createFromShared(d: ImportVault, name: String, mode: String) {
+        val wipe = { d.password?.fill(0); Unit }
+        pickFolder(onCancel = wipe) { parent ->
+            keepAccess(parent)
+            beginCreate(name, parent, mode, onGiveUp = wipe) { record, secret ->
+                try {
+                    runVaultOp(
+                        record, secret, "Importing…", "Imported into “${record.name}”.",
+                        relist = true, cancellable = true,
+                        onFail = {
+                            vaultError(
+                                "Couldn't import into “${record.name}”",
+                                "The vault was made, but nothing was added to it: $it\n\n" +
+                                    "It's in your list, empty. Remove it from the list, or add files to it.",
+                            )
+                        },
+                    ) { sink ->
+                        vm.backend.vaultImportShared(record, secret, d.password, d.uri, singleNameFromShared(d.fileName), sink)
+                    }
+                } finally {
+                    wipe()
+                }
+            }
         }
     }
 
@@ -808,9 +997,7 @@ fun App(vm: AppViewModel = viewModel()) {
             toast("Unlock the vault first.")
             return
         }
-        val chosen = page.chosen()
-        val one = if (chosen.size == 1) chosen[0] else ROOT_ENTRY
-        val dest = if (page.entries[one]?.isDir == true) one else one.substringBeforeLast('/', "").removePrefix("/")
+        val dest = page.addDestination()
         val names = files.map { vm.backend.displayName(it) } + folders.map { tree ->
             vm.backend.displayName(DocumentsContract.buildDocumentUriUsingTree(tree, DocumentsContract.getTreeDocumentId(tree)))
         }
@@ -819,7 +1006,7 @@ fun App(vm: AppViewModel = viewModel()) {
 
         fun run(replace: Boolean) {
             withVaultSecret(vault) { secret ->
-                runVaultOp(vault, secret, "Adding to vault…", "Added to the vault.", relist = true) { sink ->
+                runVaultOp(vault, secret, "Adding to vault…", "Added to the vault.", relist = true, cancellable = true) { sink ->
                     vm.backend.vaultAdd(vault, secret, files, folders, dest.ifEmpty { null }, replace, sink)
                 }
             }
@@ -905,6 +1092,61 @@ fun App(vm: AppViewModel = viewModel()) {
                         vm.backend.vaultShare(vault, secret, chosen, recipients, shareUri(staged), sink)
                     }
                     if (ok) shareFile(staged) else staged.delete()
+                }
+            },
+        )
+    }
+
+    /** Share… → Set password instead: the same file, for anyone with the password. */
+    /**
+     * Share… → Set password instead: the same file, for anyone with the password,
+     * then the same Save File or Share as a share for contacts.
+     */
+    fun shareWithPassword(share: Share, password: ByteArray) {
+        val vault = share.vault
+        val chosen = share.chosen
+        val page = vm.vaultPage
+        if (page == null) { password.fill(0); return }
+        val suggested = shareFileName(vault.name, chosen, page.entries)
+        val heading = "Encrypting with your password…"
+        dialog = SaveOrShare(
+            "Share with a password",
+            "Save the encrypted file, or share it. Tell them the password some other way than the file.",
+            onCancel = { password.fill(0) },
+            onSave = {
+                dialog = null
+                saveThen(suggested, onCancel = { password.fill(0) }) { output ->
+                    withVaultSecret(vault, onCancel = { vm.backend.discardOutput(output); password.fill(0) }) { secret ->
+                        try {
+                            runVaultOp(
+                                vault, secret, heading,
+                                "Encrypted. Send the saved file, and tell them the password some other way.",
+                            ) { sink -> vm.backend.vaultSharePassword(vault, secret, chosen, password, output, sink) }
+                        } finally {
+                            password.fill(0)
+                        }
+                    }
+                }
+            },
+            onShare = {
+                dialog = null
+                val staged = runCatching { vm.backend.newShareFile(suggested) }.getOrElse { e ->
+                    toast(e.message ?: "The operation failed.")
+                    null
+                }
+                if (staged == null) {
+                    password.fill(0)
+                } else {
+                    withVaultSecret(vault, onCancel = { staged.delete(); password.fill(0) }) { secret ->
+                        val ok = try {
+                            runVaultOp(vault, secret, heading, "Encrypted with your password.") { sink ->
+                                vm.backend.vaultSharePassword(vault, secret, chosen, password, shareUri(staged), sink)
+                            }
+                        } finally {
+                            password.fill(0)
+                        }
+                        if (ok) shareFile(staged) else staged.delete()
+                    }
                 }
             },
         )
@@ -1071,6 +1313,7 @@ fun App(vm: AppViewModel = viewModel()) {
         onDelete = { vaultDelete() },
         onLock = { vaultLock() },
         onVerify = { vaultVerify() },
+        onCancel = { cancelRunning() },
     )
 
     fun chooseRemember(choice: String) {
@@ -1237,7 +1480,7 @@ fun App(vm: AppViewModel = viewModel()) {
             dismissLabel = d.dismissLabel,
             onSave = d.onSave,
             onShare = d.onShare,
-            onCancel = { dialog = null },
+            onCancel = { dialog = null; d.onCancel?.invoke() },
         )
         AddContactDialogState -> AddContactDialog(
             onCancel = { dialog = null },
@@ -1294,7 +1537,7 @@ fun App(vm: AppViewModel = viewModel()) {
         )
         AddVaultDialogState -> AddVaultDialog(
             onCancel = { dialog = null },
-            onExisting = { dialog = null; pickFolder { addExistingVault(it) } },
+            onExisting = { dialog = ExistingVaultChoice },
             onCreate = { name, mode ->
                 dialog = null
                 // Where should the vault go? Access is kept to that folder only.
@@ -1303,6 +1546,33 @@ fun App(vm: AppViewModel = viewModel()) {
                     beginCreate(name, parent, mode)
                 }
             },
+        )
+        ExistingVaultChoice -> ExistingVaultDialog(
+            onFolder = { dialog = null; pickFolder { addExistingVault(it) } },
+            onSharedFile = {
+                dialog = null
+                sharedFileCallback = { importSharedFile(it) }
+                openSharedFile.launch(arrayOf("*/*"))
+            },
+            onCancel = { dialog = AddVaultDialogState },
+        )
+        is ArchiveChoice -> ArchiveChoiceDialog(
+            fileName = d.fileName,
+            onArchive = {
+                dialog = null
+                if (d.password == null) doDecryptFile(d.uri) else saveSharedAsIs(d.uri, d.fileName, d.password)
+            },
+            onFolder = { dialog = null; extractShared(d.uri, d.fileName, d.password) },
+            onCancel = { dialog = null; d.password?.fill(0) },
+        )
+        is ImportVault -> AddVaultDialog(
+            title = "Import as a vault",
+            intro = "“${d.fileName}” is unlocked. Choose a name for the new vault, how it's protected " +
+                "and where it goes; what the file holds is then added to it.",
+            initialName = vaultNameFromShared(d.fileName),
+            onExisting = null,
+            onCancel = { dialog = null; d.password?.fill(0) },
+            onCreate = { name, mode -> dialog = null; createFromShared(d, name, mode) },
         )
         is VaultMessage -> MessageDialog(d.heading, d.body, onClose = { dialog = null })
         is Confirm -> ConfirmDialog(
@@ -1338,6 +1608,19 @@ fun App(vm: AppViewModel = viewModel()) {
                     contacts = vm.contacts,
                     initiallyPicked = d.picked,
                     onAddNew = { picked -> dialog = ShareAddContact(d.copy(picked = picked)) },
+                    onPassword = {
+                        dialog = AskPassphrase(
+                            "Set a password",
+                            "Anyone with this password and the file can open it, in VaultSend or with " +
+                                "age. Tell them the password some other way than the file itself.",
+                            confirm = true,
+                            fieldLabel = "Password",
+                            onCancel = { dialog = d },
+                        ) { bytes ->
+                            dialog = null
+                            shareWithPassword(d, bytes)
+                        }
+                    },
                     onConfirm = { contacts -> dialog = null; shareWith(d, contacts) },
                     onCancel = { dialog = null },
                 )
@@ -1468,6 +1751,9 @@ private fun MainScreen(
                         progressHeading = vm.vaultProgressHeading,
                         onChange = { vm.vaultPage = it },
                         actions = vaultActions,
+                        menuOpen = vm.vaultMenuOpen,
+                        onMenuOpen = { vm.vaultMenuOpen = it },
+                        canCancel = vm.cancellable != null,
                         modifier = Modifier.weight(1f),
                     )
                     SnackbarHost(hostState = snackbar)
@@ -1498,6 +1784,9 @@ private fun MainScreen(
                     placeholder = { Text("Message or encrypted text…") },
                 )
                 SnackbarHost(hostState = snackbar)
+                vm.vaultProgress?.let { progress ->
+                    ProgressRow(progress, vm.vaultProgressHeading, if (vm.cancellable != null) vaultActions.onCancel else null)
+                }
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     Button(onClick = onEncryptText) { Text("Encrypt") }
                     FilledTonalButton(onClick = onDecryptText) { Text("Decrypt") }

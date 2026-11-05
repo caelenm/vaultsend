@@ -444,5 +444,91 @@ class VaultHelpersTest {
         assertEquals(emptyList<String>(), after.chosen())
         assertEquals(setOf("a"), after.expanded)
     }
-}
 
+    // --- Invert selection ------------------------------------------------------
+
+    @Test
+    fun invertFlipsEveryFileAndEmptyFolderAndKeepsFoldersWhole() {
+        val one = page.withMultiple(true).tick("a/1.txt", true)
+        val inverted = one.invert()
+        // a/1.txt goes; a/b (and so 2.txt) and ab.txt and the empty folder come in.
+        assertEquals(setOf("a/b", "a/b/2.txt", "ab.txt", "empty"), inverted.ticked)
+        assertEquals(listOf("a/b", "ab.txt", "empty"), inverted.chosen())
+        // Twice is where it started.
+        assertEquals(one.ticked, inverted.invert().ticked)
+    }
+
+    @Test
+    fun invertingNothingIsEverythingAndBack() {
+        val none = page.withMultiple(true)
+        assertEquals(listOf(ROOT_ENTRY), none.invert().chosen())
+        assertEquals(emptyList<String>(), none.invert().invert().chosen())
+        assertEquals(emptyList<String>(), page.selectAll().invert().chosen())
+    }
+
+    @Test
+    fun invertReachesRowsHiddenInClosedFolders() {
+        // Everything starts closed: only a, ab.txt and empty show.
+        val s = page.withMultiple(true).tick("ab.txt", true).invert()
+        assertEquals(setOf("a", "a/1.txt", "a/b", "a/b/2.txt", "empty"), s.ticked)
+        assertEquals(listOf("a", "empty"), s.chosen())
+    }
+
+    @Test
+    fun invertDoesNothingWithOneRowAtATime() {
+        val single = page.select("ab.txt")
+        assertEquals(single, single.invert())
+    }
+
+    @Test
+    fun aFolderTickedThroughInvertStillStandsForAllOfIt() {
+        // The rule tick() keeps: unticking inside unticks the folders above.
+        val s = page.withMultiple(true).tick("ab.txt", true).invert().tick("a/b/2.txt", false)
+        assertEquals(setOf("a/1.txt", "empty"), s.ticked)
+    }
+
+    // --- Where Add puts things (App.addToVault) ----------------------------------
+
+    @Test
+    fun addGoesIntoTheChosenFolderBesideTheChosenFileOrAtTheTop() {
+        assertEquals("", page.addDestination())
+        assertEquals("a/b", page.select("a/b").addDestination())
+        assertEquals("a/b", page.select("a/b/2.txt").addDestination())
+        assertEquals("", page.select("ab.txt").addDestination())
+        assertEquals("empty", page.select("empty").addDestination())
+        assertEquals("", page.selectAll().addDestination())
+        assertEquals("a", page.withMultiple(true).tick("a", true).addDestination())
+        assertEquals("", page.withMultiple(true).tick("a/1.txt", true).tick("ab.txt", true).addDestination())
+    }
+
+    // --- Names for shared files ------------------------------------------------
+
+    @Test
+    fun sharedFileNames() {
+        assertTrue(isArchiveName("Holiday.tar.age"))
+        assertTrue(isArchiveName("HOLIDAY.TAR.AGE"))
+        assertTrue(isArchiveName("Holiday.tar"))
+        assertFalse(isArchiveName("photo.jpg.age"))
+        assertFalse(isArchiveName("tar.age.txt"))
+
+        assertEquals("Holiday", archiveFolderName("Holiday.tar.age"))
+        assertEquals("Holiday selection", archiveFolderName("Holiday selection.tar.age"))
+        assertEquals("Shared files", archiveFolderName(".tar.age"))
+
+        assertEquals("photo.jpg", singleNameFromShared("photo.jpg.age"))
+        assertEquals("notes", singleNameFromShared("notes"))
+        assertEquals("shared file", singleNameFromShared(".age"))
+
+        assertEquals("Holiday", vaultNameFromShared("Holiday.tar.age"))
+        assertEquals("Holiday", vaultNameFromShared("Holiday selection.tar.age"))
+        assertEquals("photo", vaultNameFromShared("photo.jpg.age"))
+        assertEquals("README", vaultNameFromShared("README.age"))
+        assertEquals("Shared vault", vaultNameFromShared(".tar.age"))
+        assertEquals("Shared vault", vaultNameFromShared("..age"))
+        // Whatever comes back is a name a vault can have.
+        for (n in listOf("a/b.tar.age", "x".repeat(300) + ".tar.age", " .tar.age")) {
+            assertTrue(n, isValidVaultName(vaultNameFromShared(n)))
+            assertTrue(n, isValidVaultName(archiveFolderName(n)))
+        }
+    }
+}

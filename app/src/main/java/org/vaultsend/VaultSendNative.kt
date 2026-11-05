@@ -147,6 +147,59 @@ object VaultSendNative {
         progress: ProgressSink?,
     ): String
 
+    /** A share for anyone with [password], into [outFd], as [vaultShare]. */
+    @Throws(BackendException::class)
+    external fun vaultSharePassword(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        entries: Array<String>,
+        password: ByteArray,
+        outFd: Int,
+        progress: ProgressSink?,
+    ): String
+
+    /**
+     * Add what a shared file holds to the vault in [tree], at its top: an archive's
+     * files and folders, or one file named [singleName]. All or nothing. A null
+     * [password] means the unlocked session key.
+     */
+    @Throws(BackendException::class)
+    external fun vaultImportShared(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        password: ByteArray?,
+        inFd: Int,
+        singleName: String,
+        progress: ProgressSink?,
+    ): String
+
+    // --- Receiving a share (shared.rs) ---------------------------------------
+
+    /** "password" or "key": which prompt a shared file needs. */
+    @Throws(BackendException::class)
+    external fun sharedKind(inFd: Int): String
+
+    /** Throws unless [password] opens the file. Only the file key is unwrapped. */
+    @Throws(BackendException::class)
+    external fun sharedCheckPassword(inFd: Int, password: ByteArray)
+
+    /** Save a shared file as it is; null [password] for the session key. */
+    @Throws(BackendException::class)
+    external fun sharedDecrypt(dataDir: String, password: ByteArray?, inFd: Int, outFd: Int)
+
+    /** Unpack a shared archive into a new folder [name] in [outTree]. Returns warnings. */
+    @Throws(BackendException::class)
+    external fun sharedExtract(
+        dataDir: String,
+        password: ByteArray?,
+        inFd: Int,
+        outTree: VaultTree,
+        name: String,
+        progress: ProgressSink?,
+    ): String
+
     /** 0 remembers no vault key, negative until the app closes, else seconds. Forgets all. */
     external fun vaultSetRemember(seconds: Long)
 

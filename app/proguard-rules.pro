@@ -16,5 +16,5 @@
 # SafStore, SafSources and the progress callback), so R8 must keep them.
 -keep class org.vaultsend.VaultTree { public *; }
 -keep class org.vaultsend.VaultSources { public int openSource(int); }
--keep interface org.vaultsend.ProgressSink { *; }
--keep class * implements org.vaultsend.ProgressSink { public void report(int); }
+-keep class org.vaultsend.ProgressSink { public void report(int); public boolean isCancelled(); }
+-keep class * extends org.vaultsend.ProgressSink { public void report(int); public boolean isCancelled(); }
