@@ -24,6 +24,7 @@
 pub mod backend;
 mod ffi;
 mod tar;
+pub mod shared;
 pub mod vault;
 #[cfg(any(test, feature = "cli"))]
 pub mod vault_cli;

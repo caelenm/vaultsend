@@ -664,9 +664,16 @@ pub fn decrypt_file_to_session<R2: Read, W: Write>(
 /// serialize them) deleted and reused each other's staging file, and one
 /// destination could receive the other file's plaintext.
 fn staging_path(data_dir: &str) -> PathBuf {
+    staging_named(data_dir, "decrypt")
+}
+
+/// `.decrypt-<what>-<pid>-<n>.part` in `data_dir`: a name `clear_stale_staging`
+/// sweeps, file or folder, if a run is killed before removing it.
+pub(crate) fn staging_named(data_dir: &str, what: &str) -> PathBuf {
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let n = NEXT.fetch_add(1, Ordering::Relaxed);
-    Path::new(data_dir).join(format!(".decrypt-{}-{n}.part", std::process::id()))
+    let what = if what == "decrypt" { String::new() } else { format!("-{what}") };
+    Path::new(data_dir).join(format!(".decrypt{what}-{}-{n}.part", std::process::id()))
 }
 
 /// Remove staging files left by an earlier run that was killed mid-decrypt
@@ -677,7 +684,12 @@ fn clear_stale_staging(data_dir: &str) {
         let name = entry.file_name();
         let name = name.to_string_lossy();
         if name.starts_with(".decrypt") && name.ends_with(".part") {
-            let _ = fs::remove_file(entry.path());
+            // file_type doesn't follow a symlink, so a link is removed, never entered.
+            if entry.file_type().is_ok_and(|t| t.is_dir()) {
+                let _ = fs::remove_dir_all(entry.path());
+            } else {
+                let _ = fs::remove_file(entry.path());
+            }
         }
     }
 }
@@ -685,20 +697,35 @@ fn clear_stale_staging(data_dir: &str) {
 /// Number of file decrypts currently staging; stale-file cleanup waits for 0.
 static ACTIVE_DECRYPTS: Mutex<usize> = Mutex::new(0);
 
-/// Shared staging logic for the two file-decrypt paths above.
-fn decrypt_file_staged<R2: Read, W: Write>(
-    data_dir: &str,
-    input: R2,
-    mut output: W,
-    decrypt_into: impl FnOnce(R2, &mut File) -> R<()>,
-) -> R<()> {
-    {
+/// Held while plaintext is staged in `data_dir`: the first one in sweeps what a
+/// killed run left behind, and none sweeps while another is staging.
+pub(crate) struct StagingGuard;
+
+impl StagingGuard {
+    pub(crate) fn new(data_dir: &str) -> StagingGuard {
         let mut active = ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner());
         if *active == 0 {
             clear_stale_staging(data_dir);
         }
         *active += 1;
+        StagingGuard
     }
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        *ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+    }
+}
+
+/// Shared staging logic for the file-decrypt paths (here and in shared.rs).
+pub(crate) fn decrypt_file_staged<R2: Read, W: Write>(
+    data_dir: &str,
+    input: R2,
+    mut output: W,
+    decrypt_into: impl FnOnce(R2, &mut File) -> R<()>,
+) -> R<()> {
+    let _guard = StagingGuard::new(data_dir);
     let tmp = staging_path(data_dir);
 
     let staged: R<()> = (|| {
@@ -716,7 +743,6 @@ fn decrypt_file_staged<R2: Read, W: Write>(
     });
 
     let _ = fs::remove_file(&tmp);
-    *ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
     result
 }
 

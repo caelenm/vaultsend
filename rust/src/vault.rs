@@ -72,6 +72,8 @@ const PROGRESS_CHUNK: usize = 1 << 20;
 /// What unlocking a password vault says when it was given no password and has none
 /// remembered. The app asks for the password when it sees this.
 pub const PASSWORD_NEEDED: &str = "this vault's password is needed";
+/// What an operation stopped by the user says. The app knows it asked, and says so itself.
+pub const CANCELLED: &str = "cancelled";
 
 /// Plaintext and ciphertext written to a file are staged here first and renamed
 /// into place only once complete (desktop main.rs's `staging_path`).
@@ -84,7 +86,7 @@ fn staging_path(path: &str) -> String {
 // parser; everything joined onto a real directory has passed through it, so a
 // hostile path can never climb out of the output folder.
 // ---------------------------------------------------------------------------
-fn valid_vault_path(p: &str) -> bool {
+pub(crate) fn valid_vault_path(p: &str) -> bool {
     !p.is_empty()
         && p.len() <= 4096
         && !p.contains('\0')
@@ -92,12 +94,12 @@ fn valid_vault_path(p: &str) -> bool {
 }
 
 /// Every parent folder of `path`, outermost first: "a/b/c" gives "a", "a/b".
-fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(move |(i, _)| &path[..i])
 }
 
 /// `path` relative to `root` if it lies inside it ("" for the root itself).
-fn within<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+pub(crate) fn within<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     if root == ROOT_ENTRY {
         return Some(path);
     }
@@ -560,12 +562,22 @@ impl<W: Write> Write for HashingWriter<W> {
 /// Android: the desktop wrote these to a pipe the frontend read (`--progress-fd`);
 /// here they go to a callback (`ffi.rs` hands them to the UI; `vault_cli` still
 /// writes them to a pipe). A report that can't be delivered is just dropped.
+///
+/// It also carries the user's Cancel: `cancelled` asks the app at most once per
+/// PROGRESS_CHUNK of work (and `check` whenever called), and once it has said yes,
+/// stays yes. Work that stops this way fails with CANCELLED and cleans up as any
+/// other failure does.
 #[derive(Default)]
 pub struct Progress {
     sink: Option<Box<dyn Fn(u64)>>,
+    cancel: Option<Box<dyn Fn() -> bool>>,
     total: Cell<u64>,
     done: Cell<u64>,
     shown: Cell<Option<u64>>,
+    /// Bytes gone by, whatever the total, and when Cancel was last asked about.
+    seen: Cell<u64>,
+    polled_at: Cell<u64>,
+    stopped: Cell<bool>,
 }
 
 impl Progress {
@@ -573,12 +585,44 @@ impl Progress {
         Progress { sink: Some(Box::new(sink)), ..Default::default() }
     }
 
-    fn start(&self, total: u64) {
+    /// Ask `cancel` whether the user has stopped this operation.
+    pub fn with_cancel(mut self, cancel: impl Fn() -> bool + 'static) -> Progress {
+        self.cancel = Some(Box::new(cancel));
+        self
+    }
+
+    /// Whether the user has cancelled, asking the app only every PROGRESS_CHUNK bytes.
+    pub(crate) fn cancelled(&self) -> bool {
+        if !self.stopped.get() && self.seen.get().saturating_sub(self.polled_at.get()) >= PROGRESS_CHUNK as u64 {
+            self.poll();
+        }
+        self.stopped.get()
+    }
+
+    fn poll(&self) {
+        self.polled_at.set(self.seen.get());
+        if let Some(cancel) = &self.cancel {
+            if cancel() {
+                self.stopped.set(true);
+            }
+        }
+    }
+
+    /// Ask now, between steps: Err(CANCELLED) if the user has stopped this.
+    pub(crate) fn check(&self) -> R<()> {
+        if !self.stopped.get() {
+            self.poll();
+        }
+        if self.stopped.get() { Err(CANCELLED.into()) } else { Ok(()) }
+    }
+
+    pub(crate) fn start(&self, total: u64) {
         self.total.set(total);
         self.done.set(0);
     }
 
-    fn advance(&self, n: u64) {
+    pub(crate) fn advance(&self, n: u64) {
+        self.seen.set(self.seen.get().saturating_add(n));
         let (Some(sink), total) = (&self.sink, self.total.get()) else { return };
         if total == 0 {
             return;
@@ -604,6 +648,9 @@ struct CountingReader<R> {
 
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.progress.cancelled() {
+            return Err(io::Error::other(CANCELLED));
+        }
         let n = self.inner.read(buf)?;
         self.progress.advance(n as u64);
         self.count.set(self.count.get() + n as u64);
@@ -1224,6 +1271,20 @@ impl Vault {
         if plan.is_empty() {
             return Err("nothing to add: not a regular file or folder".into());
         }
+        // Every folder a new entry goes in must be a folder, in the vault or among the
+        // sources. The manifest would refuse anything else at commit time, but only
+        // after the blobs were written, and as an internal error.
+        for path in plan.keys() {
+            for folder in ancestors(path) {
+                let is_dir = match plan.get(folder) {
+                    Some(source) => source.is_none(),
+                    None => m.entries.get(folder) == Some(&Entry::Dir),
+                };
+                if !is_dir {
+                    return Err(format!("'{folder}' is not a folder in the vault, so '{path}' can't go in it"));
+                }
+            }
+        }
         // Decide everything before writing anything, so a name clash costs nothing.
         for (path, source) in &plan {
             let Some(existing) = m.entries.get(path) else { continue };
@@ -1374,9 +1435,6 @@ impl Vault {
     /// them. One file stays that file; anything else becomes a tar archive inside the age
     /// file. Same RAM-only rule as extract: everything verifies before `out` is touched.
     pub fn share_to(&self, entries: &[&str], to: &[&str], out: Out) -> R<()> {
-        if let Out::In(folder, name) = &out {
-            refuse_out_inside_vault(&*self.store, *folder, name)?;
-        }
         let recipients: Vec<x25519::Recipient> = to.iter()
             .map(|r| r.parse().map_err(|e| format!("invalid recipient '{r}': {e}")))
             .collect::<R<_>>()?;
@@ -1385,7 +1443,29 @@ impl Vault {
         }
         let encryptor = age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
             .map_err(|e| format!("preparing encryption: {e}"))?;
+        self.share_with(entries, encryptor, out)
+    }
 
+    /// Share for anyone who knows `password`, rather than for chosen people: the same
+    /// plain age file, encrypted with scrypt at the cost a password vault uses, so
+    /// VaultSend (Open file…, or Add existing vault) or `age -d` opens it. The same
+    /// floor on the password as a password vault's.
+    pub fn share_password(&self, entries: &[&str], password: &[u8], out: Out) -> R<()> {
+        let (password, _password_ram) = passphrase_from_bytes(password)?;
+        if password.expose_secret().chars().count() < MIN_PASSWORD_CHARS {
+            return Err(format!("use a password of at least {MIN_PASSWORD_CHARS} characters"));
+        }
+        let mut recipient = age::scrypt::Recipient::new(password);
+        recipient.set_work_factor(share_work_factor());
+        let encryptor = age::Encryptor::with_recipients(once(&recipient as &dyn age::Recipient))
+            .map_err(|e| format!("preparing encryption: {e}"))?;
+        self.share_with(entries, encryptor, out)
+    }
+
+    fn share_with(&self, entries: &[&str], encryptor: age::Encryptor, out: Out) -> R<()> {
+        if let Out::In(folder, name) = &out {
+            refuse_out_inside_vault(&*self.store, *folder, name)?;
+        }
         let m = self.load_manifest()?;
         let chosen = m.selection(entries)?;
         if chosen.is_empty() {
@@ -1471,6 +1551,12 @@ impl Vault {
         report.push_str(&format!("ok {verified} file(s) verified\n"));
         Ok(report)
     }
+}
+
+/// scrypt cost of a password share: a password vault's. Tests use less, so they stay
+/// fast; the work factor is in the file, so either opens the same way.
+fn share_work_factor() -> u8 {
+    if cfg!(test) { 10 } else { SCRYPT_LOG_N }
 }
 
 // ---------------------------------------------------------------------------
@@ -2022,6 +2108,39 @@ mod tests {
         assert!(v.add(&[t.path("f.txt")], Some("../x"), false).unwrap_err().contains("invalid"));
         assert!(v.add(&[t.path("f.txt")], Some("/"), false).is_ok());
         assert!(v.load_manifest().unwrap().entries.contains_key("f.txt"));
+    }
+
+    /// Sources listed in any order, missing a folder, or putting a file inside a file.
+    struct Listed(Vec<(String, Option<usize>)>);
+
+    impl Sources for Listed {
+        fn plan(&self) -> R<Plan> {
+            Ok((self.0.clone(), 0))
+        }
+        fn open(&self, _: usize) -> R<Box<dyn Read>> {
+            Ok(Box::new(Cursor::new(b"data".to_vec())))
+        }
+        fn size(&self, _: usize) -> u64 {
+            4
+        }
+    }
+
+    #[test]
+    fn sources_must_bring_the_folders_they_go_in() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        let blobs = || fs::read_dir(t.path("v.vsvault/blobs")).unwrap().count();
+        let before = blobs();
+        let missing = Listed(vec![("a/b.txt".into(), Some(0))]);
+        let err = v.add_from(&missing, None, false).unwrap_err();
+        assert!(err.contains("'a' is not a folder"), "{err}");
+        let in_a_file = Listed(vec![("f".into(), Some(0)), ("f/x".into(), Some(1))]);
+        assert!(v.add_from(&in_a_file, None, false).unwrap_err().contains("'f' is not a folder"));
+        assert_eq!((generation(&v), blobs()), (0, before), "nothing written");
+        // A folder already in the vault will do, and so will one among the sources.
+        v.add_from(&Listed(vec![("a".into(), None), ("a/b.txt".into(), Some(0))]), None, false).unwrap();
+        v.add_from(&Listed(vec![("a/c.txt".into(), Some(0))]), None, false).unwrap();
+        assert!(v.listing().unwrap().ends_with("D a\nF 4 a/b.txt\nF 4 a/c.txt\n"));
     }
 
     #[test]

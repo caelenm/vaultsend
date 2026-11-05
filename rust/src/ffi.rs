@@ -359,6 +359,8 @@ use std::rc::Rc;
 use jni::objects::{GlobalRef, JBooleanArray, JLongArray, JObject, JValue};
 use jni::JavaVM;
 
+use crate::shared::{self, Key};
+use crate::tar::LIMITS;
 use crate::vault::{self, Kind, Out, Plan, Progress, Secret, Sources, Store, Vault};
 
 /// An error from a callback into Kotlin, with the exception's message.
@@ -573,17 +575,25 @@ impl Sources for SafSources {
     }
 }
 
+/// Progress reports go to `sink.report(int)`, and the user's Cancel comes from
+/// `sink.isCancelled()` (org.vaultsend.ProgressSink).
 fn progress_to(env: &mut JNIEnv, sink: &JObject) -> Result<Rc<Progress>, String> {
     if sink.is_null() {
         return Ok(Rc::default());
     }
-    let sink = Callback::new(env, sink)?;
-    Ok(Rc::new(Progress::new(move |percent| {
-        // Undeliverable reports are dropped, as on desktop.
-        let _ = sink.call(|env, sink| {
-            env.call_method(sink, "report", "(I)V", &[JValue::Int(percent as i32)]).map(|_| ())
-        });
-    })))
+    let sink = Rc::new(Callback::new(env, sink)?);
+    let asks = sink.clone();
+    Ok(Rc::new(
+        Progress::new(move |percent| {
+            // Undeliverable reports are dropped, as on desktop.
+            let _ = sink.call(|env, sink| {
+                env.call_method(sink, "report", "(I)V", &[JValue::Int(percent as i32)]).map(|_| ())
+            });
+        })
+        .with_cancel(move || {
+            asks.call(|env, sink| env.call_method(sink, "isCancelled", "()Z", &[])?.z()).unwrap_or(false)
+        }),
+    ))
 }
 
 fn opt_bytes(env: &mut JNIEnv, a: &JByteArray) -> Result<Option<Vec<u8>>, String> {
@@ -865,4 +875,184 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultIsRemembered<'l>(
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSweep<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) {
     vault::sweep();
+}
+
+// ===========================================================================
+// Receiving a share (shared.rs): a plain age file someone made with Share…,
+// encrypted to this device's key or to a password. `password` is null for the
+// unlocked session key. As above, secrets are wiped and panics come back as errors.
+// ===========================================================================
+
+/// The input's length, for the percentage only (0 for a pipe: the bar pulses).
+fn input_len(file: &File) -> u64 {
+    file.metadata().map_or(0, |m| m.len())
+}
+
+/// Run `act` with the key a shared file opens with, wiping a password afterwards.
+fn with_key<T>(
+    env: &mut JNIEnv,
+    password: &JByteArray,
+    act: impl FnOnce(&Key) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut bytes = opt_bytes(env, password)?;
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        let key = match bytes.as_deref() {
+            Some(b) => Key::Password(b),
+            None => Key::Session,
+        };
+        act(&key)
+    }))
+    .unwrap_or_else(|_| Err("internal error while opening the shared file; nothing was written".into()));
+    if let Some(b) = bytes.as_mut() {
+        b.zeroize();
+    }
+    result
+}
+
+/// "password" or "key": which prompt a shared file needs.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedKind<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    in_fd: jint,
+) -> jstring {
+    let r = shared::age_kind(&mut *borrow_fd(in_fd)).map(str::to_string);
+    ret_string(&mut env, r)
+}
+
+/// Throws unless `password` opens the file. Only the file key is unwrapped.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedCheckPassword<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    in_fd: jint,
+    password: JByteArray<'l>,
+) {
+    let r = with_key(&mut env, &password, |key| match key {
+        Key::Password(pw) => shared::check_password(&mut *borrow_fd(in_fd), pw),
+        Key::Session => Err("no password was given".into()),
+    });
+    if let Err(e) = r {
+        throw(&mut env, &e);
+    }
+}
+
+/// Save a shared file as it is (an archive stays an archive), staged and
+/// authenticated in full before a byte reaches `out_fd`.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedDecrypt<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    password: JByteArray<'l>,
+    in_fd: jint,
+    out_fd: jint,
+) {
+    let r = (|| {
+        let dir = get_string(&mut env, &data_dir)?;
+        with_key(&mut env, &password, |key| {
+            shared::decrypt_file_to(&dir, key, &mut *borrow_fd(in_fd), &mut *borrow_fd(out_fd))
+        })
+    })();
+    if let Err(e) = r {
+        throw(&mut env, &e);
+    }
+}
+
+/// Unpack a shared archive into a new folder `name` inside `out_tree`. Returns
+/// warnings, one per line, as the vault calls do.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedExtract<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    password: JByteArray<'l>,
+    in_fd: jint,
+    out_tree: JObject<'l>,
+    name: JString<'l>,
+    progress: JObject<'l>,
+) -> jstring {
+    let r = (|| {
+        let dir = get_string(&mut env, &data_dir)?;
+        let name = get_string(&mut env, &name)?;
+        let folder = SafStore::new(&mut env, &out_tree)?;
+        let progress = progress_to(&mut env, &progress)?;
+        with_key(&mut env, &password, |key| {
+            let mut input = borrow_fd(in_fd);
+            let len = input_len(&input);
+            let skipped = shared::extract_archive(&dir, key, &mut *input, len, &folder, &name, &LIMITS, &progress)?;
+            Ok(skipped_warning(skipped))
+        })
+    })();
+    ret_string(&mut env, r)
+}
+
+fn skipped_warning(skipped: usize) -> String {
+    if skipped > 0 {
+        format!("warning: skipped {skipped} item(s) that are not regular files or folders\n")
+    } else {
+        String::new()
+    }
+}
+
+/// `vault-share` for anyone with `password`, into `out_fd`, as vaultShare.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSharePassword<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    tree: JObject<'l>,
+    secret: JByteArray<'l>,
+    entries: JObjectArray<'l>,
+    password: JByteArray<'l>,
+    out_fd: jint,
+    progress: JObject<'l>,
+) -> jstring {
+    let r = (|| {
+        let entries = get_string_array(&mut env, &entries)?;
+        let mut pw = get_bytes(&mut env, &password)?;
+        let r = with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| {
+            let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
+            let mut out = borrow_fd(out_fd);
+            v.share_password(&entries, &pw, Out::File(&mut out)).map(|()| String::new())
+        });
+        pw.zeroize();
+        r
+    })();
+    ret_string(&mut env, r)
+}
+
+/// Add what a shared file holds to the vault in `tree`, at its top: an archive's
+/// files and folders, or one file named `single_name`. All of it, or nothing.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultImportShared<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    tree: JObject<'l>,
+    secret: JByteArray<'l>,
+    password: JByteArray<'l>,
+    in_fd: jint,
+    single_name: JString<'l>,
+    progress: JObject<'l>,
+) -> jstring {
+    let r = (|| {
+        let dir = get_string(&mut env, &data_dir)?;
+        let single_name = get_string(&mut env, &single_name)?;
+        let mut pw = opt_bytes(&mut env, &password)?;
+        let r = with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| {
+            let key = match pw.as_deref() {
+                Some(b) => Key::Password(b),
+                None => Key::Session,
+            };
+            let mut input = borrow_fd(in_fd);
+            let len = input_len(&input);
+            shared::import_archive(v, &dir, &key, &mut *input, len, &single_name, &LIMITS).map(|_| String::new())
+        });
+        if let Some(b) = pw.as_mut() {
+            b.zeroize();
+        }
+        r
+    })();
+    ret_string(&mut env, r)
 }
