@@ -175,8 +175,9 @@ is the device-independent default requested here.)
   files…** and **Add folder…** (into the selected folder, if one is), **Open**,
   **Extract…**, **Share…** and **Delete** (which act on what's selected, and wait
   until something is), and **Lock**. **Share…** encrypts what's selected as an
-  ordinary `.age` file, for a contact or, with **Set password instead**, for anyone
-  with a password you choose; a folder or several items arrive as a `.tar` inside it.
+  ordinary `.age` file, for the contacts you tick or, with **Set password instead**,
+  for anyone with a password you choose, then saves it or hands it to the share
+  sheet; a folder or several items arrive as a `.tar` inside it.
   **Remove from list** only forgets a vault; its files stay where they are. To add a
   vault you already have (a backup, or a copy from your computer), use **Add existing
   vault… → A vault folder…**, or pick its `VAULT` file with **Open file…** and choose
