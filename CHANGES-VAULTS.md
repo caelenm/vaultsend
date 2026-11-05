@@ -167,3 +167,40 @@ downloads aren't reachable from it):
 - **Open with real viewers**, and the background auto-lock while one is showing a copy.
 - The desktop's GUI run-through (`vault_gui_driver.py`) and screenshots have no counterpart
   yet. A Compose UI test on an emulator would be the equivalent.
+
+---
+
+## Follow-up: password shares, receiving shares, vault page
+
+Changes asked for after manual testing of 0.2.0.
+
+| Asked for | Where |
+|---|---|
+| Share a vault's contents with a password; the receiver decrypts it on the main page | `Vault::share_password` (vault.rs); Share… → **Set password instead**; `shared.rs` for opening it |
+| Open file… / shared in: save an archive as it is, or unpacked as a folder | `ArchiveChoiceDialog`; `shared::decrypt_file_to`, `shared::extract_archive` |
+| Add existing vault… with a shared `.tar.age`: unlock, choose protection and place, import into a proper vault | `ExistingVaultDialog`, the Add vault form as **Import as a vault**; `shared::import_archive` |
+| Drop "(shareable)" | Add vault's second choice is **Use a password** |
+| Invert selection while Select multiple is on | `VaultSelection.invert()` |
+| Contacts \| Vaults divider slides to widen the chosen side | `SlidingToggle` |
+| The drawing's vault page | Four equal buttons above the list; a collapsible panel of stacked actions below it |
+| Validate the blob file manager | See below |
+
+**The archive reader.** `tar.rs` used to only write. Reading a share someone sends
+back is new, and the reader treats the archive as hostile. The rules are in the
+README's *Security model*. Each is tested with hand-built bad archives, a seeded
+mutation fuzz of the reader, and an end-to-end run through decrypt, the private
+tree and the output folder.
+
+**Cancel.** `Progress` carries a cancel hook. It is polled once per MiB and once per
+entry, and through JNI it calls `ProgressSink.isCancelled()`. `ProgressSink` is now a
+class, so that method exists however the sink was made. A cancelled run behaves like
+a failed one and cleans up the same way:
+- An unpack leaves no folder and no staging behind.
+- An import or an add leaves the vault's generation unchanged.
+
+**The blob file manager.** I reviewed `vault.rs` and its Kotlin mirror (`parseListing`, `VaultSelection`, Add's destination), and the existing tests already covered generations, GC, tampering and crash recovery. One gap was fixed:
+- **The gap.** A `Sources` that left out a folder its entries go in (`a/b` with no `a`) wrote every blob before the manifest's round-trip check refused it, as an "internal error".
+- **The fix.** `add_to` now refuses this before writing anything, with a test (`sources_must_bring_the_folders_they_go_in`).
+- **Who could hit it.** The app's own walks always list folders, but the archive import is a new `Sources`, so this now matters.
+
+**Not tested here.** The app on a device, and SAF on real providers for unpacking and import. `vault_attack.py` was not rerun, since it needs the `age` tool.

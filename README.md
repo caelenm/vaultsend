@@ -41,7 +41,8 @@ vaultsend-android/
 ├── rust/                     # Rust core (the only code that touches the key)
 │   ├── src/backend.rs        #   crypto + identity logic (refactored desktop main.rs)
 │   ├── src/vault.rs          #   vaults: the desktop's vault.rs, behind a Store
-│   ├── src/tar.rs            #   the archive Share writes (desktop's, unchanged)
+│   ├── src/tar.rs            #   the archive Share writes, and a strict reader for one sent back
+│   ├── src/shared.rs         #   opening a share: password check, save, unpack, import as a vault
 │   ├── src/ffi.rs            #   JNI entry points (the whole FFI surface)
 │   ├── src/vault_cli.rs      #   desktop vault-* commands, for host tests only
 │   ├── examples/vault_cli.rs #   ...as a binary the desktop test scripts drive
@@ -164,19 +165,29 @@ is the device-independent default requested here.)
   the crypto core.
 - **Vaults.** Keep a whole folder encrypted and change it one file at a time, as in
   the desktop app, in the same format, so a vault moves between the two. Open the
-  drawer, switch it to **Vaults**, tap **+**, name it, choose how to protect it (your
-  key, or a password you can share), then choose the folder it goes in. It stays
+  drawer, switch it to **Vaults** (the chosen side of the toggle widens), tap **+**,
+  name it, choose how to protect it (your key, or a password), then choose the folder it goes in. It stays
   there, where your file manager shows it, and VaultSend asks for access to that
-  folder only. Tap a vault, then **Unlock**, to see its files. **Add files…** and
-  **Add folder…** add into the selected folder, if one is. **Open**, **Extract…**,
-  **Share…** and **Delete** act on what's selected, and wait until something is.
-  **Select multiple** turns the rows into tick boxes, **Select all** ticks every row,
-  and **Verify all** checks every file for tampering. **Share…** encrypts what's
-  selected for a contact, as an ordinary `.age` file they decrypt in VaultSend (a
-  folder or several items arrive as a `.tar` inside it). **Remove from list** only
-  forgets a vault; its files stay where they are. To add a vault you already have
-  (a backup, a copy from your computer, or one someone shared), use **Add existing
-  vault…**, or pick its `VAULT` file with **Open file…** and choose its folder.
+  folder only. Tap a vault, then **Unlock**, to see its files. Above the list,
+  **Select all** ticks every row, **Select multiple** turns the rows into tick boxes,
+  **Invert selection** (with Select multiple on) flips every tick, and **Verify all**
+  checks every file for tampering. Below it, a panel you can fold away holds **Add
+  files…** and **Add folder…** (into the selected folder, if one is), **Open**,
+  **Extract…**, **Share…** and **Delete** (which act on what's selected, and wait
+  until something is), and **Lock**. **Share…** encrypts what's selected as an
+  ordinary `.age` file, for a contact or, with **Set password instead**, for anyone
+  with a password you choose; a folder or several items arrive as a `.tar` inside it.
+  **Remove from list** only forgets a vault; its files stay where they are. To add a
+  vault you already have (a backup, or a copy from your computer), use **Add existing
+  vault… → A vault folder…**, or pick its `VAULT` file with **Open file…** and choose
+  its folder.
+- **Receiving a share.** Open a shared `.age` file with **Open file…**, or share it to
+  VaultSend from another app, and choose **Decrypt**: VaultSend asks for its password,
+  or uses your key if it was made for you. An archive (`Name.tar.age`) can be saved as
+  one `.tar` or unpacked into a new folder. Or make it a vault of your own: **Add
+  existing vault… → A shared vault file…** unlocks it, asks how the new vault is
+  protected and where it goes, and fills it with what the file holds. Unpacking and
+  importing can be cancelled.
 - **Remember passphrase** (⋮ menu): whether your key stays unlocked, and whether a
   password vault's key is remembered. There are two choices: **Off** (ask every
   time) or **Until VaultSend closes** (the default, which is how this app has always
@@ -277,6 +288,19 @@ here. In short:
   the next launch if the app was killed. They are not deleted by the 2-minute
   background lock, since you're probably looking at one in another app.
 
+- **A shared archive is read as hostile.** Age has authenticated it, but only as
+  coming from whoever knew the password. `tar.rs`'s reader canonicalizes every name
+  and refuses one that could leave the folder (`..`, absolute paths, drive prefixes,
+  backslashes, NUL). It takes only files and folders, skipping links, devices and the
+  rest without creating them. It caps the entry count (100,000), each entry (8 GB) and
+  the total (32 GB), and checks every declared size against the archive's real
+  length. Everything streams. Unpacking decrypts the whole file to private staging
+  first, so age has authenticated all of it. It then builds the whole tree in the
+  app's private storage, copies it into the folder you chose under a temporary name,
+  and renames it last. Nothing reaches your folder from an archive that fails
+  anywhere. A password share uses scrypt at 2^18, and one asking for more work is
+  refused.
+
 New keys need a passphrase of at least 10 characters, and the identity is
 encrypted at the standard scrypt work factor of 2^18 (the same as the desktop app,
 the web build and the `age` CLI), so an `identity.age` from any of them imports
@@ -284,6 +308,17 @@ here. Files at a work factor above 2^20 are refused with an explicit message:
 scrypt would need more than 1 GiB of memory.
 
 ## Build verification status
+
+**Password shares, receiving shares, vault page (0.2.x).** `cargo test` passes 78
+tests on Rust 1.75 and current stable. Among them are known-bad archives (traversal
+names, links and devices, huge declared sizes, truncation, clashes), a seeded
+mutation fuzz of the tar reader (5,000 cases), and an end-to-end run of hostile
+archives through decrypt, private tree and output folder. `vault_roundtrip.sh` still
+passes 131 of 131. `VaultHelpersTest` passes 52, including the new invert, Add
+destination and shared-name cases. The Compose UI was type-checked against Compose
+Multiplatform 1.7 and `android-all` with stubs for the AndroidX activity, lifecycle
+and `FileProvider` calls, and the vault page was rendered off-screen to compare
+with the design. The app wasn't built or run on a device here; CI builds it.
 
 **Vaults (0.2.0).** Remember passphrase offers only Off and Until VaultSend
 closes; the timed choices from 0.2.0 beta 1 were removed, and a saved timed choice
