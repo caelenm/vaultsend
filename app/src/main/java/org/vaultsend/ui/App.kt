@@ -335,6 +335,54 @@ fun App(vm: AppViewModel = viewModel()) {
         }
     }
 
+    /** Open file… → Encrypt → Set password instead: the same Save File or Share as a vault's password share. */
+    fun encryptFileWithPassword(input: Uri, base: String, password: ByteArray) {
+        dialog = SaveOrShare(
+            "Share with a password",
+            "Save the encrypted file, or share it. Tell them the password some other way than the file.",
+            onCancel = { password.fill(0) },
+            onSave = {
+                dialog = null
+                saveThen("$base.age", onCancel = { password.fill(0) }) { output ->
+                    scope.launch {
+                        try {
+                            vm.backend.encryptFilePassword(password, input, output)
+                            toast("Encrypted. Send the saved file, and tell them the password some other way.")
+                        } catch (e: Exception) {
+                            vm.backend.discardOutput(output)
+                            toast(e.message ?: "The operation failed.")
+                        } finally {
+                            password.fill(0)
+                        }
+                    }
+                }
+            },
+            onShare = {
+                dialog = null
+                scope.launch {
+                    try {
+                        val staged = try {
+                            withContext(Dispatchers.IO) { vm.backend.newShareFile("$base.age") }
+                        } catch (e: Exception) {
+                            toast(e.message ?: "The operation failed.")
+                            return@launch
+                        }
+                        try {
+                            vm.backend.encryptFilePassword(password, input, shareUri(staged))
+                        } catch (e: Exception) {
+                            staged.delete()
+                            toast(e.message ?: "The operation failed.")
+                            return@launch
+                        }
+                        shareFile(staged)
+                    } finally {
+                        password.fill(0)
+                    }
+                }
+            },
+        )
+    }
+
     fun encryptFile(input: Uri) {
         val pk = vm.myPubkey
         if (pk == null) { toast("Your key isn't ready yet."); return }
@@ -392,54 +440,6 @@ fun App(vm: AppViewModel = viewModel()) {
             )
         }
         dialog = pick
-    }
-
-    /** Open file… → Encrypt → Set password instead: the same Save File or Share as a vault's password share. */
-    fun encryptFileWithPassword(input: Uri, base: String, password: ByteArray) {
-        dialog = SaveOrShare(
-            "Share with a password",
-            "Save the encrypted file, or share it. Tell them the password some other way than the file.",
-            onCancel = { password.fill(0) },
-            onSave = {
-                dialog = null
-                saveThen("$base.age", onCancel = { password.fill(0) }) { output ->
-                    scope.launch {
-                        try {
-                            vm.backend.encryptFilePassword(password, input, output)
-                            toast("Encrypted. Send the saved file, and tell them the password some other way.")
-                        } catch (e: Exception) {
-                            vm.backend.discardOutput(output)
-                            toast(e.message ?: "The operation failed.")
-                        } finally {
-                            password.fill(0)
-                        }
-                    }
-                }
-            },
-            onShare = {
-                dialog = null
-                scope.launch {
-                    try {
-                        val staged = try {
-                            withContext(Dispatchers.IO) { vm.backend.newShareFile("$base.age") }
-                        } catch (e: Exception) {
-                            toast(e.message ?: "The operation failed.")
-                            return@launch
-                        }
-                        try {
-                            vm.backend.encryptFilePassword(password, input, shareUri(staged))
-                        } catch (e: Exception) {
-                            staged.delete()
-                            toast(e.message ?: "The operation failed.")
-                            return@launch
-                        }
-                        shareFile(staged)
-                    } finally {
-                        password.fill(0)
-                    }
-                }
-            },
-        )
     }
 
     fun createKey() {
