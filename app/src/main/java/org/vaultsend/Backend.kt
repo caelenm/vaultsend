@@ -129,6 +129,14 @@ class Backend(private val context: Context) {
             }
         }
 
+    /** Encrypt a picked file for anyone with [password]. */
+    suspend fun encryptFilePassword(password: ByteArray, input: Uri, output: Uri) =
+        withContext(Dispatchers.IO) {
+            withFds(input, output) { inFd, outFd ->
+                VaultSendNative.encryptFdPassword(password, inFd, outFd)
+            }
+        }
+
     suspend fun decryptFile(passphrase: ByteArray, input: Uri, output: Uri) =
         withContext(Dispatchers.IO) {
             withFds(input, output) { inFd, outFd ->

@@ -1,5 +1,12 @@
 # What changed in this build
 
+## 0.3.3
+
+- **Open file… → Encrypt → Set password instead**, as on a vault's Share…: a
+  "Set password" dialog, then the same Save File or Share. The file is age
+  encrypted with scrypt at 2^18 (the same as a vault's password share), with the
+  same 10-character floor, so VaultSend's Decrypt or `age -d` opens it.
+
 ## 0.3.2: audit fixes (file handling and encryption)
 
 - **Background lock:** the 2 minutes are now measured with the clock that keeps

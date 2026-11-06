@@ -675,6 +675,21 @@ pub fn encrypt<R2: Read, W: Write>(
     Ok(())
 }
 
+/// Encrypt for anyone who knows `password`, as a vault's Share → Set password
+/// instead does: scrypt at SCRYPT_LOG_N, and the same floor on the password.
+pub fn encrypt_password<R2: Read, W: Write>(password: &[u8], mut input: R2, output: W) -> R<()> {
+    let (password, _password_ram) = passphrase_from_bytes(password)?;
+    if password.expose_secret().chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(format!("use a password of at least {MIN_PASSPHRASE_CHARS} characters"));
+    }
+    let mut recipient = age::scrypt::Recipient::new(password);
+    recipient.set_work_factor(SCRYPT_LOG_N);
+    let encryptor = age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+        .map_err(|e| format!("preparing encryption: {e}"))?;
+    encrypt_to(encryptor, false, &mut input, output)?;
+    Ok(())
+}
+
 /// Stream `reader` through `encryptor` into `out`, returning `out` once finished.
 /// The same helper the desktop backend's encrypt and vault code share.
 pub(crate) fn encrypt_to<W: Write>(

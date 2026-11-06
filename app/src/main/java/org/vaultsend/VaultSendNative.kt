@@ -68,6 +68,10 @@ object VaultSendNative {
     @Throws(BackendException::class)
     external fun encryptFd(recipients: Array<String>, armor: Boolean, inFd: Int, outFd: Int)
 
+    /** A file for anyone with [password], as a vault's password share. */
+    @Throws(BackendException::class)
+    external fun encryptFdPassword(password: ByteArray, inFd: Int, outFd: Int)
+
     @Throws(BackendException::class)
     external fun decryptFd(dataDir: String, passphrase: ByteArray, inFd: Int, outFd: Int)
 

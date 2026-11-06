@@ -1,6 +1,7 @@
 package org.vaultsend.ui
 
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -259,6 +260,7 @@ fun RecipientsDialog(
     contacts: List<Contact>,
     onCancel: () -> Unit,
     onConfirm: (List<String>) -> Unit,
+    onPassword: (() -> Unit)? = null,
 ) {
     val checked = remember { mutableStateMapOf<String, Boolean>() }
 
@@ -289,6 +291,9 @@ fun RecipientsDialog(
                             Text("${contact.name}  (${shortKey(contact.pubkey)})")
                         }
                     }
+                }
+                if (onPassword != null) {
+                    TextButton(onClick = onPassword, contentPadding = PaddingValues(0.dp)) { Text("Set password instead") }
                 }
             }
         },

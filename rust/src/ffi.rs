@@ -323,6 +323,24 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptFd<'l>(
     ret_unit(&mut env, r);
 }
 
+/// A file for anyone with `password` (Open file… → Encrypt → Set password instead).
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptFdPassword<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    password: JByteArray<'l>,
+    in_fd: jint,
+    out_fd: jint,
+) {
+    let r = guard(|| {
+        let pw = get_bytes(&mut env, &password)?;
+        let mut input = borrow_fd(in_fd);
+        let mut output = borrow_fd(out_fd);
+        backend::encrypt_password(&pw, &mut *input, &mut *output)
+    });
+    ret_unit(&mut env, r);
+}
+
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptFd<'l>(
     mut env: JNIEnv<'l>,

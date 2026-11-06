@@ -99,7 +99,10 @@ private data class AskPassphrase(
     val onCancel: (() -> Unit)? = null,
     val onSubmit: (ByteArray) -> Unit,
 ) : DialogState
-private data class PickRecipients(val onConfirm: (List<String>) -> Unit) : DialogState
+private data class PickRecipients(
+    val onPassword: (() -> Unit)? = null,
+    val onConfirm: (List<String>) -> Unit,
+) : DialogState
 // After choosing who it's for: save the encrypted result to a file, or hand it to the share sheet.
 private data class SaveOrShare(
     val title: String,
@@ -336,7 +339,20 @@ fun App(vm: AppViewModel = viewModel()) {
         val pk = vm.myPubkey
         if (pk == null) { toast("Your key isn't ready yet."); return }
         val base = vm.backend.displayName(input)
-        dialog = PickRecipients { recipients ->
+        lateinit var pick: PickRecipients
+        pick = PickRecipients(onPassword = {
+            // Share… → Set password instead, as on a vault's page.
+            dialog = AskPassphrase(
+                "Set password",
+                "",
+                confirm = true,
+                fieldLabel = "Password",
+                onCancel = { dialog = pick },
+            ) { bytes ->
+                dialog = null
+                encryptFileWithPassword(input, base, bytes)
+            }
+        }) { recipients ->
             dialog = SaveOrShare(
                 "Encrypt “$base”",
                 "Encrypting to ${recipients.size} recipient(s). Save the encrypted file, or share it.",
@@ -375,6 +391,55 @@ fun App(vm: AppViewModel = viewModel()) {
                 },
             )
         }
+        dialog = pick
+    }
+
+    /** Open file… → Encrypt → Set password instead: the same Save File or Share as a vault's password share. */
+    fun encryptFileWithPassword(input: Uri, base: String, password: ByteArray) {
+        dialog = SaveOrShare(
+            "Share with a password",
+            "Save the encrypted file, or share it. Tell them the password some other way than the file.",
+            onCancel = { password.fill(0) },
+            onSave = {
+                dialog = null
+                saveThen("$base.age", onCancel = { password.fill(0) }) { output ->
+                    scope.launch {
+                        try {
+                            vm.backend.encryptFilePassword(password, input, output)
+                            toast("Encrypted. Send the saved file, and tell them the password some other way.")
+                        } catch (e: Exception) {
+                            vm.backend.discardOutput(output)
+                            toast(e.message ?: "The operation failed.")
+                        } finally {
+                            password.fill(0)
+                        }
+                    }
+                }
+            },
+            onShare = {
+                dialog = null
+                scope.launch {
+                    try {
+                        val staged = try {
+                            withContext(Dispatchers.IO) { vm.backend.newShareFile("$base.age") }
+                        } catch (e: Exception) {
+                            toast(e.message ?: "The operation failed.")
+                            return@launch
+                        }
+                        try {
+                            vm.backend.encryptFilePassword(password, input, shareUri(staged))
+                        } catch (e: Exception) {
+                            staged.delete()
+                            toast(e.message ?: "The operation failed.")
+                            return@launch
+                        }
+                        shareFile(staged)
+                    } finally {
+                        password.fill(0)
+                    }
+                }
+            },
+        )
     }
 
     fun createKey() {
@@ -1475,6 +1540,7 @@ fun App(vm: AppViewModel = viewModel()) {
                     contacts = vm.contacts,
                     onCancel = { dialog = null },
                     onConfirm = d.onConfirm,
+                    onPassword = d.onPassword,
                 )
             }
         }
