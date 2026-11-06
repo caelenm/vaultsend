@@ -292,7 +292,16 @@ fn decrypt_to_staging<Rd: Read>(staging: &Staging, key: &Key, input: Rd, cap: u6
 
 /// Save a shared file as it is, to `out`: staged privately and authenticated in full,
 /// then written to `<out>.vaultsend-part` and renamed into place.
-pub(crate) fn decrypt_file_to<Rd: Read>(staging_root: &str, key: &Key, input: Rd, out: &str, progress: &Progress) -> R<()> {
+pub(crate) fn decrypt_file_to<Rd: Read>(
+    staging_root: &str,
+    key: &Key,
+    input: Rd,
+    input_len: u64,
+    out: &str,
+    progress: &Progress,
+) -> R<()> {
+    // Decrypting, then writing: about the size of the file each time.
+    progress.start(input_len.saturating_mul(2));
     let staging = Staging::new(staging_root)?;
     let mut staged = decrypt_to_staging(&staging, key, input, u64::MAX, progress)?;
     let len = staged.len;
@@ -553,8 +562,8 @@ pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
         }
         "share-decrypt" => {
             let key = key_from(&o, "--pass-fd")?;
-            let (reader, _) = input(&o)?;
-            decrypt_file_to(&staging_root()?, &key, reader, o.need("--out")?, &o.progress()?)
+            let (reader, len) = input(&o)?;
+            decrypt_file_to(&staging_root()?, &key, reader, len, o.need("--out")?, &o.progress()?)
         }
         "share-extract" => {
             let key = key_from(&o, "--pass-fd")?;
@@ -679,10 +688,10 @@ mod tests {
         let mine = Key::Identity(me.clone());
         assert!(check_password(open(&share), &mine).is_err());
         let out = t.path("saved.tar");
-        assert!(decrypt_file_to(&data, &mine, open(&share), &out, &none()).unwrap_err().contains("needs its password"));
+        assert!(decrypt_file_to(&data, &mine, open(&share), len(&share), &out, &none()).unwrap_err().contains("needs its password"));
         assert!(!Path::new(&out).exists());
 
-        decrypt_file_to(&data, &pw(PW), open(&share), &out, &none()).unwrap();
+        decrypt_file_to(&data, &pw(PW), open(&share), len(&share), &out, &none()).unwrap();
         let tar_bytes = fs::read(&out).unwrap();
         assert!(tar::looks_like_tar(&tar_bytes[..512]));
         let scan = tar::scan(&mut io::Cursor::new(&tar_bytes), tar_bytes.len() as u64, &LIMITS, &|| false).unwrap();
@@ -696,8 +705,8 @@ mod tests {
         assert!(check_password(open(&key_share), &pw(PW)).unwrap_err().contains("for people"));
         let other = Key::Identity(x25519::Identity::generate());
         let one = t.path("one.txt");
-        assert!(decrypt_file_to(&data, &other, open(&key_share), &one, &none()).unwrap_err().contains("not encrypted to you"));
-        decrypt_file_to(&data, &mine, open(&key_share), &one, &none()).unwrap();
+        assert!(decrypt_file_to(&data, &other, open(&key_share), len(&key_share), &one, &none()).unwrap_err().contains("not encrypted to you"));
+        decrypt_file_to(&data, &mine, open(&key_share), len(&key_share), &one, &none()).unwrap();
         assert_eq!(fs::read(&one).unwrap(), b"alpha");
         assert!(age_kind(&b"not an age file at all"[..]).is_err());
         assert_no_staging(&data);
@@ -935,7 +944,7 @@ mod tests {
         let data = t.path("staging");
         let (_v, share) = shared_tree(&t);
         let good_path = t.path("good.tar");
-        decrypt_file_to(&data, &pw(PW), open(&share), &good_path, &none()).unwrap();
+        decrypt_file_to(&data, &pw(PW), open(&share), len(&share), &good_path, &none()).unwrap();
         let good = fs::read(&good_path).unwrap();
 
         let mut known_bad: Vec<Vec<u8>> = Vec::new();

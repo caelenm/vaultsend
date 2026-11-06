@@ -432,6 +432,59 @@ def share_file_name(vault_name: str, selection, entries) -> str:
     return os.path.basename(only) + (".tar.age" if entries[only]["is_dir"] else ".age")
 
 
+def share_is_archive(file_name: str) -> bool:
+    """Whether a share's name says it's an archive: what Share names one (share_file_name)."""
+    return file_name.endswith(".tar.age")
+
+
+def unpacked_name(file_name: str) -> str:
+    """A name for what a share holds: a folder for "Photos.tar.age", a file for "a.txt.age"."""
+    for suffix in (".tar.age", ".age"):
+        if file_name.endswith(suffix) and len(file_name) > len(suffix):
+            return file_name[: -len(suffix)]
+    return file_name + " decrypted"
+
+
+def saved_name(file_name: str) -> str:
+    """A name for a share saved as it is: the .age comes off, so an archive stays a .tar."""
+    if file_name.endswith(".age") and len(file_name) > len(".age"):
+        return file_name[: -len(".age")]
+    return file_name + " decrypted"
+
+
+def share_actions(kind: str, file_name: str) -> list:
+    """What Decrypt offers for a file, given what `share-kind` said it needs. An archive
+    can be unpacked, saved as it is, or added to a vault; one file with a password can be
+    saved or added. One file for your key gets no choice: the plain decrypt, as always."""
+    if share_is_archive(file_name):
+        return ["unpack", "save", "import"]
+    if kind == "password":
+        return ["save", "import"]
+    return []
+
+
+def check_share_password(path: str, password: str) -> None:
+    """Raise BackendError unless `password` opens the share at `path`. The backend unwraps
+    the file key only, so this takes one scrypt and decrypts nothing. Like run_backend,
+    the password goes over a private pipe, never on the command line; run_backend itself
+    only knows --pass-fd, and stays as audited."""
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, password.encode("utf-8"))
+    os.close(write_fd)
+    try:
+        proc = subprocess.run(
+            [BACKEND, "share-check", "--in", path, "--share-pass-fd", str(read_fd)],
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, pass_fds=(read_fd,),
+        )
+    except FileNotFoundError:
+        raise BackendError(f"Backend not found at '{BACKEND}'.")
+    finally:
+        os.close(read_fd)
+    if proc.returncode != 0:
+        msg = proc.stderr.decode("utf-8", "replace").strip()
+        raise BackendError(msg.removeprefix("error: ") or "the operation failed")
+
+
 def vault_name_from_path(path: str) -> str:
     return os.path.basename(path.rstrip("/")).removesuffix(VAULT_SUFFIX)
 
@@ -681,9 +734,13 @@ class VaultOperation(FileOperation):
 
     `partial` is what to remove after a cancel or failure: the staging path of an
     extract, which is a folder for a folder extract. `on_done` gets the failure
-    message, or None on success or cancel."""
+    message, or None on success or cancel.
 
-    def __init__(self, window, args, *, passphrase, heading, subject, note, on_done, partial=None):
+    `passphrase` goes on `--pass-fd`, and each of `secrets` ({"--share-pass-fd": text})
+    on a pipe of its own: opening a share can take a passphrase and a share's password
+    at once. `passphrase` may be None when a command needs only the others."""
+
+    def __init__(self, window, args, *, passphrase, heading, subject, note, on_done, partial=None, secrets=None):
         super().__init__(
             window, args, passphrase=passphrase, heading=heading, subject=subject,
             watch_path=partial, total=1, note=note,
@@ -691,6 +748,8 @@ class VaultOperation(FileOperation):
         self.on_done = on_done
         self.progress_pipe = None
         self.percent = None
+        self.secrets = {} if passphrase is None else {"--pass-fd": passphrase}
+        self.secrets.update(secrets or {})
 
     def start(self):
         """FileOperation.start, with a pipe for the backend's reports. Its own, rather than
@@ -698,16 +757,20 @@ class VaultOperation(FileOperation):
         self.progress_pipe, write_end = os.pipe()
         os.set_blocking(self.progress_pipe, False)  # a tick must never wait on it
         os.set_blocking(write_end, False)  # nor may a report ever hold up the backend
-        pass_read, pass_write = os.pipe()
-        os.write(pass_write, self.passphrase.encode("utf-8"))
-        os.close(pass_write)
+        secret_args, secret_fds = [], []
+        for option, text in self.secrets.items():
+            pass_read, pass_write = os.pipe()
+            os.write(pass_write, text.encode("utf-8"))
+            os.close(pass_write)
+            secret_args += [option, str(pass_read)]
+            secret_fds.append(pass_read)
         try:
             self.proc = subprocess.Popen(
-                [BACKEND, *self.args, "--progress-fd", str(write_end), "--pass-fd", str(pass_read)],
+                [BACKEND, *self.args, "--progress-fd", str(write_end), *secret_args],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
-                pass_fds=(write_end, pass_read),
+                pass_fds=(write_end, *secret_fds),
             )
         except FileNotFoundError:
             os.close(self.progress_pipe)
@@ -719,7 +782,8 @@ class VaultOperation(FileOperation):
             return
         finally:
             os.close(write_end)
-            os.close(pass_read)
+            for fd in secret_fds:
+                os.close(fd)
         self.timer = GLib.timeout_add(self.POLL_MS, self._tick)
         GLib.timeout_add(self.DIALOG_DELAY_MS, self._present_dialog)
 
@@ -1324,12 +1388,160 @@ class Window(Adw.ApplicationWindow):
         ))
 
     def decrypt_file(self, path):
+        """A file someone shared may need a password rather than your key, and an archive
+        can be unpacked or added to a vault: ask the backend which, from the header alone."""
+        try:
+            kind = run_backend(["share-kind", "--in", path]).decode("utf-8").strip()
+        except BackendError as e:
+            self.error(str(e))
+            return
+        actions = share_actions(kind, os.path.basename(path))
+        if actions:
+            self._choose_share_action(path, kind, actions)
+        else:
+            self._decrypt_with_key(path)
+
+    def _decrypt_with_key(self, path):
         suggested = os.path.basename(path)
         suggested = suggested[:-4] if suggested.endswith(".age") else suggested + ".decrypted"
         self.with_passphrase("identity", lambda p: self._save_then(
             suggested,
             lambda out: self._run_decrypt(path, out, p),
         ))
+
+    # -- Opening a share -----------------------------------------------------
+    def _choose_share_action(self, path, kind, actions):
+        name = os.path.basename(path)
+        archive = "unpack" in actions
+        what = "a folder or several files" if archive else "one file"
+        how = "a password" if kind == "password" else "your key"
+        dlg = Adw.AlertDialog(
+            heading=f"Open “{name}”",
+            body=f"This was shared with {how}, and holds {what}.",
+        )
+        dlg.add_response("cancel", "Cancel")
+        if "import" in actions:
+            dlg.add_response("import", "Add to a vault…")
+            dlg.set_response_enabled("import", bool(self.vaults))
+        dlg.add_response("save", "Save as it is…" if archive else "Save…")
+        if archive:
+            dlg.add_response("unpack", "Unpack…")
+        default = "unpack" if archive else "save"
+        dlg.set_response_appearance(default, Adw.ResponseAppearance.SUGGESTED)
+        dlg.set_default_response(default)
+        dlg.set_close_response("cancel")
+
+        def resp(_d, r):
+            if r in ("unpack", "save", "import"):
+                self._with_share_key(path, kind, lambda key: self._share_action(path, r, key))
+
+        dlg.connect("response", resp)
+        dlg.present(self)
+
+    def _with_share_key(self, path, kind, on_ok, retry=False):
+        """Call on_ok with what opens the share: ("--share-pass-fd", its password), checked
+        at once so a wrong one is asked again, or ("--pass-fd", your passphrase)."""
+        if kind != "password":
+            self.with_passphrase("identity", lambda p: on_ok(("--pass-fd", p)))
+            return
+
+        def typed(password):
+            try:
+                check_share_password(path, password)
+            except BackendError as e:
+                if "wrong password" in str(e):
+                    self._with_share_key(path, kind, on_ok, retry=True)  # its heading says so
+                else:
+                    self.error(str(e))
+                return
+            on_ok(("--share-pass-fd", password))
+
+        name = os.path.basename(path)
+        self.ask_passphrase(
+            typed,
+            heading="Wrong password. Try again" if retry else "Enter the share's password",
+            body=f"“{name}” was shared with a password. Whoever sent it can tell you what it is.",
+        )
+
+    def _share_action(self, path, action, key):
+        name = os.path.basename(path)
+        option, secret = key
+
+        def done(failure):
+            if failure is None:
+                return
+            if "wrong passphrase" in failure:
+                self.cache.forget("identity")
+            self._vault_error("Couldn't open the share", failure)
+
+        def run(args, *, heading, note, out):
+            self._start_op(VaultOperation(
+                self, args, passphrase=None, secrets={option: secret}, heading=heading,
+                subject=name, note=note, on_done=done, partial=out + STAGING_SUFFIX,
+            ))
+
+        if action == "unpack":
+            self._save_then(unpacked_name(name), lambda out: run(
+                ["share-extract", "--in", path, "--out", out],
+                heading="Unpacking…", note="Unpacked.", out=out,
+            ))
+        elif action == "save":
+            self._save_then(saved_name(name), lambda out: run(
+                ["share-decrypt", "--in", path, "--out", out],
+                heading="Decrypting…", note="Decrypted.", out=out,
+            ))
+        elif action == "import":
+            self._pick_vault_for(name, lambda vault: self._import_share(vault, path, key))
+
+    def _pick_vault_for(self, name, on_ok):
+        dlg = Adw.AlertDialog(
+            heading="Add to which vault?",
+            body=f"What “{name}” holds goes in at the top of the vault you choose.",
+        )
+        rows = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
+        rows.add_css_class("boxed-list")
+        for v in self.vaults:
+            row = plain_row(v["name"], short_path(v["path"]))
+            row.set_activatable(True)
+            row.add_suffix(Gtk.Image.new_from_icon_name("go-next-symbolic"))
+            row.connect("activated", lambda _r, vault=v: (dlg.close(), on_ok(vault)))
+            rows.append(row)
+        scroller = Gtk.ScrolledWindow(propagate_natural_height=True, hscrollbar_policy=Gtk.PolicyType.NEVER)
+        scroller.set_max_content_height(260)
+        scroller.set_child(rows)
+        dlg.set_extra_child(scroller)
+        dlg.add_response("cancel", "Cancel")
+        dlg.set_close_response("cancel")
+        dlg.present(self)
+
+    def _import_share(self, vault, path, key):
+        option, secret = key
+        name = os.path.basename(path)
+        # vault-import's --pass-fd unlocks the vault, so your passphrase for the share
+        # goes on --id-pass-fd. A `self` vault takes the same passphrase: asked once.
+        share_secret = {"--id-pass-fd" if option == "--pass-fd" else option: secret}
+
+        def run(vault_secret):
+            def done(failure):
+                if failure is not None:
+                    self._vault_failed(vault, failure)
+                    return
+                self.select_vault(vault)
+                self._refresh_vaults()
+                self.vaults_toggle.set_active(True)
+                self._list_vault(vault, vault_secret)  # same secret, so no second prompt
+
+            self._start_op(VaultOperation(
+                self, self._vault_args(vault, "vault-import", "--in", path, "--name", unpacked_name(name)),
+                passphrase=vault_secret, secrets=share_secret,
+                heading=f"Adding to “{vault['name']}”…", subject=name,
+                note=f"Added to “{vault['name']}”.", on_done=done,
+            ))
+
+        if vault["mode"] == "self" and option == "--pass-fd":
+            run(secret)
+        else:
+            self.with_vault_secret(vault, run)
 
     def _save_then(self, suggested_name, callback):
         dialog = Gtk.FileDialog(title="Save as", initial_name=suggested_name)
@@ -2331,9 +2543,21 @@ class Window(Adw.ApplicationWindow):
             return True  # handled: this isn't a link for a browser to follow
 
         add_new.connect("activate-link", on_add_new)
+        with_password = Gtk.Label(
+            label='<a href="password">Share with a password instead</a>', use_markup=True, xalign=0,
+            tooltip_text="For someone who isn't a contact: anyone with the file and the password can open it",
+        )
+
+        def on_password(_label, _uri):
+            dlg.close()
+            self._share_with_password(vault, chosen)
+            return True
+
+        with_password.connect("activate-link", on_password)
         box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         box.append(scroller)
         box.append(add_new)
+        box.append(with_password)
         dlg.set_extra_child(box)
         dlg.add_response("cancel", "Cancel")
         dlg.set_close_response("cancel")
@@ -2352,6 +2576,27 @@ class Window(Adw.ApplicationWindow):
                 note=f"Encrypted for {contact['name']}. Send them the saved file.",
                 partial=out + STAGING_SUFFIX,
             ),
+        ))
+
+    def _share_with_password(self, vault, chosen):
+        suggested = share_file_name(vault["name"], chosen, self.vault_entries)
+
+        def with_password(vault_secret, password):
+            self._save_then(suggested, lambda out: self._start_op(VaultOperation(
+                self, self._vault_args(vault, "vault-share", *entry_args(chosen), "--out", out),
+                passphrase=vault_secret, secrets={"--share-pass-fd": password},
+                heading="Encrypting with a password…", subject=suggested,
+                note="Encrypted with a password. Send the file, and tell them the password another way.",
+                partial=out + STAGING_SUFFIX,
+                on_done=lambda failure: failure and self._vault_failed(vault, failure),
+            )))
+
+        self.with_vault_secret(vault, lambda s: self.ask_passphrase(
+            lambda password: with_password(s, password),
+            heading="Choose a password for this share",
+            body="Anyone with the file and this password can open it, in VaultSend or with the age tool. "
+            "Send the password another way than the file.",
+            confirm=True,
         ))
 
     def vault_delete(self):

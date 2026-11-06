@@ -720,6 +720,173 @@ def clicking_through_the_new_features():
     yield SETTLE
 
 
+def staged_left():
+    staging = app.DATA_DIR / "staging"
+    return sorted(n for n in os.listdir(staging) if n != ".lock") if staging.exists() else []
+
+
+def receiving_shares():
+    """Share with a password from a vault, then open shares on the main page: unpack one,
+    add one to a vault, and a key share, in the real window."""
+    SHARE_PASS = "gui test share password"
+    gift_path = WORK / "Gift.vsvault"
+    inbox_path = WORK / "Inbox.vsvault"
+    for path in (gift_path, inbox_path):
+        app.run_backend(["vault-create", "--dir", str(path), "--mode", "password"], passphrase=VAULT_PASS)
+    src = WORK / "gift"
+    (src / "album" / "2025").mkdir(parents=True)
+    (src / "album" / "cover.txt").write_text("cover\n")
+    (src / "album" / "2025" / "ünï day.txt").write_text("a day\n")
+    (src / "note.txt").write_text("a note\n")
+    app.run_backend(["vault-add", "--dir", str(gift_path), "--src", str(src / "album"), "--src", str(src / "note.txt")], passphrase=VAULT_PASS)
+    gift = {"name": "Gift", "path": str(gift_path), "mode": "password", "last_generation": 0}
+    inbox = {"name": "Inbox", "path": str(inbox_path), "mode": "password", "last_generation": 0}
+    win.vaults += [gift, inbox]
+    app.save_json(app.VAULTS_FILE, win.vaults)
+    win._refresh_vaults()
+    win.vaults_toggle.emit("clicked")
+    click_vault(gift)
+    yield SETTLE
+    win.vault_unlock()
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield SETTLE
+    select_all()
+
+    # -- Share with a password ----------------------------------------------------------
+    win.vault_share()
+    yield SETTLE
+    link = next(w for w in walk(dialog()) if isinstance(w, Gtk.Label) and "Share with a password instead" in w.get_label())
+    check("<a " in link.get_label(), "Share offers a password instead of a contact, as a link")
+    shot("40-share-with-password-link")
+    link.emit("activate-link", "password")
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)  # the vault's own, to read what's shared
+    yield SETTLE
+    check(dialog().get_heading() == "Choose a password for this share", "then asks for the share's password")
+    check(len([w for w in walk(dialog()) if isinstance(w, Gtk.PasswordEntry)]) == 2, "typed twice")
+    shot("41-share-password")
+    enter_passphrase("short", "short")
+    yield SETTLE
+    check(dialog().get_heading() == "Choose a password for this share", "a short one is refused and asked again")
+    enter_passphrase(SHARE_PASS, SHARE_PASS)
+    yield SETTLE
+    yield from answer_save(WORK, "Gift.tar.age")
+    yield from idle()
+    share = WORK / "Gift.tar.age"
+    header = share.read_bytes()[:200] if share.exists() else b""
+    check(b"-> scrypt" in header and b"-> X25519" not in header, "it saves a password share, not one for a key")
+    check(any("Encrypted with a password" in t for t in toasts[-3:]), "and says so")
+    check(app.run_backend(["share-kind", "--in", str(share)]) == b"password", "the backend agrees it needs a password")
+
+    # -- Unpack it on the main page --------------------------------------------------------
+    drop_on_main_page(share)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    check(dialog().get_heading() == "Open “Gift.tar.age”" and "a password" in dialog().get_body(), "Decrypt sees a password share")
+    check(dialog().get_response_enabled("import"), "and offers to add it to a vault, there being vaults")
+    shot("42-open-share")
+    respond("Unpack…")
+    yield SETTLE
+    check(dialog().get_heading() == "Enter the share's password", "Unpack asks for its password")
+    shot("43-share-password-prompt")
+    enter_passphrase("not the share password")
+    yield 3000  # one scrypt, to find it's wrong
+    check(dialog().get_heading() == "Wrong password. Try again", "a wrong password is said at once, and asked again")
+    enter_passphrase(SHARE_PASS)
+    yield 3000
+    yield from answer_save(WORK, "Gift")
+    yield from idle()
+    got = WORK / "Gift"
+    check(got.is_dir() and (got / "album" / "2025" / "ünï day.txt").read_text() == "a day\n" and (got / "note.txt").read_text() == "a note\n",
+          "Unpack gives the folder, file for file")
+    check(any(t == "Unpacked." for t in toasts[-3:]), "and says it's done")
+    check(not (WORK / "Gift.vaultsend-part").exists() and staged_left() == [], "with no partial folder and no staging left")
+
+    # -- Add it to a vault --------------------------------------------------------------------
+    drop_on_main_page(share)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    respond("Add to a vault…")
+    yield SETTLE
+    enter_passphrase(SHARE_PASS)
+    yield 3000
+    check(dialog().get_heading() == "Add to which vault?", "Add to a vault asks which")
+    rows = [w for w in walk(dialog()) if isinstance(w, Adw.ActionRow)]
+    check([r.get_title() for r in rows] == [v["name"] for v in win.vaults], "listing every vault")
+    shot("44-add-share-to-vault")
+    rows[[v["name"] for v in win.vaults].index("Inbox")].get_parent().emit("row-activated", rows[[v["name"] for v in win.vaults].index("Inbox")])
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)  # Inbox's
+    yield from idle()
+    yield from wait_for(lambda: win.vault is inbox and win.vault_entries is not None, "Inbox to open")
+    check(sorted(win.vault_entries) == ["album", "album/2025", "album/2025/ünï day.txt", "album/cover.txt", "note.txt"],
+          "it lands in that vault, which opens on it")
+    check(registry(inbox)["last_generation"] == 1, "in one change")
+    check(staged_left() == [], "with no staging left")
+    shot("45-share-imported")
+
+    # Again: everything's there already, so nothing changes.
+    drop_on_main_page(share)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    respond("Add to a vault…")
+    yield SETTLE
+    enter_passphrase(SHARE_PASS)
+    yield 3000
+    rows = [w for w in walk(dialog()) if isinstance(w, Adw.ActionRow)]
+    rows[[v["name"] for v in win.vaults].index("Inbox")].get_parent().emit("row-activated", rows[[v["name"] for v in win.vaults].index("Inbox")])
+    yield SETTLE
+    enter_passphrase(VAULT_PASS)
+    yield from idle()
+    check("already exists" in dialog_text(), "adding it twice is refused")
+    respond("Close")
+    yield SETTLE
+    listing = app.run_backend(["vault-list", "--dir", str(inbox_path)], passphrase=VAULT_PASS).decode()
+    check(listing.startswith("generation 1\n"), "and leaves the vault as it was")
+
+    # -- A key share: an archive for you, and one file for you --------------------------
+    key_share = WORK / "for me.tar.age"
+    raw = WORK / "for me.tar"
+    with tarfile.open(raw, "w") as archive:
+        archive.add(src / "note.txt", arcname="mine/note.txt")
+    app.run_backend(["encrypt", "-r", win.my_pubkey, "--in", str(raw), "--out", str(key_share)])
+    drop_on_main_page(key_share)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    check("your key" in dialog().get_body(), "an archive for your key gets the same choice")
+    respond("Unpack…")
+    yield SETTLE
+    enter_passphrase(ID_PASS)
+    yield SETTLE
+    yield from answer_save(WORK, "for me")
+    yield from idle()
+    check((WORK / "for me" / "mine" / "note.txt").read_text() == "a note\n", "and unpacks with your passphrase")
+
+    one = WORK / "just one.txt.age"
+    app.run_backend(["encrypt", "-r", win.my_pubkey, "--in", str(src / "note.txt"), "--out", str(one)])
+    drop_on_main_page(one)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    check(dialog().get_heading() == "Unlock your key", "one file for your key decrypts as it always has, with no choice")
+    respond("Cancel")
+    yield SETTLE
+
+    # Back as clicking_through_the_new_features left things.
+    win.vault_lock()
+    win.vaults = [v for v in win.vaults if v is not gift and v is not inbox]
+    win.vault = None
+    app.save_json(app.VAULTS_FILE, win.vaults)
+    win._refresh_vaults()
+    win.content_stack.set_visible_child_name("send")
+    yield SETTLE
+
+
 def script():
     yield 1800
     check(not STALE_COPY.exists(), "a crash's leftover copy is cleared at launch")
@@ -1477,6 +1644,7 @@ def script():
     yield SETTLE
 
     yield from clicking_through_the_new_features()
+    yield from receiving_shares()
 
     # Contacts must still work as before.
     win.contacts_toggle.emit("clicked")
