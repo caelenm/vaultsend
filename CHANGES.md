@@ -1,5 +1,49 @@
 # What changed in this build
 
+## 0.3.2: audit fixes (file handling and encryption)
+
+- **Background lock:** the 2 minutes are now measured with the clock that keeps
+  running while the phone sleeps, and checked again when the app comes back. Before,
+  the timer counted only time awake, didn't run while Android froze the app, and was
+  cancelled on return, so the key could stay unlocked for hours. The timer lives in
+  the view model, so a rotation while away can't leave one behind.
+- **Decrypted text:** every lock (Lock now, the background lock, closing) clears
+  decrypted text from the message box; it stayed on screen before. Below Android 13
+  the window is made secure while decrypted text or an unlocked vault is showing, so
+  the Recents thumbnail can't show it. Text fields ask the keyboard not to learn
+  from what's in them (`IME_FLAG_NO_PERSONALIZED_LEARNING`).
+- **Opened copies:** swept at every process start, and Lock now and closing delete
+  every copy in the folder. Before, if Android killed the app and it was reopened
+  from Recents, copies from the earlier process were never deleted.
+- **Plaintext staging:** what a killed decrypt, extract, Share or unpack left in the
+  app's storage is removed when the app starts (`sweepStaging`), not only at the
+  next decrypt. Cleanup is counted per folder, so staging in one never holds off
+  cleanup in another.
+- **Vault files stream:** Extract, Open, Share and Verify no longer load whole
+  files into RAM. Each blob is read once, hashed in the same pass that decrypts it
+  into private staging, and copied out only after all of it (all of them, for a
+  folder or a share) has verified. Memory is one chunk whatever the file's size,
+  where a 2 GB file needed about 4 GB before. A tampered blob is still refused
+  before anything is written, and an enormous one is refused without reading it.
+- **Weak identities:** an `identity.age` wrapped below scrypt 2^18 (earlier
+  calibrating builds, or an import) is re-wrapped at 2^18 when unlocked or
+  imported, after checking the new file opens to the same key. Identity writes are
+  serialized. Import reads at most 64 KiB.
+- **Incoming files:** a URI another app hands over is refused if it's to
+  VaultSend's own FileProvider or inside a folder VaultSend holds access to, since
+  VaultSend opens it with its own permissions, not the sender's.
+- **Folder access, stated correctly:** making a vault keeps access to the folder
+  picked for it and everything in it, not only the vault's folder; the README and
+  the Add vault hint now say so.
+- **JNI boundary:** every entry point catches panics, and every passphrase,
+  password and plaintext buffer in the native layer is wiped on drop, early
+  returns included.
+- **New-key passphrase floor** (10 characters) is enforced in the core too, and the
+  app counts characters the way the core does (code points).
+- **Build:** the shipped library is built with `--locked`, as is CI's `cargo test`;
+  CI's actions are pinned to commits. Rust crate version 0.3.2, matching
+  `versionName`.
+
 ## 0.3.1
 
 - **Set password:** Share… → Set password instead now opens a dialog titled just

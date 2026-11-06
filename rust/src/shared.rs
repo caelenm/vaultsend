@@ -25,8 +25,8 @@ use age::armor::ArmoredReader;
 use age::DecryptError;
 
 use crate::backend::{
-    decrypt_file_staged, open_private_new, passphrase_from_bytes, session_identity, staging_named, StagingGuard,
-    SCRYPT_LOG_N,
+    decrypt_file_staged, open_private_new, passphrase_from_bytes, session_identity, staging_named, PrivateDir,
+    StagingGuard, SCRYPT_LOG_N,
 };
 use crate::tar::{self, Item, Limits, Scan};
 use crate::vault::{valid_vault_path, within, Kind, PathStore, Plan, Progress, Sources, Store, Vault, CANCELLED};
@@ -225,18 +225,6 @@ fn write_items(
     Ok(())
 }
 
-/// A folder in the app's private storage, removed with everything in it when dropped.
-struct PrivateTree {
-    path: PathBuf,
-    _guard: StagingGuard,
-}
-
-impl Drop for PrivateTree {
-    fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
-    }
-}
-
 /// Unpack a shared archive into a new folder `name` inside `folder`. Returns how
 /// many entries were skipped (links and the like).
 ///
@@ -266,12 +254,8 @@ pub fn extract_archive<Rd: Read>(
     let mut staged = decrypt_to_staging(data_dir, key, input, archive_cap(limits), progress)?;
     let scan = scan_staged(&mut staged, limits, progress)?;
 
-    let private = PrivateTree { path: staging_named(data_dir, "tree"), _guard: StagingGuard::new(data_dir) };
+    let private = PrivateDir::create(data_dir, "tree")?;
     let private_dir = private.path.to_str().ok_or("the app's storage path is not valid UTF-8")?.to_string();
-    fs::DirBuilder::new()
-        .mode_private()
-        .create(&private.path)
-        .map_err(|e| format!("creating {private_dir}: {e}"))?;
     let private_store = PathStore::new(&private_dir);
     let archive = staged.file.try_clone().map_err(|e| e.to_string())?;
     write_items(&private_store, "", &scan, &mut |_, offset| {
@@ -373,18 +357,6 @@ pub fn import_archive<Rd: Read>(
     }
     vault.add_from(&sources, None, false)?;
     Ok(sources.skipped)
-}
-
-/// DirBuilder with mode 0700.
-trait PrivateMode {
-    fn mode_private(&mut self) -> &mut Self;
-}
-
-impl PrivateMode for fs::DirBuilder {
-    fn mode_private(&mut self) -> &mut Self {
-        use std::os::unix::fs::DirBuilderExt;
-        self.mode(0o700)
-    }
 }
 
 #[cfg(test)]

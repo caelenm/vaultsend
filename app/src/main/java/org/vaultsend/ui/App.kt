@@ -230,7 +230,7 @@ fun App(vm: AppViewModel = viewModel()) {
     fun doDecryptText(text: String) {
         scope.launch {
             try {
-                vm.message = vm.backend.decryptTextSession(text)
+                vm.showDecrypted(vm.backend.decryptTextSession(text))
                 toast("Decrypted.")
             } catch (e: Exception) {
                 toast(e.message ?: "The operation failed.")
@@ -284,7 +284,7 @@ fun App(vm: AppViewModel = viewModel()) {
                     toast(e.message ?: "The operation failed.")
                     return@launch
                 }
-                vm.message = encrypted
+                vm.replaceMessage(encrypted)
                 dialog = SaveOrShare(
                     "Encrypted",
                     "Encrypted to ${recipients.size} recipient(s). Save it to a file, or share it. " +
@@ -537,7 +537,11 @@ fun App(vm: AppViewModel = viewModel()) {
         if (uris.isNotEmpty() && callback != null) callback(uris)
     }
 
-    /** Keep access to a vault's folder across restarts: the one grant the app holds. */
+    /**
+     * Keep access to a picked folder across restarts. For a new vault that's the
+     * folder it's made in, not just the vault's own folder: SAF only grants what
+     * the user picked, so the app can reach everything in that folder.
+     */
     fun keepAccess(tree: Uri) {
         runCatching {
             context.contentResolver.takePersistableUriPermission(
@@ -1397,7 +1401,7 @@ fun App(vm: AppViewModel = viewModel()) {
             uri != null && isVaultFile(uri) -> { vm.clearPendingShare(); offerVaultDecrypt() }
             uri != null -> { dialog = FileActionDialogState(uri); vm.clearPendingShare() }
             text != null -> {
-                vm.message = text
+                vm.replaceMessage(text)
                 vm.clearPendingShare()
                 toast("Loaded shared text.")
             }
@@ -1540,7 +1544,8 @@ fun App(vm: AppViewModel = viewModel()) {
             onExisting = { dialog = ExistingVaultChoice },
             onCreate = { name, mode ->
                 dialog = null
-                // Where should the vault go? Access is kept to that folder only.
+                // Where should the vault go? Access is kept to the folder picked, and
+                // everything in it (see keepAccess).
                 pickFolder { parent ->
                     keepAccess(parent)
                     beginCreate(name, parent, mode)
@@ -1725,7 +1730,7 @@ private fun MainScreen(
                     },
                     actions = {
                         OverflowMenu(
-                            canLock = vm.unlocked || vm.vaultPage != null || vm.openedCopies.isNotEmpty(),
+                            canLock = vm.unlocked || vm.messageIsDecrypted || vm.vaultPage != null || vm.openedCopies.isNotEmpty(),
                             hasKey = vm.myPubkey != null,
                             onRemember = onRemember,
                             onLock = onLock,
@@ -1776,7 +1781,7 @@ private fun MainScreen(
                 )
                 OutlinedTextField(
                     value = vm.message,
-                    onValueChange = { vm.message = it },
+                    onValueChange = { vm.editMessage(it) },
                     modifier = Modifier
                         .fillMaxWidth()
                         .weight(1f),

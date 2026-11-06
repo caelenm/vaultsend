@@ -150,8 +150,8 @@ is the device-independent default requested here.)
 - **Decrypt** text or a file. The first decrypt of a session asks for your
   passphrase to **unlock**; after that you stay unlocked until you close the app,
   tap **Lock now** in the ⋮ menu, or leave the app in the background for 2 minutes
-  (see the security note below). With **Remember passphrase** set to Off, it asks
-  every time. File decryption stages
+  (see the security note below). Locking also clears decrypted text from the message
+  box. With **Remember passphrase** set to Off, it asks every time. File decryption stages
   the output to a private temp file and only writes it to your chosen destination
   after the whole stream authenticates, so a tampered or truncated file never
   leaves partial plaintext behind.
@@ -159,7 +159,9 @@ is the device-independent default requested here.)
   or use "open with" on a file (e.g. a `.age` file in a file manager). It opens the
   same encrypt/decrypt chooser as the in-app *Open file…* button. Shared plain text
   drops straight into the message box. (Inside the app, files are opened only via
-  the *Open file…* button.)
+  the *Open file…* button.) VaultSend opens what it's handed with its own access, so
+  it refuses a file inside a folder it has access to (a vault's, or the one you made
+  a vault in) when another app hands it over: use *Open file…* for those.
 - **Contacts** are stored as `contacts.json` in the same `[{name, pubkey}]` shape
   as desktop, so the file is interchangeable between the two. Contacts never reach
   the crypto core.
@@ -167,8 +169,8 @@ is the device-independent default requested here.)
   the desktop app, in the same format, so a vault moves between the two. Open the
   drawer, switch it to **Vaults** (the chosen side of the toggle widens), tap **+**,
   name it, choose how to protect it (your key, or a password), then choose the folder it goes in. It stays
-  there, where your file manager shows it, and VaultSend asks for access to that
-  folder only. Tap a vault, then **Unlock**, to see its files. Above the list,
+  there, where your file manager shows it. VaultSend keeps access to the folder you
+  choose, and everything in it, so a folder just for vaults is best. Tap a vault, then **Unlock**, to see its files. Above the list,
   **Select all** ticks every row, **Select multiple** turns the rows into tick boxes,
   **Invert selection** (with Select multiple on) flips every tick, and **Verify all**
   checks every file for tampering. Below it, a panel you can fold away holds **Add
@@ -193,7 +195,8 @@ is the device-independent default requested here.)
   password vault's key is remembered. There are two choices: **Off** (ask every
   time) or **Until VaultSend closes** (the default, which is how this app has always
   worked). Either way the 2-minute background lock still applies.
-  **Lock now** forgets all of it, locks open vaults and deletes opened copies.
+  **Lock now** forgets all of it, locks open vaults, clears decrypted text and
+  deletes opened copies.
 
 ## Security model — what changed in the port
 
@@ -240,7 +243,10 @@ around the managed heap and leave the original in freed memory until it is
 reclaimed. The native cache is a `SecretString` that zeroes its buffer on drop;
 `lock()` drops it, the ⋮ **Lock now** action calls it, and the Activity calls it when
 the app is finishing or has been in the background for 2 minutes (Android does not
-reliably call `onDestroy()` when an app is swiped away or left running). The key is never written to disk and never crosses back into
+reliably call `onDestroy()` when an app is swiped away or left running). The 2 minutes
+are measured on the clock that keeps running while the phone sleeps, and checked
+again when the app comes back, so a sleeping phone or a frozen process can't stretch
+them. The key is never written to disk and never crosses back into
 the JVM; for each decrypt it is briefly copied into zeroizing storage, used, and
 dropped.
 
@@ -250,9 +256,12 @@ widens the window in which it is in memory. That is the cost of the unlock-once
 convenience; it is made as safe as an in-process design allows — zeroizing,
 mutex-guarded, native-only — and the OS sandbox above is the same boundary that
 protects `identity.age` itself. If you prefer the stronger per-operation posture,
-set **Remember passphrase** to Off, or shorten `BACKGROUND_LOCK_MS` in `MainActivity`.
-The recent-apps thumbnail is disabled (Android 13+) so decrypted text isn't shown
-there.
+set **Remember passphrase** to Off, or shorten `BACKGROUND_LOCK_MS` in `Session.kt`.
+Every lock, the background one included, also clears decrypted text from the message
+box. The recent-apps thumbnail is disabled (Android 13+) so decrypted text isn't shown
+there; on older versions the window is made secure (no thumbnail, no screenshots)
+while decrypted text or an unlocked vault's list is on screen. Text fields ask the
+keyboard not to learn from what's typed or shown in them.
 
 ### Vaults
 
@@ -264,12 +273,18 @@ the format and threat model, and this branch's `CHANGES-VAULTS.md` for what diff
 here. In short:
 
 - **Where it lives.** In a folder you choose, through the Storage Access Framework.
-  The app keeps access to that folder and nothing else. Anything that can read the
+  The app keeps access to the folder you chose for it (the one the vault is made in,
+  and everything in it) and nothing else. Anything that can read the
   folder sees what the desktop says it would: how many files, roughly how big, when
   they changed. It doesn't see names or contents.
 - **Nothing is written until it has verified.** As on desktop, a file is decrypted
-  and verified in the library's memory before any of it is written, and only to a
-  place you chose.
+  and verified in full before any of it is written, and only to a place you chose.
+  Unlike the desktop, which does that in RAM, a phone can't hold a large file twice
+  over, so here each file is read once, its hash checked in the same pass that
+  decrypts it into private staging in the app's own storage, and copied out only
+  once all of it (for a folder or a share, all of them) has verified. Memory use is
+  one chunk whatever the size. The staging is deleted however the operation ends,
+  and when the app next starts if it was killed.
 - **Replacing the manifest.** SAF can't rename over a file, so a change deletes the
   old manifest and then renames the new one in. If the app is killed in between,
   the next open puts the new one in place, after checking that it's this vault's.
@@ -286,7 +301,8 @@ here. In short:
   one file. It can still keep its own copies (recent files, previews), and VaultSend
   can't see or remove those; the first Open says so and asks you to acknowledge it.
   Copies are deleted when you lock the vault, use Lock now, or close the app, and at
-  the next launch if the app was killed. They are not deleted by the 2-minute
+  the next launch if the app was killed (including when Android restarts it from
+  Recents). They are not deleted by the 2-minute
   background lock, since you're probably looking at one in another app.
 
 - **A shared archive is read as hostile.** Age has authenticated it, but only as
@@ -306,9 +322,31 @@ New keys need a passphrase of at least 10 characters, and the identity is
 encrypted at the standard scrypt work factor of 2^18 (the same as the desktop app,
 the web build and the `age` CLI), so an `identity.age` from any of them imports
 here. Files at a work factor above 2^20 are refused with an explicit message:
-scrypt would need more than 1 GiB of memory.
+scrypt would need more than 1 GiB of memory. An identity wrapped with less than
+2^18 (from an earlier build that calibrated to the phone, or imported from
+elsewhere) is wrapped again at 2^18 the first time it's unlocked or imported, which
+makes its passphrase as costly to guess as a new one's. The new file is checked to
+open with the same passphrase and hold the same key before it replaces the old one.
 
 ## Build verification status
+
+**Audit fixes (0.3.2).** `cargo test --locked` passes 86 tests on current stable,
+eight of them new: reading an identity's work factor from its header; a weak
+identity re-wrapped on import; one already on the device re-wrapped on unlock (and
+a stronger one left alone); the import size cap; the new-key passphrase floor,
+counted in characters; the start-up staging sweep, which leaves live staging alone;
+files streamed through staging that is always removed, with an appended-to or
+enormous blob refused (the enormous one without being read); and every blob read
+exactly once. `cargo clippy --lib
+--features cli -D warnings` is clean, and `tests/verify_deps.sh` passes.
+`vault_roundtrip.sh` passes 131 of 131 (its strace check included).
+`vault_attack.py`, with `age`, passes 212 and fails the same 4 process-hardening
+checks as before (see `CHANGES-VAULTS.md`). Its 1.5 GiB file now extracts
+identically under a 1 GiB memory limit, where the process used to be killed. The
+app was built here with the Android SDK and NDK 27: `assembleDebug` (all four ABIs,
+through `build-rust.sh --locked`), `assembleRelease` (R8), and `testDebugUnitTest`
+(VaultHelpersTest 52, SessionTest 4). Each `.so` exports exactly the 33 functions
+`VaultSendNative` declares. The app wasn't run on a device or emulator.
 
 **Password shares, receiving shares, vault page (0.2.x).** `cargo test` passes 78
 tests on Rust 1.75 and current stable. Among them are known-bad archives (traversal

@@ -58,6 +58,20 @@ pub(crate) const SCRYPT_LOG_N: u8 = 18;
 // build uses the same limit.
 const SCRYPT_MAX_LOG_N: u8 = 20;
 
+/// The shortest passphrase a new identity may have, in characters (Unicode scalar
+/// values). The app checks the same floor before it calls keygen; this is the
+/// check that holds whoever calls.
+pub(crate) const MIN_PASSPHRASE_CHARS: usize = 10;
+
+/// The largest file `import_identity` reads. A real identity.age is a few hundred
+/// bytes; this only stops a wrong pick (a video, say) from being read into memory.
+const MAX_IDENTITY_FILE: u64 = 64 << 10;
+
+/// Held while identity.age is being replaced, so two writers can never interleave
+/// on its staging file (`identity.age.new`): one could otherwise rename the other's
+/// half-written file into place.
+static IDENTITY_FILE: Mutex<()> = Mutex::new(());
+
 /// Encryptor for the identity file at the fixed work factor.
 pub(crate) fn identity_encryptor(passphrase: SecretString) -> R<age::Encryptor> {
     let mut recipient = age::scrypt::Recipient::new(passphrase);
@@ -84,6 +98,122 @@ fn decrypt_identity<'a, RR: Read + 'a>(
             ),
             _ => wrong_pass.to_string(),
         })
+}
+
+/// The scrypt work factor (log2 N) an identity file is wrapped with, read from its
+/// header, or None if the header isn't a single scrypt stanza.
+pub(crate) fn identity_work_factor(file: &[u8]) -> Option<u8> {
+    let mut lines = file.split(|&b| b == b'\n');
+    if lines.next()? != b"age-encryption.org/v1" {
+        return None;
+    }
+    let stanza = std::str::from_utf8(lines.next()?).ok()?;
+    match stanza.strip_prefix("-> scrypt ")?.split(' ').collect::<Vec<_>>()[..] {
+        [_salt, log_n] => log_n.parse().ok().filter(|n: &u8| n.to_string() == log_n),
+        _ => None,
+    }
+}
+
+/// Unwrap the identity in `file` (the bytes of an identity.age) with `passphrase`.
+/// `not_age` is said if it isn't an age file at all, `wrong_pass` if it doesn't open.
+fn identity_from_bytes(file: &[u8], passphrase: &[u8], not_age: &str, wrong_pass: &str) -> R<x25519::Identity> {
+    let (passphrase, _pass_ram) = passphrase_from_bytes(passphrase)?;
+    let dec = age::Decryptor::new(file).map_err(|_| not_age.to_string())?;
+    let mut id_reader = decrypt_identity(dec, passphrase, wrong_pass)?;
+    // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
+    // drop rather than left behind in freed heap.
+    let mut secret_bytes = secret_buffer();
+    id_reader
+        .read_to_end(&mut secret_bytes)
+        .map_err(|e| format!("reading identity: {e}"))?;
+    std::str::from_utf8(&secret_bytes)
+        .map_err(|_| "identity file is corrupt".to_string())?
+        .trim()
+        .parse::<x25519::Identity>()
+        .map_err(|e| format!("identity file is corrupt: {e}"))
+}
+
+/// Replace identity.age, so it is only ever the old file or the new one: `fill`
+/// writes the new one to `identity.age.new`, which is fsynced, then `verify`d, and
+/// only then renamed into place. Any failure removes the staging file and leaves
+/// identity.age as it was.
+fn replace_identity(
+    data_dir: &str,
+    fill: impl FnOnce(&mut File) -> R<()>,
+    verify: impl FnOnce(&Path) -> R<()>,
+) -> R<()> {
+    let _held = IDENTITY_FILE.lock().unwrap_or_else(|e| e.into_inner());
+    let id_path = identity_path(data_dir);
+    let tmp = id_path.with_extension("age.new");
+    let staged = (|| -> R<()> {
+        let mut file = open_private_new(&tmp)?;
+        fill(&mut file)?;
+        file.flush().map_err(|e| format!("writing identity: {e}"))?;
+        file.sync_all().map_err(|e| format!("writing identity: {e}"))?;
+        drop(file);
+        verify(&tmp)
+    })();
+    if let Err(e) = staged {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, &id_path).map_err(|e| {
+        let _ = fs::remove_file(&tmp);
+        format!("finalizing identity: {e}")
+    })?;
+    // Make the rename durable. Best-effort: by now it has happened.
+    if let Ok(dir) = File::open(data_dir) {
+        let _ = dir.sync_all();
+    }
+    Ok(())
+}
+
+/// Re-wrap identity.age at SCRYPT_LOG_N if `file` (what was just read from it, and
+/// opened with `passphrase` as `identity`) is wrapped with less. An identity made by
+/// an earlier, calibrating build, or imported from elsewhere, can carry a work
+/// factor as low as 2^1, which makes the passphrase cheap to guess from a copy of
+/// the file. The passphrase is at hand only here, so this is where it's fixed.
+///
+/// Best-effort: on any failure identity.age is left exactly as it was, and the
+/// next unlock tries again. The new file is decrypted and checked to hold the same
+/// key before it replaces the old one, and the old one is replaced only if it is
+/// still the file that was read.
+fn strengthen_identity(data_dir: &str, file: &[u8], passphrase: &[u8], identity: &x25519::Identity) {
+    if !identity_work_factor(file).is_some_and(|log_n| log_n < SCRYPT_LOG_N) {
+        return;
+    }
+    let public = identity.to_public().to_string();
+    let _ = replace_identity(
+        data_dir,
+        |out| {
+            if fs::read(identity_path(data_dir)).ok().as_deref() != Some(file) {
+                return Err("identity.age changed since it was read".into());
+            }
+            let (pass, _pass_ram) = passphrase_from_bytes(passphrase)?;
+            let secret = identity.to_string();
+            let _secret_ram = lock_in_ram(secret.expose_secret().as_bytes());
+            let encryptor = identity_encryptor(pass)?;
+            let mut w = encryptor
+                .wrap_output(&mut *out)
+                .map_err(|e| format!("encrypting identity: {e}"))?;
+            w.write_all(secret.expose_secret().as_bytes())
+                .map_err(|e| format!("encrypting identity: {e}"))?;
+            w.finish().map_err(|e| format!("encrypting identity: {e}"))?;
+            Ok(())
+        },
+        |staged| {
+            let bytes = fs::read(staged).map_err(|e| format!("reading identity: {e}"))?;
+            if identity_work_factor(&bytes) != Some(SCRYPT_LOG_N) {
+                return Err("re-wrapped identity has the wrong work factor".into());
+            }
+            let reread = identity_from_bytes(&bytes, passphrase, "re-wrapped identity is damaged", "re-wrapped identity does not open")?;
+            if reread.to_public().to_string() == public {
+                Ok(())
+            } else {
+                Err("re-wrapped identity holds a different key".into())
+            }
+        },
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -376,42 +506,32 @@ pub fn keygen(data_dir: &str, passphrase: &[u8]) -> R<String> {
         return Err("an identity already exists; refusing to overwrite it".into());
     }
     let (passphrase, _pass_ram) = passphrase_from_bytes(passphrase)?;
+    if passphrase.expose_secret().chars().count() < MIN_PASSPHRASE_CHARS {
+        return Err(format!("use a passphrase of at least {MIN_PASSPHRASE_CHARS} characters"));
+    }
 
     let identity = x25519::Identity::generate();
     let public = identity.to_public().to_string(); // "age1..."
     let secret = identity.to_string(); // SecretString "AGE-SECRET-KEY-1..."
     let _secret_ram = lock_in_ram(secret.expose_secret().as_bytes());
 
-    // Write to a temp file then atomically rename into place, so identity.age is
+    // Written to a temp file then atomically renamed into place, so identity.age is
     // only ever absent or fully written — never a partial/empty file a later run
     // would mistake for a real identity.
-    let id_path = identity_path(data_dir);
-    let tmp = id_path.with_extension("age.new");
-    let file = open_private_new(&tmp)?;
-    let write_result = (move || -> R<()> {
-        let encryptor = identity_encryptor(passphrase)?;
-        let mut w = encryptor
-            .wrap_output(file)
-            .map_err(|e| format!("encrypting identity: {e}"))?;
-        w.write_all(secret.expose_secret().as_bytes())
-            .map_err(|e| format!("encrypting identity: {e}"))?;
-        let mut inner = w.finish().map_err(|e| format!("encrypting identity: {e}"))?;
-        inner
-            .flush()
-            .map_err(|e| format!("encrypting identity: {e}"))?;
-        inner
-            .sync_all()
-            .map_err(|e| format!("encrypting identity: {e}"))?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    fs::rename(&tmp, &id_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("finalizing identity: {e}")
-    })?;
+    replace_identity(
+        data_dir,
+        |file| {
+            let encryptor = identity_encryptor(passphrase)?;
+            let mut w = encryptor
+                .wrap_output(&mut *file)
+                .map_err(|e| format!("encrypting identity: {e}"))?;
+            w.write_all(secret.expose_secret().as_bytes())
+                .map_err(|e| format!("encrypting identity: {e}"))?;
+            w.finish().map_err(|e| format!("encrypting identity: {e}"))?;
+            Ok(())
+        },
+        |_| Ok(()),
+    )?;
 
     fs::write(pubkey_path(data_dir), &public).map_err(|e| format!("writing public key: {e}"))?;
 
@@ -428,7 +548,7 @@ pub fn keygen(data_dir: &str, passphrase: &[u8]) -> R<String> {
 /// identity. Only on success are the original bytes written into place as
 /// `identity.age`, the public-key cache rebuilt, and the session unlocked. A valid
 /// existing identity is never overwritten. Returns the public key.
-pub fn import_identity<R2: Read>(data_dir: &str, passphrase: &[u8], mut input: R2) -> R<String> {
+pub fn import_identity<R2: Read>(data_dir: &str, passphrase: &[u8], input: R2) -> R<String> {
     let dir = Path::new(data_dir);
     fs::create_dir_all(dir).map_err(|e| format!("creating {}: {e}", dir.display()))?;
     let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
@@ -437,51 +557,36 @@ pub fn import_identity<R2: Read>(data_dir: &str, passphrase: &[u8], mut input: R
         return Err("an identity already exists on this device; refusing to overwrite it".into());
     }
 
-    // Identity files are tiny; read the whole candidate into memory.
+    // Identity files are tiny; read the whole candidate into memory, but no more
+    // than a real one could be.
     let mut bytes: Vec<u8> = Vec::new();
     input
+        .take(MAX_IDENTITY_FILE + 1)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("reading the selected file: {e}"))?;
+    if bytes.len() as u64 > MAX_IDENTITY_FILE {
+        return Err("that file is too large to be an identity file".into());
+    }
 
     // Verify structure + passphrase by fully decrypting to the secret key. If any
     // of this fails, nothing has been written and the device is unchanged.
-    let (pass, _pass_ram) = passphrase_from_bytes(passphrase)?;
-    let dec = age::Decryptor::new(BufReader::new(io::Cursor::new(&bytes)))
-        .map_err(|_| "that file is not a valid age identity".to_string())?;
-    let mut id_reader =
-        decrypt_identity(dec, pass, "wrong passphrase, or that is not a VaultSend identity file")?;
-    let mut secret_bytes = secret_buffer();
-    id_reader
-        .read_to_end(&mut secret_bytes)
-        .map_err(|e| format!("reading identity: {e}"))?;
-    let secret_str =
-        std::str::from_utf8(&secret_bytes).map_err(|_| "identity file is corrupt".to_string())?;
-    let identity = secret_str
-        .trim()
-        .parse::<x25519::Identity>()
-        .map_err(|e| format!("identity file is corrupt: {e}"))?;
+    let identity = identity_from_bytes(
+        &bytes,
+        passphrase,
+        "that file is not a valid age identity",
+        "wrong passphrase, or that is not a VaultSend identity file",
+    )?;
     let public = identity.to_public().to_string();
 
     // Verified. Write the original encrypted bytes into place, atomically, 0600.
-    let id_path = identity_path(data_dir);
-    let tmp = id_path.with_extension("age.new");
-    let write_result = (|| -> R<()> {
-        let mut file = open_private_new(&tmp)?;
-        file.write_all(&bytes)
-            .map_err(|e| format!("writing identity: {e}"))?;
-        file.sync_all()
-            .map_err(|e| format!("writing identity: {e}"))?;
-        Ok(())
-    })();
-    if let Err(e) = write_result {
-        let _ = fs::remove_file(&tmp);
-        return Err(e);
-    }
-    fs::rename(&tmp, &id_path).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("finalizing identity: {e}")
-    })?;
+    replace_identity(
+        data_dir,
+        |file| file.write_all(&bytes).map_err(|e| format!("writing identity: {e}")),
+        |_| Ok(()),
+    )?;
     fs::write(pubkey_path(data_dir), &public).map_err(|e| format!("writing public key: {e}"))?;
+    // And if it was wrapped weakly, wrap it again at the standard work factor.
+    strengthen_identity(data_dir, &bytes, passphrase, &identity);
 
     // Unlock the freshly imported identity for this session.
     hold_session(&identity);
@@ -516,26 +621,19 @@ pub fn status(data_dir: &str) -> R<String> {
 }
 
 /// Decrypt identity.age with the passphrase and return the parsed identity.
+/// A weakly wrapped one is wrapped again at the standard work factor on the way
+/// (`strengthen_identity`).
 pub(crate) fn load_identity(data_dir: &str, passphrase: &[u8]) -> R<x25519::Identity> {
-    let (passphrase, _pass_ram) = passphrase_from_bytes(passphrase)?;
-    let id_file = File::open(identity_path(data_dir))
+    let file = fs::read(identity_path(data_dir))
         .map_err(|_| "no identity yet — run keygen first".to_string())?;
-    let dec = age::Decryptor::new(BufReader::new(id_file))
-        .map_err(|_| "your saved identity is empty or damaged and can't be read".to_string())?;
-    let mut id_reader =
-        decrypt_identity(dec, passphrase, "wrong passphrase, or the identity file is damaged")?;
-    // Hold the decrypted secret-key text in zeroizing storage so it is wiped on
-    // drop rather than left behind in freed heap.
-    let mut secret_bytes = secret_buffer();
-    id_reader
-        .read_to_end(&mut secret_bytes)
-        .map_err(|e| format!("reading identity: {e}"))?;
-    let secret =
-        std::str::from_utf8(&secret_bytes).map_err(|_| "identity file is corrupt".to_string())?;
-    secret
-        .trim()
-        .parse::<x25519::Identity>()
-        .map_err(|e| format!("identity file is corrupt: {e}"))
+    let identity = identity_from_bytes(
+        &file,
+        passphrase,
+        "your saved identity is empty or damaged and can't be read",
+        "wrong passphrase, or the identity file is damaged",
+    )?;
+    strengthen_identity(data_dir, &file, passphrase, &identity);
+    Ok(identity)
 }
 
 /// Rebuild the clear pubkey cache from the encrypted identity (needs passphrase).
@@ -694,27 +792,103 @@ fn clear_stale_staging(data_dir: &str) {
     }
 }
 
-/// Number of file decrypts currently staging; stale-file cleanup waits for 0.
-static ACTIVE_DECRYPTS: Mutex<usize> = Mutex::new(0);
+/// How many staged operations are running, by the folder they stage in; a folder's
+/// stale-file cleanup waits for its count to be 0. Kept per folder, so staging in one
+/// never holds off the cleanup of another.
+static ACTIVE_DECRYPTS: Mutex<BTreeMap<String, usize>> = Mutex::new(BTreeMap::new());
 
 /// Held while plaintext is staged in `data_dir`: the first one in sweeps what a
-/// killed run left behind, and none sweeps while another is staging.
-pub(crate) struct StagingGuard;
+/// killed run left behind, and none sweeps while another is staging there.
+pub(crate) struct StagingGuard {
+    dir: String,
+}
 
 impl StagingGuard {
     pub(crate) fn new(data_dir: &str) -> StagingGuard {
         let mut active = ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner());
-        if *active == 0 {
+        let count = active.entry(data_dir.to_string()).or_insert(0);
+        if *count == 0 {
             clear_stale_staging(data_dir);
         }
-        *active += 1;
-        StagingGuard
+        *count += 1;
+        StagingGuard { dir: data_dir.to_string() }
     }
 }
 
 impl Drop for StagingGuard {
     fn drop(&mut self) {
-        *ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner()) -= 1;
+        let mut active = ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(count) = active.get_mut(&self.dir) {
+            *count -= 1;
+            if *count == 0 {
+                active.remove(&self.dir);
+            }
+        }
+    }
+}
+
+/// Remove the plaintext staging a killed run left in `data_dir`, unless something is
+/// staging there now. For the app's start: otherwise leftovers wait for the next
+/// staged operation, which may never come. The count's lock is held throughout, so
+/// no operation can start staging while this sweeps.
+pub fn sweep_staging(data_dir: &str) {
+    let active = ACTIVE_DECRYPTS.lock().unwrap_or_else(|e| e.into_inner());
+    if active.get(data_dir).copied().unwrap_or(0) == 0 {
+        clear_stale_staging(data_dir);
+    }
+}
+
+/// One file of plaintext staged in `data_dir` (0600, a name `clear_stale_staging`
+/// sweeps), removed when dropped. It holds no descriptor, so thousands can be staged
+/// at once without running out.
+pub(crate) struct StagedFile {
+    path: PathBuf,
+    _guard: StagingGuard,
+}
+
+impl StagedFile {
+    /// A new staging file, and a write-only descriptor on it.
+    pub(crate) fn create(data_dir: &str, what: &str) -> R<(StagedFile, File)> {
+        let guard = StagingGuard::new(data_dir);
+        let path = staging_named(data_dir, what);
+        let file = open_private_new(&path)?;
+        Ok((StagedFile { path, _guard: guard }, file))
+    }
+
+    /// Its contents, from the start.
+    pub(crate) fn open(&self) -> R<File> {
+        File::open(&self.path).map_err(|e| format!("reading the staged file: {e}"))
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// A private (0700) folder in `data_dir`, removed with everything in it when dropped.
+pub(crate) struct PrivateDir {
+    pub(crate) path: PathBuf,
+    _guard: StagingGuard,
+}
+
+impl PrivateDir {
+    pub(crate) fn create(data_dir: &str, what: &str) -> R<PrivateDir> {
+        use std::os::unix::fs::DirBuilderExt;
+        let guard = StagingGuard::new(data_dir);
+        let path = staging_named(data_dir, what);
+        fs::DirBuilder::new()
+            .mode(0o700)
+            .create(&path)
+            .map_err(|e| format!("creating {}: {e}", path.display()))?;
+        Ok(PrivateDir { path, _guard: guard })
+    }
+}
+
+impl Drop for PrivateDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
     }
 }
 
@@ -808,8 +982,8 @@ mod tests {
         let dir_b = tmpdir() + "-b";
         fs::create_dir_all(&dir_a).unwrap();
         fs::create_dir_all(&dir_b).unwrap();
-        let pk_a = keygen(&dir_a, b"aaaa").unwrap();
-        let pk_b = keygen(&dir_b, b"bbbb").unwrap();
+        let pk_a = keygen(&dir_a, b"aaaa aaaa aaaa").unwrap();
+        let pk_b = keygen(&dir_b, b"bbbb bbbb bbbb").unwrap();
 
         let data = vec![0xABu8; 100_000];
         let mut ct = Vec::new();
@@ -817,9 +991,9 @@ mod tests {
 
         // Both recipients can decrypt the single ciphertext.
         let mut out_a = Vec::new();
-        decrypt(&dir_a, b"aaaa", Cursor::new(&ct), &mut out_a).unwrap();
+        decrypt(&dir_a, b"aaaa aaaa aaaa", Cursor::new(&ct), &mut out_a).unwrap();
         let mut out_b = Vec::new();
-        decrypt(&dir_b, b"bbbb", Cursor::new(&ct), &mut out_b).unwrap();
+        decrypt(&dir_b, b"bbbb bbbb bbbb", Cursor::new(&ct), &mut out_b).unwrap();
         assert_eq!(out_a, data);
         assert_eq!(out_b, data);
 
@@ -984,5 +1158,116 @@ mod tests {
         lock();
         let _ = fs::remove_dir_all(&src);
         let _ = fs::remove_dir_all(&dst);
+    }
+
+    /// An identity.age for `identity`, wrapped with `pass` at scrypt 2^`log_n`.
+    fn identity_file(identity: &x25519::Identity, pass: &str, log_n: u8) -> Vec<u8> {
+        let mut r = age::scrypt::Recipient::new(SecretString::from(pass.to_owned()));
+        r.set_work_factor(log_n);
+        let enc = age::Encryptor::with_recipients(std::iter::once(&r as &dyn age::Recipient)).unwrap();
+        let mut bytes = Vec::new();
+        let mut w = enc.wrap_output(&mut bytes).unwrap();
+        w.write_all(identity.to_string().expose_secret().as_bytes()).unwrap();
+        w.finish().unwrap();
+        bytes
+    }
+
+    #[test]
+    fn the_work_factor_is_read_from_the_header() {
+        let id = x25519::Identity::generate();
+        assert_eq!(identity_work_factor(&identity_file(&id, "pw", 3)), Some(3));
+        assert_eq!(identity_work_factor(b"age-encryption.org/v1\n-> scrypt c2FsdA 018\n"), None);
+        assert_eq!(identity_work_factor(b"age-encryption.org/v1\n-> X25519 abc\n"), None);
+        assert_eq!(identity_work_factor(b"not an age file"), None);
+    }
+
+    #[test]
+    fn a_weakly_wrapped_import_is_wrapped_again_at_the_standard_work_factor() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-weak-import";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        lock();
+        let id = x25519::Identity::generate();
+        let pk = import_identity(&dir, b"weak but mine", Cursor::new(identity_file(&id, "weak but mine", 1))).unwrap();
+        assert_eq!(pk, id.to_public().to_string());
+        let stored = fs::read(identity_path(&dir)).unwrap();
+        assert_eq!(identity_work_factor(&stored), Some(SCRYPT_LOG_N));
+        assert!(!identity_path(&dir).with_extension("age.new").exists());
+        // The same key and passphrase still open it.
+        lock();
+        assert_eq!(unlock(&dir, b"weak but mine").unwrap(), pk);
+        lock();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_weak_identity_already_on_the_device_is_strengthened_when_unlocked() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-weak-existing";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        lock();
+        let id = x25519::Identity::generate();
+        fs::write(identity_path(&dir), identity_file(&id, "an older build", 2)).unwrap();
+        fs::write(pubkey_path(&dir), id.to_public().to_string()).unwrap();
+        // A wrong passphrase changes nothing.
+        assert!(unlock(&dir, b"not the passphrase").is_err());
+        assert_eq!(identity_work_factor(&fs::read(identity_path(&dir)).unwrap()), Some(2));
+        assert_eq!(unlock(&dir, b"an older build").unwrap(), id.to_public().to_string());
+        assert_eq!(identity_work_factor(&fs::read(identity_path(&dir)).unwrap()), Some(SCRYPT_LOG_N));
+        // Stronger than standard is left as it is.
+        let strong = identity_file(&id, "an older build", 19);
+        fs::write(identity_path(&dir), &strong).unwrap();
+        load_identity(&dir, b"an older build").unwrap();
+        assert_eq!(fs::read(identity_path(&dir)).unwrap(), strong);
+        lock();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn import_reads_no_more_than_an_identity_could_be() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-big-import";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let huge = io::repeat(b'x').take(MAX_IDENTITY_FILE * 4);
+        assert!(import_identity(&dir, b"whatever passphrase", huge).unwrap_err().contains("too large"));
+        assert_eq!(status(&dir).unwrap(), "empty");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_new_identity_needs_a_passphrase_of_ten_characters() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tmpdir() + "-short";
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // Characters, not bytes: nine accented letters are 18 bytes and still too short.
+        assert!(keygen(&dir, "ééééééééé".as_bytes()).unwrap_err().contains("at least 10"));
+        assert_eq!(status(&dir).unwrap(), "empty");
+        lock();
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_start_sweep_removes_leftover_staging_but_never_live_staging() {
+        let dir = std::env::temp_dir().join(format!("vaultsend-sweep-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join(".decrypt-tree-1-2.part")).unwrap();
+        fs::write(dir.join(".decrypt-1-1.part"), b"old plaintext").unwrap();
+        fs::write(dir.join("identity.age"), b"kept").unwrap();
+        let d = dir.to_str().unwrap();
+        // While something is staging there, nothing is touched...
+        let (live, _file) = StagedFile::create(d, "live").unwrap();
+        fs::write(dir.join(".decrypt-1-3.part"), b"a killed run's").unwrap();
+        sweep_staging(d);
+        assert!(dir.join(".decrypt-1-3.part").exists() && live.open().is_ok());
+        drop(live);
+        // ...and once it's done, every leftover goes, and nothing else.
+        sweep_staging(d);
+        let left: Vec<_> = fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("identity.age")]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }

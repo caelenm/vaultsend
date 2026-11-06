@@ -10,9 +10,10 @@
 //     blobs/<aa>/<32-hex-id>.age   one per file, encrypted to the vault's public key
 //
 // No custom crypto here either: all encryption is age. The security rests on the
-// bookkeeping: hashes checked before decrypting, plaintext fully verified in RAM
-// before a byte reaches disk, and age recipients being anonymous (the vault's public
-// key is stored nowhere in the clear, so a manifest can't be forged without the key).
+// bookkeeping: every blob's hash checked in the same pass that decrypts it,
+// plaintext fully verified before a byte reaches the output, and age recipients
+// being anonymous (the vault's public key is stored nowhere in the clear, so a
+// manifest can't be forged without the key).
 //
 // Android port. This is the desktop vaults branch's vault.rs, and everything that
 // decides what a vault is (the format, the manifest parser, path rules, the seal,
@@ -28,6 +29,11 @@
 //     so a SAF vault is locked within the process (`process_lock`) instead.
 //   * Secrets come from the session or a byte array, not a pipe (`Secret`), and a
 //     password vault's key can be remembered in native memory (`remember`).
+//   * The desktop decrypts each file whole in RAM. A phone can't hold a large file
+//     twice over, so here a file is verified as a stream into private staging in the
+//     app's own storage (`stage`), and copied out only once all of it has verified.
+//     Memory use is one chunk; the staging is deleted however the operation ends,
+//     and at the app's next start if it was killed.
 
 use std::any::Any;
 use std::cell::{Cell, RefCell};
@@ -49,7 +55,7 @@ use zeroize::Zeroizing;
 
 use crate::backend::{
     encrypt_to, load_identity, lock_in_ram, open_private_new, passphrase_from_bytes,
-    secret_buffer, session_identity, Held, RamLock, SCRYPT_LOG_N,
+    secret_buffer, session_identity, Held, RamLock, StagedFile, MIN_PASSPHRASE_CHARS, SCRYPT_LOG_N,
 };
 use crate::{tar, R};
 
@@ -66,9 +72,11 @@ const BLOBS_DIR: &str = "blobs";
 /// `--entry` / `--dest` value meaning the top of the vault. Never a valid vault path.
 pub const ROOT_ENTRY: &str = "/";
 /// Same floor as the identity passphrase (MIN_PASSPHRASE_LEN in the frontend).
-const MIN_PASSWORD_CHARS: usize = 10;
+const MIN_PASSWORD_CHARS: usize = MIN_PASSPHRASE_CHARS;
 /// How much plaintext goes by between progress reports, at most.
 const PROGRESS_CHUNK: usize = 1 << 20;
+/// How much plaintext a streamed copy holds in memory at once.
+const COPY_CHUNK: usize = 64 << 10;
 /// What unlocking a password vault says when it was given no password and has none
 /// remembered. The app asks for the password when it sees this.
 pub const PASSWORD_NEEDED: &str = "this vault's password is needed";
@@ -283,6 +291,8 @@ pub trait Store {
     /// The whole of a regular file. Anything else is an error: a FIFO planted in
     /// a vault would otherwise block forever.
     fn read(&self, rel: &str) -> io::Result<Vec<u8>>;
+    /// A regular file, to read as a stream; anything else is an error, as for `read`.
+    fn open(&self, rel: &str) -> io::Result<File>;
     /// A new private file at `rel`, replacing a stale one of that name. Its
     /// folder must exist.
     fn create_new(&self, rel: &str) -> R<File>;
@@ -345,6 +355,9 @@ impl Store for PathStore {
     }
     fn read(&self, rel: &str) -> io::Result<Vec<u8>> {
         read_regular(&self.full(rel))
+    }
+    fn open(&self, rel: &str) -> io::Result<File> {
+        open_regular(&self.full(rel))
     }
     fn create_new(&self, rel: &str) -> R<File> {
         open_private_new(Path::new(&self.full(rel)))
@@ -513,10 +526,22 @@ fn sync_dir(path: &str) {
 /// fs::read for anything inside a vault. A FIFO planted there would otherwise block forever,
 /// with the window frozen behind it, since unlocking runs in the foreground.
 fn read_regular(path: &str) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    open_regular(path)?.read_to_end(&mut data)?;
+    Ok(data)
+}
+
+/// File::open for anything inside a vault, for the same reason. What was opened is
+/// checked again, so a file swapped for something else in between is refused too.
+fn open_regular(path: &str) -> io::Result<File> {
     if !fs::metadata(path)?.is_file() {
         return Err(io::Error::other("not a regular file"));
     }
-    fs::read(path)
+    let file = File::open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("not a regular file"));
+    }
+    Ok(file)
 }
 
 fn parent_of(path: &str) -> &str {
@@ -553,6 +578,29 @@ impl<W: Write> Write for HashingWriter<W> {
     }
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// Hashes a blob's ciphertext on its way to age, so one read both verifies and
+/// decrypts it. Remembers a read error, so one can be told from tampering.
+struct HashingReader<R> {
+    inner: R,
+    hasher: Sha256,
+    failed: Option<String>,
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.inner.read(buf) {
+            Ok(n) => {
+                self.hasher.update(&buf[..n]);
+                Ok(n)
+            }
+            Err(e) => {
+                self.failed.get_or_insert_with(|| e.to_string());
+                Err(e)
+            }
+        }
     }
 }
 
@@ -658,39 +706,79 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-/// Reads a list of buffers in order, wiping each one as soon as it has been read.
+/// One piece of what Share encrypts: a tar header or padding, or a verified file.
+enum Part {
+    Bytes(Zeroizing<Vec<u8>>),
+    Staged(StagedFile),
+}
+
+/// The piece being read, and how far.
+enum Reading {
+    Bytes(Zeroizing<Vec<u8>>, usize),
+    /// The staged file is kept until it has been read, then deleted with it.
+    Staged(StagedFile, File),
+}
+
+/// Reads a list of parts in order, wiping or deleting each one as soon as it has
+/// been read.
 struct Parts {
-    parts: VecDeque<Zeroizing<Vec<u8>>>,
-    position: usize,
+    parts: VecDeque<Part>,
+    reading: Option<Reading>,
     progress: Rc<Progress>,
 }
 
 impl Read for Parts {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        while let Some(part) = self.parts.front() {
-            let rest = &part[self.position..];
-            if rest.is_empty() {
-                self.parts.pop_front();
-                self.position = 0;
-                continue;
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            let reading = match self.reading.take() {
+                Some(reading) => reading,
+                None => match self.parts.pop_front() {
+                    None => return Ok(0),
+                    Some(Part::Bytes(bytes)) => Reading::Bytes(bytes, 0),
+                    Some(Part::Staged(staged)) => {
+                        let file = staged.open().map_err(io::Error::other)?;
+                        Reading::Staged(staged, file)
+                    }
+                },
+            };
+            let (n, reading) = match reading {
+                Reading::Bytes(bytes, position) => {
+                    let rest = &bytes[position..];
+                    let n = rest.len().min(buf.len());
+                    buf[..n].copy_from_slice(&rest[..n]);
+                    (n, Reading::Bytes(bytes, position + n))
+                }
+                Reading::Staged(staged, mut file) => (file.read(buf)?, Reading::Staged(staged, file)),
+            };
+            if n == 0 {
+                continue; // this part is done: dropping it wipes or deletes it
             }
-            let n = rest.len().min(buf.len());
-            buf[..n].copy_from_slice(&rest[..n]);
-            self.position += n;
+            self.reading = Some(reading);
             self.progress.advance(n as u64);
             return Ok(n);
         }
-        Ok(0)
     }
 }
 
-/// write_all, in pieces small enough for the percentage to keep moving.
-fn write_counted(file: &mut File, data: &[u8], progress: &Progress, path: &str) -> R<()> {
-    for piece in data.chunks(PROGRESS_CHUNK) {
-        file.write_all(piece).map_err(|e| format!("writing {path}: {e}"))?;
-        progress.advance(piece.len() as u64);
+/// io::copy, through one wiped buffer, counting for the percentage as it goes.
+/// Returns how many bytes went by.
+fn copy_counted(from: &mut dyn Read, to: &mut dyn Write, progress: &Progress, path: &str) -> R<u64> {
+    let mut buf = Zeroizing::new(vec![0u8; COPY_CHUNK]);
+    let mut total = 0u64;
+    loop {
+        let n = match from.read(&mut buf) {
+            Ok(0) => return Ok(total),
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("reading for {path}: {e}")),
+        };
+        to.write_all(&buf[..n]).map_err(|e| format!("writing {path}: {e}"))?;
+        progress.advance(n as u64);
+        total += n as u64;
     }
-    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -956,21 +1044,24 @@ pub enum Out<'a> {
     In(&'a dyn Store, &'a str),
 }
 
-fn write_tree(store: &dyn Store, root: &str, tree: &[(&str, Option<Zeroizing<Vec<u8>>>)], progress: &Progress) -> R<()> {
+/// Write `tree` (paths under `root`, None for a folder, or a file's verified
+/// plaintext) into `root`, a new folder in `store`. Each staged file is deleted as
+/// soon as it has been copied.
+fn write_tree(store: &dyn Store, root: &str, tree: Vec<(&str, Option<StagedFile>)>, progress: &Progress) -> R<()> {
     store.mkdir(root, false)?;
     // In manifest order, so every folder is created before its contents.
-    for (rel, data) in tree {
+    for (rel, staged) in tree {
         let path = format!("{root}/{rel}");
-        match data {
+        match staged {
             None => store.mkdir(&path, false)?,
-            Some(data) => {
+            Some(staged) => {
                 // create_new would replace it, and on a case-insensitive disk
                 // "A" and "a" are the same file: one would silently go missing.
                 if store.kind(&path) != Kind::Missing {
                     return Err(format!("{}: two names in the vault collide on this disk", store.show(&path)));
                 }
                 let mut file = store.create_new(&path)?;
-                write_counted(&mut file, data, progress, &store.show(&path))?;
+                copy_counted(&mut staged.open()?, &mut file, progress, &store.show(&path))?;
                 file.sync_all().map_err(|e| format!("flushing {}: {e}", store.show(&path)))?;
             }
         }
@@ -994,6 +1085,9 @@ pub struct Vault {
     pub(crate) dir: String,
     store: Box<dyn Store>,
     key: x25519::Identity,
+    /// Where plaintext is staged while it verifies: the app's private storage (the
+    /// folder identity.age is in), never anywhere in the vault or the output.
+    staging: String,
     /// Held only for its lock, released when this is dropped.
     _lock: Option<Box<dyn Any>>,
     pub progress: Rc<Progress>,
@@ -1003,20 +1097,29 @@ pub struct Vault {
 }
 
 impl Vault {
+    /// Plaintext is staged in `secret.data_dir`.
     pub fn open_in(store: Box<dyn Store>, secret: &Secret, exclusive: bool) -> R<Vault> {
         let lock = store.lock(exclusive)?;
         let key = unlock(&*store, secret)?;
-        Ok(Vault::with(store, key, Some(lock)))
+        Ok(Vault::with(store, key, Some(lock), secret.data_dir))
     }
 
-    fn with(store: Box<dyn Store>, key: x25519::Identity, lock: Option<Box<dyn Any>>) -> Vault {
-        Vault { dir: store.show(""), store, key, _lock: lock, progress: Rc::default(), warnings: RefCell::default() }
+    fn with(store: Box<dyn Store>, key: x25519::Identity, lock: Option<Box<dyn Any>>, staging: &str) -> Vault {
+        Vault {
+            dir: store.show(""),
+            store,
+            key,
+            staging: staging.to_string(),
+            _lock: lock,
+            progress: Rc::default(),
+            warnings: RefCell::default(),
+        }
     }
 
     /// `wrap` already holds key.age's wrapped file key, so scrypt (for a password
     /// vault) has run by now. VAULT goes last: its presence marks a complete vault.
-    fn create_in(store: Box<dyn Store>, mode: &str, wrap: age::Encryptor) -> R<Vault> {
-        let v = Vault::with(store, x25519::Identity::generate(), None);
+    fn create_in(store: Box<dyn Store>, mode: &str, wrap: age::Encryptor, staging: &str) -> R<Vault> {
+        let v = Vault::with(store, x25519::Identity::generate(), None, staging);
         let store = &*v.store;
         let populate = || -> R<()> {
             store.mkdir("", true)?;
@@ -1043,8 +1146,9 @@ impl Vault {
     }
 
     /// A vault on a real path (the desktop's `Vault::create`, kept for the tests).
+    /// It stages plaintext in a private folder of this process's under the temp dir.
     pub fn create(dir: &str, mode: &str, wrap: age::Encryptor) -> R<Vault> {
-        Vault::create_in(Box::new(PathStore::new(dir)), mode, wrap)
+        Vault::create_in(Box::new(PathStore::new(dir)), mode, wrap, &host_staging_dir()?)
     }
 
     pub fn warnings(&self) -> Vec<String> {
@@ -1074,22 +1178,18 @@ impl Vault {
     /// Decrypt a complete in-memory ciphertext to the end, so age has authenticated
     /// every chunk and the final-chunk flag. Plaintext is never longer than its
     /// ciphertext, so this buffer never reallocates (which would leave an unwiped
-    /// copy behind in freed heap).
-    fn decrypt_in_ram(&self, ciphertext: &[u8], on_read: impl Fn(u64)) -> R<Zeroizing<Vec<u8>>> {
+    /// copy behind in freed heap). Only for the manifest, which is parsed whole;
+    /// files go through `verify_into`.
+    fn decrypt_in_ram(&self, ciphertext: &[u8]) -> R<Zeroizing<Vec<u8>>> {
         let dec = age::Decryptor::new(ciphertext).map_err(|e| e.to_string())?;
         let mut stream = dec.decrypt(once(&self.key as &dyn age::Identity)).map_err(|e| e.to_string())?;
         let mut plain = Zeroizing::new(Vec::with_capacity(ciphertext.len()));
-        loop {
-            let n = (&mut stream).take(PROGRESS_CHUNK as u64).read_to_end(&mut plain).map_err(|e| e.to_string())?;
-            if n == 0 {
-                return Ok(plain);
-            }
-            on_read(n as u64);
-        }
+        stream.read_to_end(&mut plain).map_err(|e| e.to_string())?;
+        Ok(plain)
     }
 
     fn decrypt_manifest(&self, data: &[u8]) -> R<Manifest> {
-        let text = self.decrypt_in_ram(data, |_| ()).map_err(|_| "the vault's manifest is damaged or was replaced".to_string())?;
+        let text = self.decrypt_in_ram(data).map_err(|_| "the vault's manifest is damaged or was replaced".to_string())?;
         let text = std::str::from_utf8(&text).map_err(|_| "the vault's manifest is not valid text".to_string())?;
         Manifest::parse(text).map_err(|e| format!("the vault's manifest is invalid: {e}"))
     }
@@ -1120,18 +1220,69 @@ impl Vault {
         }
     }
 
-    /// The RAM-only rule: read the whole blob once (no re-open, so no TOCTOU), check
-    /// its hash against the manifest, decrypt to the end in memory. The caller gets
-    /// plaintext only if all of that succeeded.
-    fn read_verified(&self, path: &str, blob: &str, sha256: &str) -> R<Zeroizing<Vec<u8>>> {
-        let data = self.store.read(&self.blob_rel(blob)).map_err(|e| match e.kind() {
+    /// The desktop's RAM-only rule, as a stream: read the blob once (no re-open, so
+    /// no TOCTOU), hashing every byte on its way into age, decrypt it to the end into
+    /// `out`, then check the hash against the manifest. Returns the plaintext length.
+    ///
+    /// Plaintext reaches `out` before the last check, so `out` must be private
+    /// staging the caller deletes unless this returns Ok (`stage`), or a sink.
+    ///
+    /// age reads to the end of the blob and refuses anything after its last chunk,
+    /// so on success the hash has covered the whole file. A blob age can't decrypt
+    /// is one that was changed (the manifest pins what this vault wrote), and is
+    /// refused at once, without reading the rest of what may be an enormous file.
+    fn verify_into(&self, path: &str, blob: &str, sha256: &str, out: &mut dyn Write) -> R<u64> {
+        let file = self.store.open(&self.blob_rel(blob)).map_err(|e| match e.kind() {
             io::ErrorKind::NotFound => format!("'{path}': its encrypted data is missing from the vault"),
             _ => format!("'{path}': reading its encrypted data: {e}"),
         })?;
-        if hex(&Sha256::digest(&data)) != sha256 {
-            return Err(format!("'{path}' failed verification: its encrypted data was changed or replaced"));
+        let changed = || format!("'{path}' failed verification: its encrypted data was changed or replaced");
+        let mut hashing = HashingReader { inner: file, hasher: Sha256::new(), failed: None };
+        let mut wrote: Option<String> = None;
+        let decrypted = (|| -> Option<u64> {
+            let dec = age::Decryptor::new(io::BufReader::new(&mut hashing)).ok()?;
+            let mut stream = dec.decrypt(once(&self.key as &dyn age::Identity)).ok()?;
+            let mut buf = Zeroizing::new(vec![0u8; COPY_CHUNK]);
+            let mut total = 0u64;
+            loop {
+                let n = match stream.read(&mut buf) {
+                    Ok(0) => return Some(total),
+                    Ok(n) => n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(_) => return None,
+                };
+                if let Err(e) = out.write_all(&buf[..n]) {
+                    wrote = Some(format!("'{path}': staging its plaintext: {e}"));
+                    return None;
+                }
+                self.progress.advance(n as u64);
+                total += n as u64;
+            }
+        })();
+        if let Some(e) = hashing.failed {
+            return Err(format!("'{path}': reading its encrypted data: {e}"));
         }
-        self.decrypt_in_ram(&data, |n| self.progress.advance(n)).map_err(|e| format!("'{path}' failed to decrypt: {e}"))
+        if let Some(e) = wrote {
+            return Err(e);
+        }
+        let total = decrypted.ok_or_else(changed)?;
+        if hex(&hashing.hasher.finalize()) != sha256 {
+            return Err(changed());
+        }
+        Ok(total)
+    }
+
+    /// One file's plaintext, verified (`verify_into`) into private staging in the
+    /// app's storage, and its length. Nothing of it is anywhere else; the staging is
+    /// deleted when the result is dropped, or at once if verification fails.
+    fn stage(&self, path: &str, blob: &str, sha256: &str) -> R<(StagedFile, u64)> {
+        let (staged, mut file) = StagedFile::create(&self.staging, "vault")?;
+        let size = self.verify_into(path, blob, sha256, &mut file)?;
+        // No fsync: staging is meant to vanish if the app dies (it's swept at the next
+        // start), and reading it back is served from the page cache, so a flush per
+        // file would only slow a large extract. The output is fsynced, as before.
+        file.flush().map_err(|e| format!("'{path}': staging its plaintext: {e}"))?;
+        Ok((staged, size))
     }
 
     fn write_manifest(&self, m: &Manifest) -> R<()> {
@@ -1346,16 +1497,17 @@ impl Vault {
         match m.entries.get(entry) {
             Some(Entry::File { blob, sha256, size }) => {
                 self.progress.start(size.saturating_mul(2)); // once decrypting, once writing
-                let plain = self.read_verified(entry, blob, sha256)?;
-                // Only now does anything reach the disk.
+                let (staged, _) = self.stage(entry, blob, sha256)?;
+                let mut plain = staged.open()?;
+                // Only now does anything reach the output.
                 match out {
                     Out::File(file) => {
-                        write_counted(file, &plain, &self.progress, "the output")?;
+                        copy_counted(&mut plain, file, &self.progress, "the output")?;
                         file.flush().and_then(|_| file.sync_all()).map_err(|e| format!("writing the output: {e}"))
                     }
                     Out::In(folder, name) => {
                         write_atomic(folder, name, |mut file| {
-                            write_counted(&mut file, &plain, &self.progress, &folder.show(name))?;
+                            copy_counted(&mut plain, &mut file, &self.progress, &folder.show(name))?;
                             Ok(file)
                         })?;
                         folder.sync_dir("");
@@ -1393,9 +1545,9 @@ impl Vault {
     }
 
     /// `wanted` is (path in the vault, path under `out`), parents first.
-    /// Verify and decrypt every file first; if any fails, nothing at all is written.
-    /// The tree is then built under a staging name and renamed into place, so `out`
-    /// is only ever absent or complete.
+    /// Verify and decrypt every file first, each into private staging; if any fails,
+    /// nothing at all is written. The tree is then built under a staging name and
+    /// renamed into place, so `out` is only ever absent or complete.
     fn extract_tree(&self, m: &Manifest, wanted: Vec<(&str, &str)>, out: Out) -> R<()> {
         let Out::In(folder, out) = out else {
             return Err("a folder can only be extracted into a folder".into());
@@ -1408,12 +1560,12 @@ impl Vault {
         for (path, rel) in wanted {
             tree.push((rel, match &m.entries[path] {
                 Entry::Dir => None,
-                Entry::File { blob, sha256, .. } => Some(self.read_verified(path, blob, sha256)?),
+                Entry::File { blob, sha256, .. } => Some(self.stage(path, blob, sha256)?.0),
             }));
         }
         let tmp = staging_path(out);
         folder.remove_tree(&tmp); // a killed run's leftovers; the suffix is ours
-        let staged = write_tree(folder, &tmp, &tree, &self.progress).and_then(|_| {
+        let staged = write_tree(folder, &tmp, tree, &self.progress).and_then(|_| {
             folder.rename(&tmp, out).map_err(|e| format!("finalizing {}: {e}", folder.show(out)))
         });
         if staged.is_err() {
@@ -1433,7 +1585,8 @@ impl Vault {
     /// Re-encrypt entries for other people, as a plain age file anyone with VaultSend or the
     /// `age` tool can open: not a vault, because `self` vaults only open for whoever sealed
     /// them. One file stays that file; anything else becomes a tar archive inside the age
-    /// file. Same RAM-only rule as extract: everything verifies before `out` is touched.
+    /// file. Same rule as extract: everything verifies, into private staging, before
+    /// `out` is touched.
     pub fn share_to(&self, entries: &[&str], to: &[&str], out: Out) -> R<()> {
         let recipients: Vec<x25519::Recipient> = to.iter()
             .map(|r| r.parse().map_err(|e| format!("invalid recipient '{r}': {e}")))
@@ -1482,24 +1635,23 @@ impl Vault {
         for path in chosen {
             match &m.entries[path] {
                 Entry::Dir if one_file => {} // only the folders leading to it
-                Entry::Dir => parts.push_back(Zeroizing::new(tar::dir_header(path, now))),
+                Entry::Dir => parts.push_back(Part::Bytes(Zeroizing::new(tar::dir_header(path, now)))),
                 Entry::File { blob, sha256, .. } => {
-                    let plain = self.read_verified(path, blob, sha256)?;
-                    let size = plain.len() as u64;
+                    let (plain, size) = self.stage(path, blob, sha256)?;
                     if one_file {
-                        parts.push_back(plain);
+                        parts.push_back(Part::Staged(plain));
                     } else {
-                        parts.push_back(Zeroizing::new(tar::file_header(path, size, now)?));
-                        parts.push_back(plain);
-                        parts.push_back(Zeroizing::new(tar::padding(size)));
+                        parts.push_back(Part::Bytes(Zeroizing::new(tar::file_header(path, size, now)?)));
+                        parts.push_back(Part::Staged(plain));
+                        parts.push_back(Part::Bytes(Zeroizing::new(tar::padding(size))));
                     }
                 }
             }
         }
         if !one_file {
-            parts.push_back(Zeroizing::new(tar::END.to_vec()));
+            parts.push_back(Part::Bytes(Zeroizing::new(tar::END.to_vec())));
         }
-        let reader = Parts { parts, position: 0, progress: self.progress.clone() };
+        let reader = Parts { parts, reading: None, progress: self.progress.clone() };
         match out {
             Out::File(file) => {
                 let file = encrypt_to(encryptor, false, reader, file)?;
@@ -1527,9 +1679,9 @@ impl Vault {
         Ok(out)
     }
 
-    /// The RAM-only rule for every file, discarding the plaintext; stops at the first
-    /// failure. Orphans are reported but are no failure: a crash leaves them behind
-    /// and the next change removes them.
+    /// Every file verified as extract verifies it, discarding the plaintext as it
+    /// goes; stops at the first failure. Orphans are reported but are no failure: a
+    /// crash leaves them behind and the next change removes them.
     pub fn check(&self) -> R<String> {
         let m = self.load_manifest()?;
         let orphans = self.orphans(&m)?;
@@ -1544,13 +1696,26 @@ impl Vault {
         let mut verified = 0;
         for (path, entry) in &m.entries {
             if let Entry::File { blob, sha256, .. } = entry {
-                self.read_verified(path, blob, sha256)?;
+                self.verify_into(path, blob, sha256, &mut io::sink())?;
                 verified += 1;
             }
         }
         report.push_str(&format!("ok {verified} file(s) verified\n"));
         Ok(report)
     }
+}
+
+/// Where a vault made by `Vault::create` (the tests) stages plaintext: a private
+/// folder of this process's under the temp dir, so its sweep of leftovers can't
+/// touch another process's staging.
+fn host_staging_dir() -> R<String> {
+    let dir = std::env::temp_dir().join(format!("vaultsend-staging-{}", std::process::id()));
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    dir.to_str().map(str::to_string).ok_or_else(|| format!("{}: not valid UTF-8", dir.display()))
 }
 
 /// scrypt cost of a password share: a password vault's. Tests use less, so they stay
@@ -1587,7 +1752,7 @@ pub fn create(store: Box<dyn Store>, mode: &str, secret: &Secret) -> R<()> {
         other => return Err(format!("--mode must be self or password, not '{other}'")),
     }
     .map_err(|e| format!("preparing the vault key: {e}"))?;
-    let vault = Vault::create_in(store, mode, wrap)?;
+    let vault = Vault::create_in(store, mode, wrap, secret.data_dir)?;
     if mode == "password" {
         // The password was just typed, so remember the key as if it had opened it.
         remember(&vault.store.key()?, &vault.key);
@@ -2020,7 +2185,7 @@ mod tests {
 
         // A manifest encrypted to some other key: what a forger without the vault's
         // public key would have to produce.
-        let other = Vault::with(Box::new(PathStore::new(&v.dir)), x25519::Identity::generate(), None);
+        let other = Vault::with(Box::new(PathStore::new(&v.dir)), x25519::Identity::generate(), None, &v.staging);
         other.write_manifest(&Manifest::default()).unwrap();
         assert!(v.load_manifest().unwrap_err().contains("damaged"));
     }
@@ -2332,9 +2497,14 @@ mod tests {
     fn colliding_names_are_an_error_not_a_silent_loss() {
         let t = TempDir::new();
         // Two entries landing on one file, as "A" and "a" do on a case-insensitive disk.
-        let data = Some(Zeroizing::new(b"y".to_vec()));
-        let items = [("Name", data.clone()), ("Name", data)];
-        assert!(write_tree(&PathStore::new(&t.0), "root", &items, &Progress::default()).unwrap_err().contains("collide"));
+        let staging = host_staging_dir().unwrap();
+        let staged = || {
+            let (staged, mut file) = StagedFile::create(&staging, "test").unwrap();
+            file.write_all(b"y").unwrap();
+            Some(staged)
+        };
+        let items = vec![("Name", staged()), ("Name", staged())];
+        assert!(write_tree(&PathStore::new(&t.0), "root", items, &Progress::default()).unwrap_err().contains("collide"));
     }
 
     #[test]
@@ -2621,6 +2791,7 @@ mod tests {
         fn show(&self, rel: &str) -> String { self.0.show(rel) }
         fn kind(&self, rel: &str) -> Kind { self.0.kind(rel) }
         fn read(&self, rel: &str) -> io::Result<Vec<u8>> { self.0.read(rel) }
+        fn open(&self, rel: &str) -> io::Result<File> { self.0.open(rel) }
         fn create_new(&self, rel: &str) -> R<File> { self.0.create_new(rel) }
         fn rename(&self, from: &str, to: &str) -> io::Result<()> {
             if self.0.kind(to) != Kind::Missing {
@@ -2649,6 +2820,120 @@ mod tests {
             Vault::open_in(Box::new(NoReplaceStore(PathStore::new(&open_dir))), &secret, exclusive)
         };
         (dir, Box::new(open))
+    }
+
+    // -----------------------------------------------------------------------
+    // Android: files stream through private staging instead of RAM.
+    // -----------------------------------------------------------------------
+
+    /// A PathStore that counts how often each file is opened or read.
+    struct CountingStore(PathStore, Rc<RefCell<BTreeMap<String, usize>>>);
+
+    impl CountingStore {
+        fn count(&self, rel: &str) {
+            *self.1.borrow_mut().entry(rel.to_string()).or_insert(0) += 1;
+        }
+    }
+
+    impl Store for CountingStore {
+        fn key(&self) -> R<String> { self.0.key() }
+        fn show(&self, rel: &str) -> String { self.0.show(rel) }
+        fn kind(&self, rel: &str) -> Kind { self.0.kind(rel) }
+        fn read(&self, rel: &str) -> io::Result<Vec<u8>> { self.count(rel); self.0.read(rel) }
+        fn open(&self, rel: &str) -> io::Result<File> { self.count(rel); self.0.open(rel) }
+        fn create_new(&self, rel: &str) -> R<File> { self.0.create_new(rel) }
+        fn rename(&self, from: &str, to: &str) -> io::Result<()> { self.0.rename(from, to) }
+        fn replaces_on_rename(&self) -> bool { true }
+        fn remove_file(&self, rel: &str) -> io::Result<()> { self.0.remove_file(rel) }
+        fn remove_tree(&self, rel: &str) { self.0.remove_tree(rel) }
+        fn mkdir(&self, rel: &str, recursive: bool) -> R<()> { self.0.mkdir(rel, recursive) }
+        fn list(&self, rel: &str) -> R<Vec<(String, Kind)>> { self.0.list(rel) }
+        fn sync_dir(&self, rel: &str) { self.0.sync_dir(rel) }
+        fn lock(&self, _exclusive: bool) -> R<Box<dyn Any>> { Ok(Box::new(())) }
+    }
+
+    /// `v` again, staging in a folder of its own (`t`'s "staging"), so what it stages
+    /// can be counted while other tests stage in the shared one.
+    fn with_own_staging(t: &TempDir, v: &Vault, store: Box<dyn Store>) -> (Vault, String) {
+        let staging = t.path("staging");
+        fs::create_dir_all(&staging).unwrap();
+        (Vault::with(store, v.key.clone(), None, &staging), staging)
+    }
+
+    fn staged_now(staging: &str) -> Vec<String> {
+        fs::read_dir(staging).unwrap().flatten().map(|e| e.file_name().to_string_lossy().into_owned()).collect()
+    }
+
+    #[test]
+    fn files_stream_through_private_staging_that_is_always_removed() {
+        let t = TempDir::new();
+        let built = quick_vault(&t);
+        // Larger than one age chunk and one copy buffer, and not a multiple of either.
+        let big: Vec<u8> = (0..3_000_017u32).map(|i| (i.wrapping_mul(2654435761) >> 24) as u8).collect();
+        add(&built, &t.write("src/big.bin", &big));
+        add(&built, &t.write("src/small.txt", b"small"));
+        let (v, staging) = with_own_staging(&t, &built, Box::new(PathStore::new(&built.dir)));
+
+        let out = t.path("big.out");
+        v.extract("big.bin", &out).unwrap();
+        assert_eq!(fs::read(&out).unwrap(), big);
+        assert!(staged_now(&staging).is_empty(), "left behind: {:?}", staged_now(&staging));
+
+        let many = t.path("many.out");
+        v.extract_many(&["big.bin", "small.txt"], &many).unwrap();
+        assert_eq!(fs::read(format!("{many}/big.bin")).unwrap(), big);
+        assert_eq!(fs::read(format!("{many}/small.txt")).unwrap(), b"small");
+        let friend = x25519::Identity::generate();
+        let shared = t.path("shared.tar.age");
+        v.share(&[ROOT_ENTRY], &[&friend.to_public().to_string()], &shared).unwrap();
+        let mut plain = Vec::new();
+        age::Decryptor::new(File::open(&shared).unwrap()).unwrap()
+            .decrypt(once(&friend as &dyn age::Identity)).unwrap()
+            .read_to_end(&mut plain).unwrap();
+        let scan = tar::scan(&mut Cursor::new(&plain), plain.len() as u64, &tar::LIMITS, &|| false).unwrap();
+        let Some(tar::Item::File { offset, size }) = scan.items.get("big.bin").copied() else { panic!("{scan:?}") };
+        assert_eq!(&plain[offset as usize..(offset + size) as usize], &big[..]);
+        assert_eq!(v.check().unwrap(), "ok 2 file(s) verified\n");
+        assert!(staged_now(&staging).is_empty(), "left behind: {:?}", staged_now(&staging));
+
+        // Tampered: data after age's last chunk, and an enormous file in a blob's place.
+        // Each is refused, writes nothing, and leaves no staging.
+        let small = blob_of(&v, "small.txt");
+        let mut f = fs::OpenOptions::new().append(true).open(&small).unwrap();
+        f.write_all(b"trailing").unwrap();
+        drop(f);
+        let out = t.path("small.out");
+        assert!(v.extract("small.txt", &out).unwrap_err().contains("failed verification"));
+        assert_nothing_written(&out);
+        File::create(blob_of(&v, "big.bin")).unwrap().set_len(64 << 30).unwrap(); // sparse
+        let started = std::time::Instant::now();
+        assert!(v.extract("big.bin", &out).unwrap_err().contains("failed verification"));
+        assert!(started.elapsed() < Duration::from_secs(10), "read the whole enormous blob");
+        assert_nothing_written(&out);
+        assert!(v.check().unwrap_err().contains("failed verification"));
+        assert!(staged_now(&staging).is_empty(), "left behind: {:?}", staged_now(&staging));
+    }
+
+    #[test]
+    fn every_blob_is_read_exactly_once() {
+        let t = TempDir::new();
+        let built = quick_vault(&t);
+        add(&built, &t.write("src/tree/a.txt", b"alpha"));
+        add(&built, &t.write("src/tree/sub/b.txt", b"beta"));
+        let counts = Rc::new(RefCell::new(BTreeMap::new()));
+        let counting = Box::new(CountingStore(PathStore::new(&built.dir), counts.clone()));
+        let (v, _) = with_own_staging(&t, &built, counting);
+        let blobs: Vec<String> = v.load_manifest().unwrap().entries.values().filter_map(|e| match e {
+            Entry::File { blob, .. } => Some(v.blob_rel(blob)),
+            Entry::Dir => None,
+        }).collect();
+        assert_eq!(blobs.len(), 2);
+        v.extract(ROOT_ENTRY, &t.path("all.out")).unwrap();
+        // No second read of a blob, so nothing can swap it between check and use.
+        let counts = counts.borrow();
+        for blob in &blobs {
+            assert_eq!(counts.get(blob), Some(&1), "{blob}: {counts:?}");
+        }
     }
 
     #[test]
@@ -2698,7 +2983,7 @@ mod tests {
         fs::write(&staged, b"not a manifest").unwrap();
         assert!(v.load_manifest().unwrap_err().contains("reading the vault's manifest"));
         assert_eq!(fs::read(&staged).unwrap(), b"not a manifest");
-        let other = Vault::with(Box::new(PathStore::new(&t.path("elsewhere"))), x25519::Identity::generate(), None);
+        let other = Vault::with(Box::new(PathStore::new(&t.path("elsewhere"))), x25519::Identity::generate(), None, &host_staging_dir().unwrap());
         fs::create_dir_all(t.path("elsewhere")).unwrap();
         other.write_manifest(&Manifest::default()).unwrap();
         fs::rename(t.path(&format!("elsewhere/{MANIFEST_FILE}")), &staged).unwrap();

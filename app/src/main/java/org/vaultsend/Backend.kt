@@ -494,7 +494,13 @@ class Backend(private val context: Context) {
         }
     }
 
-    /** Delete opened copies: one, or all of them. */
+    /**
+     * Remove plaintext staging a killed run left in [dataDir] (an interrupted file
+     * decrypt, extract, Share or unpack). The core skips it while anything is staging.
+     */
+    fun sweepStaging() = VaultSendNative.sweepStaging(dataDir)
+
+    /** Delete opened copies: these, or with none given, every one in the folder. */
     fun discardCopies(copies: Collection<File>? = null) {
         if (copies == null) {
             clearStaleCopies(openRoot)

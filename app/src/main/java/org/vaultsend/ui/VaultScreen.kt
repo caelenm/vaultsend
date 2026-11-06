@@ -670,7 +670,8 @@ fun AddVaultDialog(
                 }
                 Text(
                     "Next, choose the folder it goes in. It stays there, where your file manager " +
-                        "shows it, and VaultSend asks for access to that folder only.",
+                        "shows it. VaultSend keeps access to the folder you choose and what's in it, " +
+                        "so a folder just for vaults is best.",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

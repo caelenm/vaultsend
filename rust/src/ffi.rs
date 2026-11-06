@@ -4,30 +4,43 @@
 // Each function: pulls its arguments out of the JVM, calls one `backend`
 // function, and either returns the result or throws `org.vaultsend.BackendException`
 // carrying the error message (mirroring the desktop `BackendError`, whose text the
-// UI shows verbatim). Errors are caught here at the boundary; we never unwind into
-// the JVM.
+// UI shows verbatim). Errors are caught here at the boundary, and so are panics:
+// every entry point runs its work inside `guard`, so nothing ever unwinds into the
+// JVM (undefined behaviour on older Rust, an abort of the whole app on newer).
 //
-// Passphrases arrive as a byte[] the caller zeroes after the call; we additionally
-// zero our own copy here. File data for the file paths arrives as raw file
-// descriptors borrowed from the caller's Storage Access Framework
-// ParcelFileDescriptors — we wrap them in ManuallyDrop so dropping our File never
-// closes a descriptor the Kotlin side still owns and will close itself.
+// Passphrases arrive as a byte[] the caller zeroes after the call. Our copy of it,
+// and of any plaintext crossing in either direction, is held in `Zeroizing`
+// storage, so it is wiped on drop however the call ends, early returns included.
+// File data for the file paths arrives as raw file descriptors borrowed from the
+// caller's Storage Access Framework ParcelFileDescriptors — we wrap them in
+// ManuallyDrop so dropping our File never closes a descriptor the Kotlin side
+// still owns and will close itself.
 
 use std::fs::File;
 use std::io::Read;
 use std::mem::ManuallyDrop;
 use std::os::fd::FromRawFd;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 use jni::objects::{JByteArray, JClass, JObjectArray, JString};
 use jni::sys::{jboolean, jbyteArray, jint, jstring, JNI_FALSE, JNI_TRUE};
 use jni::JNIEnv;
-use zeroize::Zeroize;
+use zeroize::Zeroizing;
 
 use crate::backend;
 
 const EXCEPTION: &str = "org/vaultsend/BackendException";
 
+/// What a panic in the core comes back to the app as.
+const PANICKED: &str = "internal error in VaultSend's core";
+
 // --- argument/return helpers ------------------------------------------------
+
+/// Run one entry point's work, turning a panic into an error, so it can never
+/// unwind across the JNI boundary.
+fn guard<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    catch_unwind(AssertUnwindSafe(work)).unwrap_or_else(|_| Err(PANICKED.into()))
+}
 
 fn get_string(env: &mut JNIEnv, s: &JString) -> Result<String, String> {
     env.get_string(s)
@@ -35,8 +48,9 @@ fn get_string(env: &mut JNIEnv, s: &JString) -> Result<String, String> {
         .map_err(|e| e.to_string())
 }
 
-fn get_bytes(env: &mut JNIEnv, a: &JByteArray) -> Result<Vec<u8>, String> {
-    env.convert_byte_array(a).map_err(|e| e.to_string())
+/// A byte[]'s contents, wiped when dropped: it may be a passphrase or plaintext.
+fn get_bytes(env: &mut JNIEnv, a: &JByteArray) -> Result<Zeroizing<Vec<u8>>, String> {
+    env.convert_byte_array(a).map(Zeroizing::new).map_err(|e| e.to_string())
 }
 
 fn get_string_array(env: &mut JNIEnv, arr: &JObjectArray) -> Result<Vec<String>, String> {
@@ -75,7 +89,8 @@ fn ret_string(env: &mut JNIEnv, r: Result<String, String>) -> jstring {
     }
 }
 
-fn ret_bytes(env: &mut JNIEnv, r: Result<Vec<u8>, String>) -> jbyteArray {
+/// A result's bytes as a new byte[]; ours are wiped once copied.
+fn ret_bytes(env: &mut JNIEnv, r: Result<Zeroizing<Vec<u8>>, String>) -> jbyteArray {
     match r {
         Ok(v) => match env.byte_array_from_slice(&v) {
             Ok(arr) => arr.into_raw(),
@@ -85,6 +100,12 @@ fn ret_bytes(env: &mut JNIEnv, r: Result<Vec<u8>, String>) -> jbyteArray {
             throw(env, &e);
             std::ptr::null_mut()
         }
+    }
+}
+
+fn ret_unit(env: &mut JNIEnv, r: Result<(), String>) {
+    if let Err(e) = r {
+        throw(env, &e);
     }
 }
 
@@ -103,13 +124,11 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_keygen<'l>(
     data_dir: JString<'l>,
     passphrase: JByteArray<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
-        let mut pass = get_bytes(&mut env, &passphrase)?;
-        let out = backend::keygen(&dir, &pass);
-        pass.zeroize();
-        out
-    })();
+        let pass = get_bytes(&mut env, &passphrase)?;
+        backend::keygen(&dir, &pass)
+    });
     ret_string(&mut env, r)
 }
 
@@ -119,7 +138,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_pubkey<'l>(
     _class: JClass<'l>,
     data_dir: JString<'l>,
 ) -> jstring {
-    let r = get_string(&mut env, &data_dir).and_then(|dir| backend::pubkey(&dir));
+    let r = guard(|| get_string(&mut env, &data_dir).and_then(|dir| backend::pubkey(&dir)));
     ret_string(&mut env, r)
 }
 
@@ -129,7 +148,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_status<'l>(
     _class: JClass<'l>,
     data_dir: JString<'l>,
 ) -> jstring {
-    let r = get_string(&mut env, &data_dir).and_then(|dir| backend::status(&dir));
+    let r = guard(|| get_string(&mut env, &data_dir).and_then(|dir| backend::status(&dir)));
     ret_string(&mut env, r)
 }
 
@@ -140,13 +159,11 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_recoverPubkey<'l>(
     data_dir: JString<'l>,
     passphrase: JByteArray<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
-        let mut pass = get_bytes(&mut env, &passphrase)?;
-        let out = backend::recover_pubkey(&dir, &pass);
-        pass.zeroize();
-        out
-    })();
+        let pass = get_bytes(&mut env, &passphrase)?;
+        backend::recover_pubkey(&dir, &pass)
+    });
     ret_string(&mut env, r)
 }
 
@@ -162,23 +179,25 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_unlock<'l>(
     data_dir: JString<'l>,
     passphrase: JByteArray<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
-        let mut pass = get_bytes(&mut env, &passphrase)?;
-        let out = backend::unlock(&dir, &pass);
-        pass.zeroize();
-        out
-    })();
+        let pass = get_bytes(&mut env, &passphrase)?;
+        backend::unlock(&dir, &pass)
+    });
     ret_string(&mut env, r)
 }
 
 /// Drop the cached session key (zeroized). Called on app close and on explicit Lock.
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_lock<'l>(
-    _env: JNIEnv<'l>,
+    mut env: JNIEnv<'l>,
     _class: JClass<'l>,
 ) {
-    backend::lock();
+    let r = guard(|| {
+        backend::lock();
+        Ok(())
+    });
+    ret_unit(&mut env, r);
 }
 
 /// True if the session currently holds an unlocked key.
@@ -187,11 +206,26 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_isUnlocked<'l>(
     _env: JNIEnv<'l>,
     _class: JClass<'l>,
 ) -> jboolean {
-    if backend::is_unlocked() {
-        JNI_TRUE
-    } else {
-        JNI_FALSE
+    match guard(|| Ok(backend::is_unlocked())) {
+        Ok(true) => JNI_TRUE,
+        _ => JNI_FALSE,
     }
+}
+
+/// Remove plaintext staging a killed run left in the data directory, unless a
+/// staged operation is running. The app calls this when it starts.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_sweepStaging<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+) {
+    let r = guard(|| {
+        let dir = get_string(&mut env, &data_dir)?;
+        backend::sweep_staging(&dir);
+        Ok(())
+    });
+    ret_unit(&mut env, r);
 }
 
 /// Import an existing identity.age (read from `in_fd`), verifying it against the
@@ -205,14 +239,12 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_importIdentity<'l>(
     passphrase: JByteArray<'l>,
     in_fd: jint,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
-        let mut pass = get_bytes(&mut env, &passphrase)?;
+        let pass = get_bytes(&mut env, &passphrase)?;
         let mut input = borrow_fd(in_fd);
-        let out = backend::import_identity(&dir, &pass, &mut *input);
-        pass.zeroize();
-        out
-    })();
+        backend::import_identity(&dir, &pass, &mut *input)
+    });
     ret_string(&mut env, r)
 }
 
@@ -226,13 +258,13 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptBytes<'l>(
     armor: jboolean,
     input: JByteArray<'l>,
 ) -> jbyteArray {
-    let r = (|| {
+    let r = guard(|| {
         let recips = get_string_array(&mut env, &recipients)?;
-        let data = get_bytes(&mut env, &input)?;
-        let mut out = Vec::new();
-        backend::encrypt(&recips, armor == JNI_TRUE, std::io::Cursor::new(data), &mut out)?;
+        let plain = get_bytes(&mut env, &input)?;
+        let mut out = Zeroizing::new(Vec::new());
+        backend::encrypt(&recips, armor == JNI_TRUE, &plain[..], &mut *out)?;
         Ok(out)
-    })();
+    });
     ret_bytes(&mut env, r)
 }
 
@@ -244,15 +276,14 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptBytes<'l>(
     passphrase: JByteArray<'l>,
     input: JByteArray<'l>,
 ) -> jbyteArray {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
-        let mut pass = get_bytes(&mut env, &passphrase)?;
+        let pass = get_bytes(&mut env, &passphrase)?;
         let data = get_bytes(&mut env, &input)?;
-        let mut out = Vec::new();
-        let res = backend::decrypt(&dir, &pass, std::io::Cursor::new(data), &mut out);
-        pass.zeroize();
-        res.map(|()| out)
-    })();
+        let mut out = Zeroizing::new(Vec::new());
+        backend::decrypt(&dir, &pass, &data[..], &mut *out)?;
+        Ok(out)
+    });
     ret_bytes(&mut env, r)
 }
 
@@ -263,12 +294,12 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptBytesSession<'l
     _class: JClass<'l>,
     input: JByteArray<'l>,
 ) -> jbyteArray {
-    let r = (|| {
+    let r = guard(|| {
         let data = get_bytes(&mut env, &input)?;
-        let mut out = Vec::new();
-        backend::decrypt_session(std::io::Cursor::new(data), &mut out)?;
+        let mut out = Zeroizing::new(Vec::new());
+        backend::decrypt_session(&data[..], &mut *out)?;
         Ok(out)
-    })();
+    });
     ret_bytes(&mut env, r)
 }
 
@@ -283,15 +314,13 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptFd<'l>(
     in_fd: jint,
     out_fd: jint,
 ) {
-    let r = (|| {
+    let r = guard(|| {
         let recips = get_string_array(&mut env, &recipients)?;
         let mut input = borrow_fd(in_fd);
         let mut output = borrow_fd(out_fd);
         backend::encrypt(&recips, armor == JNI_TRUE, &mut *input, &mut *output)
-    })();
-    if let Err(e) = r {
-        throw(&mut env, &e);
-    }
+    });
+    ret_unit(&mut env, r);
 }
 
 #[no_mangle]
@@ -303,18 +332,14 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptFd<'l>(
     in_fd: jint,
     out_fd: jint,
 ) {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
-        let mut pass = get_bytes(&mut env, &passphrase)?;
+        let pass = get_bytes(&mut env, &passphrase)?;
         let mut input = borrow_fd(in_fd);
         let mut output = borrow_fd(out_fd);
-        let res = backend::decrypt_file_to(&dir, &pass, &mut *input, &mut *output);
-        pass.zeroize();
-        res
-    })();
-    if let Err(e) = r {
-        throw(&mut env, &e);
-    }
+        backend::decrypt_file_to(&dir, &pass, &mut *input, &mut *output)
+    });
+    ret_unit(&mut env, r);
 }
 
 /// Decrypt a file using the unlocked session key (no passphrase). Same staged,
@@ -327,15 +352,13 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptFdSession<'l>(
     in_fd: jint,
     out_fd: jint,
 ) {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
         let mut input = borrow_fd(in_fd);
         let mut output = borrow_fd(out_fd);
         backend::decrypt_file_to_session(&dir, &mut *input, &mut *output)
-    })();
-    if let Err(e) = r {
-        throw(&mut env, &e);
-    }
+    });
+    ret_unit(&mut env, r);
 }
 
 // ===========================================================================
@@ -353,7 +376,6 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptFdSession<'l>(
 
 use std::cell::OnceCell;
 use std::io;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::rc::Rc;
 
 use jni::objects::{GlobalRef, JBooleanArray, JLongArray, JObject, JValue};
@@ -479,16 +501,18 @@ impl Store for SafStore {
         }
     }
     fn read(&self, rel: &str) -> io::Result<Vec<u8>> {
+        let mut data = Vec::new();
+        self.open(rel)?.read_to_end(&mut data)?;
+        Ok(data)
+    }
+    fn open(&self, rel: &str) -> io::Result<File> {
         // A FIFO can't be made in shared storage, and a cloud provider may hand a
         // file over as a pipe, so unlike PathStore a descriptor's type isn't checked.
         if self.kind(rel) != Kind::File {
             return Err(io::Error::new(io::ErrorKind::NotFound, "not a file in the folder"));
         }
-        let mut file = self.owned_fd("openRead", rel).map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not a file in the folder"))?;
-        let mut data = Vec::new();
-        file.read_to_end(&mut data)?;
-        Ok(data)
+        self.owned_fd("openRead", rel).map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "not a file in the folder"))
     }
     fn create_new(&self, rel: &str) -> backend::R<File> {
         self.owned_fd("createNew", rel)?.ok_or_else(|| format!("creating {}: no descriptor", self.show(rel)))
@@ -596,7 +620,8 @@ fn progress_to(env: &mut JNIEnv, sink: &JObject) -> Result<Rc<Progress>, String>
     ))
 }
 
-fn opt_bytes(env: &mut JNIEnv, a: &JByteArray) -> Result<Option<Vec<u8>>, String> {
+/// A byte[] that may be null (the session or a remembered key), wiped when dropped.
+fn opt_bytes(env: &mut JNIEnv, a: &JByteArray) -> Result<Option<Zeroizing<Vec<u8>>>, String> {
     if a.is_null() { Ok(None) } else { get_bytes(env, a).map(Some) }
 }
 
@@ -614,11 +639,11 @@ fn with_vault(
     act: &mut dyn FnMut(&mut JNIEnv, &Vault) -> Result<String, String>,
 ) -> Result<String, String> {
     let dir = get_string(env, data_dir)?;
-    let mut bytes = opt_bytes(env, secret)?;
+    let bytes = opt_bytes(env, secret)?;
     let store = SafStore::new(env, tree);
     let progress = progress_to(env, progress);
-    let result = catch_unwind(AssertUnwindSafe(|| {
-        let secret = Secret { data_dir: &dir, bytes: bytes.as_deref() };
+    guard(|| {
+        let secret = Secret { data_dir: &dir, bytes: bytes.as_deref().map(Vec::as_slice) };
         let mut vault = Vault::open_in(Box::new(store?), &secret, exclusive)?;
         vault.progress = progress?;
         let mut out = act(env, &vault)?;
@@ -626,12 +651,7 @@ fn with_vault(
             out.push_str(&format!("warning: {warning}\n"));
         }
         Ok(out)
-    }))
-    .unwrap_or_else(|_| Err("internal error in the vault code; nothing was changed after it".into()));
-    if let Some(b) = bytes.as_mut() {
-        b.zeroize();
-    }
-    result
+    })
 }
 
 /// Make a vault in `tree`, an empty folder.
@@ -644,23 +664,14 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultCreate<'l>(
     mode: JString<'l>,
     secret: JByteArray<'l>,
 ) {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
         let mode = get_string(&mut env, &mode)?;
-        let mut bytes = opt_bytes(&mut env, &secret)?;
+        let bytes = opt_bytes(&mut env, &secret)?;
         let store = SafStore::new(&mut env, &tree)?;
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            vault::create(Box::new(store), &mode, &Secret { data_dir: &dir, bytes: bytes.as_deref() })
-        }))
-        .unwrap_or_else(|_| Err("internal error in the vault code".into()));
-        if let Some(b) = bytes.as_mut() {
-            b.zeroize();
-        }
-        result
-    })();
-    if let Err(e) = r {
-        throw(&mut env, &e);
-    }
+        vault::create(Box::new(store), &mode, &Secret { data_dir: &dir, bytes: bytes.as_deref().map(Vec::as_slice) })
+    });
+    ret_unit(&mut env, r);
 }
 
 /// `vault-list`: "generation N" then "F size path" / "D path" lines.
@@ -672,7 +683,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultList<'l>(
     tree: JObject<'l>,
     secret: JByteArray<'l>,
 ) -> jstring {
-    let r = with_vault(&mut env, &data_dir, &tree, &secret, false, &JObject::null(), &mut |_, v| v.listing());
+    let r = guard(|| with_vault(&mut env, &data_dir, &tree, &secret, false, &JObject::null(), &mut |_, v| v.listing()));
     ret_string(&mut env, r)
 }
 
@@ -686,7 +697,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultCheck<'l>(
     secret: JByteArray<'l>,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| v.check());
+    let r = guard(|| with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| v.check()));
     ret_string(&mut env, r)
 }
 
@@ -709,7 +720,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultAdd<'l>(
     replace: jboolean,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let targets = get_string_array(&mut env, &targets)?;
         let n = targets.len();
         let mut dirs = vec![JNI_FALSE; n];
@@ -728,7 +739,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultAdd<'l>(
         with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| {
             v.add_from(&sources, dest.as_deref(), replace == JNI_TRUE).map(|()| String::new())
         })
-    })();
+    });
     ret_string(&mut env, r)
 }
 
@@ -744,14 +755,14 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultRemove<'l>(
     all: jboolean,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let entries = if all == JNI_TRUE { Vec::new() } else { get_string_array(&mut env, &entries)? };
         with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| {
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
             let done = if all == JNI_TRUE { v.remove_everything() } else { v.remove(&entries) };
             done.map(|()| String::new())
         })
-    })();
+    });
     ret_string(&mut env, r)
 }
 
@@ -768,13 +779,13 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultExtractFile<'l>(
     out_fd: jint,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let entry = get_string(&mut env, &entry)?;
         with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| {
             let mut out = borrow_fd(out_fd);
             v.extract_to(&entry, Out::File(&mut out)).map(|()| String::new())
         })
-    })();
+    });
     ret_string(&mut env, r)
 }
 
@@ -792,7 +803,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultExtractTree<'l>(
     name: JString<'l>,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let entries = get_string_array(&mut env, &entries)?;
         let name = get_string(&mut env, &name)?;
         let folder = SafStore::new(&mut env, &out_tree)?;
@@ -805,7 +816,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultExtractTree<'l>(
             }
             .map(|()| String::new())
         })
-    })();
+    });
     ret_string(&mut env, r)
 }
 
@@ -822,7 +833,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultShare<'l>(
     out_fd: jint,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let entries = get_string_array(&mut env, &entries)?;
         let recipients = get_string_array(&mut env, &recipients)?;
         with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| {
@@ -831,7 +842,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultShare<'l>(
             let mut out = borrow_fd(out_fd);
             v.share_to(&entries, &to, Out::File(&mut out)).map(|()| String::new())
         })
-    })();
+    });
     ret_string(&mut env, r)
 }
 
@@ -843,7 +854,10 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSetRemember<'l>(
     _class: JClass<'l>,
     seconds: jni::sys::jlong,
 ) {
-    vault::set_remember(seconds);
+    let _ = guard(|| {
+        vault::set_remember(seconds);
+        Ok(())
+    });
 }
 
 /// Forget one vault's remembered key, by its VaultTree key.
@@ -853,9 +867,10 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultForget<'l>(
     _class: JClass<'l>,
     key: JString<'l>,
 ) {
-    if let Ok(key) = get_string(&mut env, &key) {
-        vault::forget(&key);
-    }
+    let _ = guard(|| {
+        vault::forget(&get_string(&mut env, &key)?);
+        Ok(())
+    });
 }
 
 /// Whether a vault's key is remembered now, by its VaultTree key.
@@ -865,8 +880,8 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultIsRemembered<'l>(
     _class: JClass<'l>,
     key: JString<'l>,
 ) -> jboolean {
-    match get_string(&mut env, &key) {
-        Ok(key) if vault::is_remembered(&key) => JNI_TRUE,
+    match guard(|| get_string(&mut env, &key).map(|key| vault::is_remembered(&key))) {
+        Ok(true) => JNI_TRUE,
         _ => JNI_FALSE,
     }
 }
@@ -874,7 +889,10 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultIsRemembered<'l>(
 /// Forget remembered keys whose time is up.
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSweep<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) {
-    vault::sweep();
+    let _ = guard(|| {
+        vault::sweep();
+        Ok(())
+    });
 }
 
 // ===========================================================================
@@ -894,19 +912,14 @@ fn with_key<T>(
     password: &JByteArray,
     act: impl FnOnce(&Key) -> Result<T, String>,
 ) -> Result<T, String> {
-    let mut bytes = opt_bytes(env, password)?;
-    let result = catch_unwind(AssertUnwindSafe(|| {
+    let bytes = opt_bytes(env, password)?;
+    guard(|| {
         let key = match bytes.as_deref() {
             Some(b) => Key::Password(b),
             None => Key::Session,
         };
         act(&key)
-    }))
-    .unwrap_or_else(|_| Err("internal error while opening the shared file; nothing was written".into()));
-    if let Some(b) = bytes.as_mut() {
-        b.zeroize();
-    }
-    result
+    })
 }
 
 /// "password" or "key": which prompt a shared file needs.
@@ -916,7 +929,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedKind<'l>(
     _class: JClass<'l>,
     in_fd: jint,
 ) -> jstring {
-    let r = shared::age_kind(&mut *borrow_fd(in_fd)).map(str::to_string);
+    let r = guard(|| shared::age_kind(&mut *borrow_fd(in_fd)).map(str::to_string));
     ret_string(&mut env, r)
 }
 
@@ -928,13 +941,13 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedCheckPassword<'l
     in_fd: jint,
     password: JByteArray<'l>,
 ) {
-    let r = with_key(&mut env, &password, |key| match key {
-        Key::Password(pw) => shared::check_password(&mut *borrow_fd(in_fd), pw),
-        Key::Session => Err("no password was given".into()),
+    let r = guard(|| {
+        with_key(&mut env, &password, |key| match key {
+            Key::Password(pw) => shared::check_password(&mut *borrow_fd(in_fd), pw),
+            Key::Session => Err("no password was given".into()),
+        })
     });
-    if let Err(e) = r {
-        throw(&mut env, &e);
-    }
+    ret_unit(&mut env, r);
 }
 
 /// Save a shared file as it is (an archive stays an archive), staged and
@@ -948,15 +961,13 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedDecrypt<'l>(
     in_fd: jint,
     out_fd: jint,
 ) {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
         with_key(&mut env, &password, |key| {
             shared::decrypt_file_to(&dir, key, &mut *borrow_fd(in_fd), &mut *borrow_fd(out_fd))
         })
-    })();
-    if let Err(e) = r {
-        throw(&mut env, &e);
-    }
+    });
+    ret_unit(&mut env, r);
 }
 
 /// Unpack a shared archive into a new folder `name` inside `out_tree`. Returns
@@ -972,7 +983,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedExtract<'l>(
     name: JString<'l>,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
         let name = get_string(&mut env, &name)?;
         let folder = SafStore::new(&mut env, &out_tree)?;
@@ -983,7 +994,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_sharedExtract<'l>(
             let skipped = shared::extract_archive(&dir, key, &mut *input, len, &folder, &name, &LIMITS, &progress)?;
             Ok(skipped_warning(skipped))
         })
-    })();
+    });
     ret_string(&mut env, r)
 }
 
@@ -1008,17 +1019,15 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSharePassword<'l>
     out_fd: jint,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let entries = get_string_array(&mut env, &entries)?;
-        let mut pw = get_bytes(&mut env, &password)?;
-        let r = with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| {
+        let pw = get_bytes(&mut env, &password)?;
+        with_vault(&mut env, &data_dir, &tree, &secret, false, &progress, &mut |_, v| {
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
             let mut out = borrow_fd(out_fd);
             v.share_password(&entries, &pw, Out::File(&mut out)).map(|()| String::new())
-        });
-        pw.zeroize();
-        r
-    })();
+        })
+    });
     ret_string(&mut env, r)
 }
 
@@ -1036,11 +1045,11 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultImportShared<'l>(
     single_name: JString<'l>,
     progress: JObject<'l>,
 ) -> jstring {
-    let r = (|| {
+    let r = guard(|| {
         let dir = get_string(&mut env, &data_dir)?;
         let single_name = get_string(&mut env, &single_name)?;
-        let mut pw = opt_bytes(&mut env, &password)?;
-        let r = with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| {
+        let pw = opt_bytes(&mut env, &password)?;
+        with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| {
             let key = match pw.as_deref() {
                 Some(b) => Key::Password(b),
                 None => Key::Session,
@@ -1048,11 +1057,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultImportShared<'l>(
             let mut input = borrow_fd(in_fd);
             let len = input_len(&input);
             shared::import_archive(v, &dir, &key, &mut *input, len, &single_name, &LIMITS).map(|_| String::new())
-        });
-        if let Some(b) = pw.as_mut() {
-            b.zeroize();
-        }
-        r
-    })();
+        })
+    });
     ret_string(&mut env, r)
 }

@@ -41,6 +41,13 @@ object VaultSendNative {
     external fun isUnlocked(): Boolean
 
     /**
+     * Remove plaintext staging a killed run left in [dataDir], unless something is
+     * staging there now. Called when the app starts.
+     */
+    @Throws(BackendException::class)
+    external fun sweepStaging(dataDir: String)
+
+    /**
      * Import an existing identity.age read from [inFd], verifying it against
      * [passphrase] before writing it into place. Returns the public key and
      * unlocks the session on success.

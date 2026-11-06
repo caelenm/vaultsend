@@ -1,16 +1,22 @@
 package org.vaultsend
 
-import android.content.ContentResolver
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
+import android.view.WindowManager
+import android.view.inputmethod.EditorInfo
+import android.view.inputmethod.InputConnection
+import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.viewModels
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.ui.ExperimentalComposeUiApi
+import androidx.compose.ui.platform.InterceptPlatformTextInput
+import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.core.content.IntentCompat
 import org.vaultsend.ui.App
 import org.vaultsend.ui.AppViewModel
@@ -19,19 +25,10 @@ import org.vaultsend.ui.VaultSendTheme
 class MainActivity : ComponentActivity() {
 
     // Same Activity-scoped instance that App() resolves via viewModel(), so a
-    // share intent handled here is visible to the composables.
+    // share intent handled here is visible to the composables. It also owns the
+    // background lock's timer, so a recreated activity can cancel one an earlier
+    // instance posted.
     private val vm: AppViewModel by viewModels()
-
-    // Locks the session once the app has been in the background for a while, so
-    // an unlocked key doesn't stay resident for as long as Android keeps the
-    // process alive (onDestroy is not called when the app is swiped away or
-    // simply left in the background). Long enough to survive a trip through the
-    // system file picker, which also puts this activity in the background.
-    private val lockHandler = Handler(Looper.getMainLooper())
-    // Opened vault copies are kept: the user is probably looking at one in
-    // another app, which is what put this one in the background. They go on
-    // Lock now, a vault's Lock, and when the app closes.
-    private val backgroundLock = Runnable { vm.lockForBackground() }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -45,16 +42,29 @@ class MainActivity : ComponentActivity() {
 
         // Handle a share/"open with" intent only on a fresh start; on rotation
         // (savedInstanceState != null) the pending content is already in the VM
-        // and must not be re-applied.
+        // and must not be re-applied. (Copies and staging a killed run left behind
+        // are swept when the view model is made, which is once per process.)
         if (savedInstanceState == null) {
-            // Copies Open left behind when the app was last killed (see OpenCopies.kt).
-            vm.backend.discardCopies()
             handleShareIntent(intent)
         }
 
         setContent {
+            // Below API 33 the thumbnail can't be turned off on its own, so the window
+            // is made secure while it shows decrypted text or an unlocked vault's list.
+            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                val secret = vm.messageIsDecrypted || vm.vaultPage != null
+                LaunchedEffect(secret) {
+                    if (secret) {
+                        window.addFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    } else {
+                        window.clearFlags(WindowManager.LayoutParams.FLAG_SECURE)
+                    }
+                }
+            }
             VaultSendTheme {
-                App(vm)
+                NoPersonalizedLearning {
+                    App(vm)
+                }
             }
         }
     }
@@ -80,43 +90,60 @@ class MainActivity : ComponentActivity() {
             Intent.ACTION_SEND_MULTIPLE -> {
                 // Several files at once only make sense for a vault: added to the open one.
                 val uris = IntentCompat.getParcelableArrayListExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
-                    ?.filter { isContentUri(it) }
-                if (!uris.isNullOrEmpty()) vm.offerShareMany(uris)
+                    ?: return
+                val accepted = uris.filter { accept(it) }
+                if (accepted.size < uris.size) refused()
+                if (accepted.isNotEmpty()) vm.offerShareMany(accepted)
             }
             Intent.ACTION_SEND -> {
                 val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
                 if (uri != null) {
-                    if (isContentUri(uri)) vm.setPendingShare(uri, null)
+                    if (accept(uri)) vm.setPendingShare(uri, null) else refused()
                 } else {
                     val text = intent.getStringExtra(Intent.EXTRA_TEXT)
                     if (!text.isNullOrEmpty()) vm.setPendingShare(null, text)
                 }
             }
             Intent.ACTION_VIEW -> {
-                intent.data?.let { if (isContentUri(it)) vm.setPendingShare(it, null) }
+                intent.data?.let { if (accept(it)) vm.setPendingShare(it, null) else refused() }
             }
         }
     }
 
     /**
-     * Only content:// URIs are accepted from other apps. A file:// URI is opened
-     * with this app's own permissions, so another app could name a file in our
-     * private storage (identity.age, contacts.json) and have the user encrypt it
-     * out to a location of their choosing.
+     * Only content:// URIs are accepted from other apps, and none that only
+     * VaultSend's own access reaches (see [refuseIncoming]). A URI is opened with
+     * this app's permissions, not the sender's: a file:// URI could name
+     * identity.age, a URI to this app's FileProvider an opened copy, and one inside
+     * a folder VaultSend was granted (a vault's, and the folder it was made in) any
+     * file there, none of which the sender could read itself.
      */
-    private fun isContentUri(uri: Uri): Boolean = uri.scheme == ContentResolver.SCHEME_CONTENT
+    private fun accept(uri: Uri): Boolean {
+        val grants = runCatching { contentResolver.persistedUriPermissions.map { it.uri.parts() } }
+            // If the grants can't be read, nothing can be told apart: refuse.
+            .getOrElse { return false }
+        return !refuseIncoming(uri.parts(), "$packageName.open", grants)
+    }
+
+    private fun Uri.parts() = UriParts(scheme, authority, pathSegments)
+
+    private fun refused() {
+        Toast.makeText(
+            this,
+            "VaultSend didn't open that: another app can't hand it a file in a folder it has access to. " +
+                "Use Open file… in VaultSend instead.",
+            Toast.LENGTH_LONG,
+        ).show()
+    }
 
     override fun onStart() {
         super.onStart()
-        lockHandler.removeCallbacks(backgroundLock)
+        vm.cameToForeground()
     }
 
     override fun onStop() {
         super.onStop()
-        if (!isChangingConfigurations) {
-            lockHandler.removeCallbacks(backgroundLock)
-            lockHandler.postDelayed(backgroundLock, BACKGROUND_LOCK_MS)
-        }
+        if (!isChangingConfigurations) vm.wentToBackground()
     }
 
     override fun onDestroy() {
@@ -124,14 +151,35 @@ class MainActivity : ComponentActivity() {
         // Drop the in-memory session key when the app is actually closing. Guard
         // on isFinishing so a configuration change (e.g. rotation) doesn't lock
         // the session — the native key is process-global and survives rotation.
+        // Lock now: the key, remembered vault keys, decrypted text and every opened
+        // copy. (The view model is cleared next, which cancels the background timer.)
         if (isFinishing) {
-            lockHandler.removeCallbacks(backgroundLock)
-            vm.backend.lock()
-            vm.discardCopies()
+            vm.lockSession()
         }
     }
+}
 
-    private companion object {
-        const val BACKGROUND_LOCK_MS = 2 * 60 * 1000L
-    }
+/**
+ * Asks the keyboard not to learn from anything typed or shown in `content`'s text
+ * fields (IME_FLAG_NO_PERSONALIZED_LEARNING, which Gboard and others honour as
+ * incognito): decrypted messages, and the plaintext typed to encrypt, would
+ * otherwise feed its suggestions and personal dictionary. Compose has no
+ * KeyboardOptions for it, so the request each field makes is amended on its way.
+ */
+@OptIn(ExperimentalComposeUiApi::class)
+@Composable
+private fun NoPersonalizedLearning(content: @Composable () -> Unit) {
+    InterceptPlatformTextInput(
+        interceptor = { request, nextHandler ->
+            val noLearning = object : PlatformTextInputMethodRequest {
+                override fun createInputConnection(outAttributes: EditorInfo): InputConnection {
+                    val connection = request.createInputConnection(outAttributes)
+                    outAttributes.imeOptions = outAttributes.imeOptions or EditorInfo.IME_FLAG_NO_PERSONALIZED_LEARNING
+                    return connection
+                }
+            }
+            nextHandler.startInputMethod(noLearning)
+        },
+        content = content,
+    )
 }

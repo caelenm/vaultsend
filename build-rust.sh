@@ -21,4 +21,6 @@ for abi in "${ABIS[@]}"; do
     TARGET_ARGS+=(-t "$abi")
 done
 
-exec cargo ndk "${TARGET_ARGS[@]}" -o ../app/src/main/jniLibs build --release
+# --locked: build exactly the dependency versions Cargo.lock records (and fail if
+# it would need changing), so the shipped library is the one the tests ran on.
+exec cargo ndk "${TARGET_ARGS[@]}" -o ../app/src/main/jniLibs build --release --locked

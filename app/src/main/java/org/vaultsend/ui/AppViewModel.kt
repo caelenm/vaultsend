@@ -2,14 +2,20 @@ package org.vaultsend.ui
 
 import android.app.Application
 import android.net.Uri
+import android.os.Handler
+import android.os.Looper
+import android.os.SystemClock
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.vaultsend.AppSettings
+import org.vaultsend.BACKGROUND_LOCK_MS
 import org.vaultsend.Backend
 import org.vaultsend.Contact
 import org.vaultsend.ContactStore
@@ -17,6 +23,7 @@ import org.vaultsend.REMEMBER_SECONDS
 import org.vaultsend.VaultRecord
 import org.vaultsend.VaultSelection
 import org.vaultsend.VaultStore
+import org.vaultsend.backgroundLockDue
 import org.vaultsend.readContacts
 import org.vaultsend.writeContacts
 import java.io.File
@@ -70,6 +77,41 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** The encrypt/decrypt text box. Kept here so rotation doesn't lose it. */
     var message by mutableStateOf("")
+        private set
+
+    /**
+     * Whether [message] holds text this app decrypted (or what the user has made of
+     * it since), which every lock clears. Encrypting it, loading shared text over
+     * it, or emptying the box ends that.
+     */
+    var messageIsDecrypted by mutableStateOf(false)
+        private set
+
+    /** The user typed in the box. */
+    fun editMessage(text: String) {
+        message = text
+        if (text.isEmpty()) messageIsDecrypted = false
+    }
+
+    /** Something that isn't decrypted text replaces what's in the box. */
+    fun replaceMessage(text: String) {
+        message = text
+        messageIsDecrypted = false
+    }
+
+    /** Decrypted text goes in the box, until the next lock. */
+    fun showDecrypted(text: String) {
+        message = text
+        messageIsDecrypted = true
+    }
+
+    /** Locking: decrypted text leaves the screen with the key that decrypted it. */
+    fun clearDecryptedMessage() {
+        if (messageIsDecrypted) {
+            message = ""
+            messageIsDecrypted = false
+        }
+    }
 
     /**
      * A file or text shared into the app from outside (share sheet / "open with").
@@ -100,6 +142,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         backend.lock()
         unlocked = false
         lockVaultPage()
+        clearDecryptedMessage()
         discardCopies()
     }
 
@@ -140,6 +183,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     init {
         backend.setVaultRemember(rememberSeconds())
+        // A new view model means a new process, or an activity that finished (and
+        // locked) before this one: no opened copy can be in use, and none would be in
+        // [openedCopies] if Android had restarted the app, so they're swept here. So
+        // is plaintext staging a killed run left in the data dir; the core skips that
+        // if something is staging, so it can run off the main thread.
+        backend.discardCopies()
+        viewModelScope.launch(Dispatchers.IO) { runCatching { backend.sweepStaging() } }
     }
 
     fun saveVaults() = vaultStore.saveVaults(vaults)
@@ -212,8 +262,18 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         if (selectedVault?.uri == record.uri) lockVaultPage()
     }
 
+    /**
+     * Delete opened copies: one vault's (its Lock, Remove from list), or with no
+     * vault, every copy in the folder, including any an earlier process handed out
+     * that this one never knew about (Lock now, and closing the app).
+     */
     fun discardCopies(record: VaultRecord? = null) {
-        val gone = openedCopies.filter { record == null || it.vaultUri == record.uri }
+        if (record == null) {
+            backend.discardCopies()
+            openedCopies.clear()
+            return
+        }
+        val gone = openedCopies.filter { it.vaultUri == record.uri }
         backend.discardCopies(gone.map { it.file })
         openedCopies.removeAll(gone)
     }
@@ -239,11 +299,44 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         backend.sweepVaultKeys()
     }
 
-    /** The background auto-lock: keys and open vault pages, but not opened copies. */
+    /** The background auto-lock: keys, open vault pages and decrypted text, but not opened copies. */
     fun lockForBackground() {
         backend.lock()
         unlocked = false
         lockVaultPage()
+        clearDecryptedMessage()
+    }
+
+    // --- The background lock's timing ---------------------------------------
+    // Here rather than in the activity, so that one instance can cancel the timer
+    // another posted (a rotation while away makes a new activity).
+
+    private val lockHandler = Handler(Looper.getMainLooper())
+    private val backgroundLock = Runnable { lockForBackground() }
+
+    /** When the app went to the background (SystemClock.elapsedRealtime), or 0 while it's in front. */
+    private var backgroundSince = 0L
+
+    /** The app went to the background: lock once it has been away [BACKGROUND_LOCK_MS]. */
+    fun wentToBackground() {
+        backgroundSince = SystemClock.elapsedRealtime()
+        lockHandler.removeCallbacks(backgroundLock)
+        lockHandler.postDelayed(backgroundLock, BACKGROUND_LOCK_MS)
+    }
+
+    /**
+     * Back in front: cancel the timer, and lock now if the time away has run out
+     * whether or not it fired (see [backgroundLockDue]).
+     */
+    fun cameToForeground() {
+        lockHandler.removeCallbacks(backgroundLock)
+        val since = backgroundSince
+        backgroundSince = 0L
+        if (backgroundLockDue(since, SystemClock.elapsedRealtime())) lockForBackground()
+    }
+
+    override fun onCleared() {
+        lockHandler.removeCallbacks(backgroundLock)
     }
 
     /** After an operation that used the session: with Remember off, lock straight away. */

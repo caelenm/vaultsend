@@ -1266,7 +1266,8 @@ def section_scale():
     e = backend("vault-extract", "--dir", dv, "--entry", "/", "--out", out, secret=VAULT_PASS)
     check(r.returncode == 0 and e.returncode == 0 and tree_state(deep) == tree_state(out / deep.name), "150 levels deep goes in and comes back", (r.stderr, e.stderr))
 
-    # Large files: added as a stream, but read whole into memory to verify.
+    # Large files: added as a stream, and (on Android) verified as a stream too, into
+    # private staging in the data dir, so memory stays flat whatever the file's size.
     size = 1536 * 1024 * 1024
     big = T / "scale-big.bin"
     with open(big, "wb") as f:
@@ -1282,7 +1283,9 @@ def section_scale():
     check(same, f"extracted identically in {took:.0f}s; peak memory {rss // 1024} MiB", r.stderr)
     out.unlink(missing_ok=True)
 
-    # Not enough memory: the process dies before any plaintext reaches the disk.
+    # Less memory than the file: the desktop's RAM-only rule died here, before any
+    # plaintext reached the disk. Streaming through private staging needs one chunk, so
+    # it extracts the file intact, and leaves no staging behind in the data dir.
     def low_memory():
         resource.setrlimit(resource.RLIMIT_AS, (1024 * 1024 * 1024, 1024 * 1024 * 1024))
     r3, w3 = os.pipe()
@@ -1290,9 +1293,11 @@ def section_scale():
     os.close(w3)
     p = subprocess.run([BIN, "vault-extract", "--dir", str(bv), "--entry", big.name, "--out", str(out), "--pass-fd", str(r3)], pass_fds=(r3,), env=ENV, capture_output=True, text=True, errors="replace", preexec_fn=low_memory, timeout=600)
     os.close(r3)
-    check(p.returncode != 0 and not out.exists() and not Path(str(out) + PART).exists(), f"out of memory: fails, and writes nothing (exit {p.returncode})", p.stderr[:200])
-    if p.returncode != 1:
-        note(f"running out of memory ends the backend with exit {p.returncode}, not a tidy error: {p.stderr.strip()[:120]}")
+    same = p.returncode == 0 and subprocess.run(["cmp", "-s", str(big), str(out)]).returncode == 0
+    check(same, f"under a 1 GiB memory limit: still extracted identically (exit {p.returncode})", p.stderr[:200])
+    leftover = [n for n in os.listdir(Path(ENV["XDG_DATA_HOME"]) / "vaultsend") if n.startswith(".decrypt")]
+    check(not leftover, "and no staging is left in the data dir", leftover[:3])
+    out.unlink(missing_ok=True)
     big.unlink()
     check(backend("vault-check", "--dir", bv, secret=VAULT_PASS, timeout=900).returncode == 0, "and the vault is unharmed")
 

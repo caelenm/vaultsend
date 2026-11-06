@@ -171,7 +171,8 @@ fun PassphraseDialog(
     fun submit() {
         when {
             pass.isEmpty() -> error = "$fieldLabel can't be empty."
-            confirm && pass.length < MIN_PASSPHRASE_LEN ->
+            // Characters as the core counts them (code points), so an emoji counts once.
+            confirm && pass.codePointCount(0, pass.length) < MIN_PASSPHRASE_LEN ->
                 error = "Use at least $MIN_PASSPHRASE_LEN characters — a few random words works well."
             confirm && pass != repeat -> error = "Those don't match."
             validate != null -> {
