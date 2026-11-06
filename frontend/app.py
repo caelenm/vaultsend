@@ -1395,10 +1395,17 @@ class Window(Adw.ApplicationWindow):
         self.with_vault_secret(vault, opened)
 
     def encrypt_file(self, path):
-        self.pick_recipients(lambda recips: self._save_then(
-            os.path.basename(path) + ".age",
-            lambda out: self._run_encrypt(path, out, recips),
-        ))
+        name = os.path.basename(path) + ".age"
+        self.pick_recipients(
+            lambda recips: self._save_then(name, lambda out: self._run_encrypt(path, out, recips)),
+            # Set password instead: for anyone with the password, as the Android app's Share.
+            on_password=lambda: self.ask_passphrase(
+                lambda pw: self._save_then(name, lambda out: self._run_encrypt(path, out, [], password=pw)),
+                heading="Set password",
+                body="",
+                confirm=True,
+            ),
+        )
 
     def decrypt_file(self, path):
         """A file someone shared may need a password rather than your key, and an archive
@@ -1584,14 +1591,17 @@ class Window(Adw.ApplicationWindow):
         self.current_op = op
         op.start()
 
-    def _run_encrypt(self, in_path, out_path, recips):
+    def _run_encrypt(self, in_path, out_path, recips, password=None):
         args = ["encrypt"]
         for r in recips:
             args += ["-r", r]
+        if password is not None:
+            args.append("--password")
         args += ["--in", in_path, "--out", out_path]
         self._start_op(FileOperation(
             self,
             args,
+            passphrase=password,
             heading="Encrypting…",
             subject=os.path.basename(in_path),
             # The backend stages the ciphertext and renames it into place when
@@ -1599,7 +1609,7 @@ class Window(Adw.ApplicationWindow):
             # follows from the input plus the format's overhead.
             watch_path=out_path + STAGING_SUFFIX,
             total=expected_ciphertext_size(file_size(in_path)),
-            note=f"Encrypted to {len(recips)}.",
+            note="Encrypted with your password." if password is not None else f"Encrypted to {len(recips)}.",
         ))
 
     def _run_decrypt(self, in_path, out_path, passphrase):
@@ -1652,7 +1662,7 @@ class Window(Adw.ApplicationWindow):
             self.error(str(e))
 
     # -- Dialogs --------------------------------------------------------------
-    def pick_recipients(self, on_ok):
+    def pick_recipients(self, on_ok, on_password=None):
         if self.my_pubkey is None:
             self.error("Your key isn't ready yet.")
             return
@@ -1673,12 +1683,17 @@ class Window(Adw.ApplicationWindow):
         scroller.set_child(box)
         dlg.set_extra_child(scroller)
         dlg.add_response("cancel", "Cancel")
+        if on_password is not None:
+            dlg.add_response("password", "Set password instead")
         dlg.add_response("encrypt", "Encrypt")
         dlg.set_response_appearance("encrypt", Adw.ResponseAppearance.SUGGESTED)
         dlg.set_default_response("encrypt")
         dlg.set_close_response("cancel")
 
         def resp(_d, r):
+            if r == "password":
+                on_password()
+                return
             if r != "encrypt":
                 return
             recips = [self.my_pubkey] + [pk for cb, pk in checks if cb.get_active()]

@@ -416,18 +416,38 @@ fn cmd_recover_pubkey(pass_fd: i32) -> R<()> {
     Ok(())
 }
 
-fn cmd_encrypt(recipient_strs: &[String], armor: bool, in_p: Option<&str>, out_p: Option<&str>) -> R<()> {
-    if recipient_strs.is_empty() {
-        return Err("no recipients given".into());
-    }
-    let recipients: Vec<x25519::Recipient> = recipient_strs
-        .iter()
-        .map(|s| s.parse::<x25519::Recipient>().map_err(|e| format!("invalid recipient '{s}': {e}")))
-        .collect::<R<_>>()?;
+/// The same floor as a new identity passphrase (MIN_PASSPHRASE_LEN in the frontend).
+const MIN_PASSWORD_CHARS: usize = 10;
 
-    let encryptor =
+/// `encrypt --password --pass-fd N`: for anyone who knows the password read from the
+/// pipe (scrypt at SCRYPT_LOG_N), instead of for `-r` recipients.
+fn cmd_encrypt(
+    recipient_strs: &[String],
+    password_fd: Option<i32>,
+    armor: bool,
+    in_p: Option<&str>,
+    out_p: Option<&str>,
+) -> R<()> {
+    let encryptor = if let Some(fd) = password_fd {
+        let password = read_passphrase(fd)?;
+        if password.expose_secret().chars().count() < MIN_PASSWORD_CHARS {
+            return Err(format!("use a password of at least {MIN_PASSWORD_CHARS} characters"));
+        }
+        let mut recipient = age::scrypt::Recipient::new(password);
+        recipient.set_work_factor(SCRYPT_LOG_N);
+        age::Encryptor::with_recipients(std::iter::once(&recipient as &dyn age::Recipient))
+            .map_err(|e| format!("preparing encryption: {e}"))?
+    } else {
+        if recipient_strs.is_empty() {
+            return Err("no recipients given".into());
+        }
+        let recipients: Vec<x25519::Recipient> = recipient_strs
+            .iter()
+            .map(|s| s.parse::<x25519::Recipient>().map_err(|e| format!("invalid recipient '{s}': {e}")))
+            .collect::<R<_>>()?;
         age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
-            .map_err(|e| format!("preparing encryption: {e}"))?;
+            .map_err(|e| format!("preparing encryption: {e}"))?
+    };
 
     let reader = input_reader(in_p)?;
     match out_p {
@@ -549,6 +569,7 @@ fn run() -> R<()> {
         "recover-pubkey" => cmd_recover_pubkey(require_fd(rest)?),
         "encrypt" => cmd_encrypt(
             &all_values(rest, "-r"),
+            if has_flag(rest, "--password") { Some(require_fd(rest)?) } else { None },
             has_flag(rest, "--armor"),
             opt_value(rest, "--in").as_deref(),
             opt_value(rest, "--out").as_deref(),
