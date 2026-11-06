@@ -242,6 +242,19 @@ class Selection(unittest.TestCase):
             self.assertNotEqual(app.unpacked_name(name), "")
             self.assertNotEqual(app.saved_name(name), "")
 
+    def test_a_free_name_never_replaces_anything(self):
+        folder = tempfile.mkdtemp(dir=ROOT)
+        self.assertEqual(app.free_name(folder, "Photos"), "Photos")
+        os.mkdir(os.path.join(folder, "Photos"))
+        self.assertEqual(app.free_name(folder, "Photos"), "Photos (2)")
+        Path(folder, "a.txt").write_text("x")
+        Path(folder, "a (2).txt").write_text("x")
+        self.assertEqual(app.free_name(folder, "a.txt"), "a (3).txt")
+        os.symlink("/nonexistent", os.path.join(folder, "dangling"))  # a broken link is still taken
+        self.assertEqual(app.free_name(folder, "dangling"), "dangling (2)")
+        Path(folder, ".age").write_text("x")
+        self.assertEqual(app.free_name(folder, ".age"), ".age (2)")
+
     def test_what_decrypt_offers_for_a_share(self):
         self.assertEqual(app.share_actions("password", "b.tar.age"), ["unpack", "save", "import"])
         self.assertEqual(app.share_actions("key", "b.tar.age"), ["unpack", "save", "import"])

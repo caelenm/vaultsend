@@ -38,9 +38,31 @@ chose to change so secret buffers are locked in memory: `read_passphrase`, `load
 
 The Android build (`android` branch, `rust/`, 0.3.x) can make password shares and open shares
 as a folder or into a vault. This brings the parts the desktop needs for security and so the
-two can open each other's shares, as backend commands. The JNI layer, the system file picker,
-FileProvider and the Compose UI stay on Android. **The desktop frontend doesn't call the new
-commands yet**: Share… still makes key shares only, and nothing in the window opens a share.
+two can open each other's shares, as backend commands, and the window uses them. The JNI layer,
+the system file picker, FileProvider and the Compose UI stay on Android.
+
+**In the window.**
+
+- **Share…** has a *Share with a password instead* link under the contacts. It asks for the
+  vault's secret, then a password for the share, typed twice and at least 10 characters, then
+  where to save.
+- **Decrypt** on the main page asks the backend what the file needs (`share-kind`, from the
+  header alone). An archive (`.tar.age`), or one file shared with a password, gets a choice:
+  **Unpack…**, **Save as it is…**, or **Add to a vault…** (greyed out with no vaults). A share's
+  password is checked at once (`share-check`), and a wrong one is asked again. One file for your
+  key decrypts exactly as before, with no new step.
+- **Unpack…** and **Save as it is…** ask for a folder rather than a name, and use the next free
+  name there (`Photos`, `Photos (2)`…). GTK's save chooser completes a typed name. When it opens
+  beside the share, "Photos" completes to `Photos.tar.age`, the share itself, and accepting it
+  would replace the share. Checked on GTK 4.14. The existing main-page Decrypt has the same quirk
+  (`x.txt` completes to `x.txt.age`), but GTK asks before replacing, and that flow is unchanged.
+- **Add to a vault…** lists your vaults. What the share holds goes in at the top of the one you
+  pick, in one change, and that vault then opens. For a `self` vault and a share made for you,
+  your passphrase is asked once.
+- `VaultOperation` can now pass several secret pipes (`--pass-fd`, `--share-pass-fd`,
+  `--id-pass-fd`). `run_backend` and `spawn_backend` are unchanged, so `share-check` has its own
+  small helper with its own pipe. Cancel sends SIGTERM as before, which these commands now
+  treat as Cancel.
 
 **Security and correctness.**
 
@@ -114,6 +136,8 @@ stale-staging sweep; key shares. `tests/vault_attack.py` gets a `shares` section
 | `tests/vault_attack.py`, with `age` 1.1.1, as root | 239 passed, 3 failed: the three `/proc/pid/{mem,environ,maps}` checks, which root can always read. `main`'s binary fails the same three the same way |
 | `vault_attack.py --only hardening`, as an unprivileged user | 7 passed, 0 failed |
 | `vault_attack.py --only shares` | 27 passed, 0 failed |
+| `tests/test_frontend_helpers.py`, GTK 4.14.5, libadwaita 1.5.0 | 52 passed |
+| `tests/vault_gui_check.sh`, the same, Xvfb | 277 passed, 0 failed (250 before this change, and 27 for sharing with a password, unpacking, saving and adding to a vault) |
 
 The read-only-folder case was skipped, because root runs with permission overrides.
 

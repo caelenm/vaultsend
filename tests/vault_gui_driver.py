@@ -292,6 +292,14 @@ def answer_save(folder, name):
     yield 300
 
 
+def answer_folder(folder):
+    yield 1500
+    chooser = choose_in_file_dialog(str(folder))
+    yield 800
+    chooser.response(Gtk.ResponseType.ACCEPT)
+    yield 300
+
+
 def watch_progress():
     """Until the running operation ends: every percentage it reached, and what its bar said."""
     percents, texts = [], []
@@ -796,13 +804,41 @@ def receiving_shares():
     check(dialog().get_heading() == "Wrong password. Try again", "a wrong password is said at once, and asked again")
     enter_passphrase(SHARE_PASS)
     yield 3000
-    yield from answer_save(WORK, "Gift")
+    yield from answer_folder(WORK)  # beside the share: GTK would have completed a typed "Gift"
     yield from idle()
     got = WORK / "Gift"
     check(got.is_dir() and (got / "album" / "2025" / "ünï day.txt").read_text() == "a day\n" and (got / "note.txt").read_text() == "a note\n",
           "Unpack gives the folder, file for file")
-    check(any(t == "Unpacked." for t in toasts[-3:]), "and says it's done")
+    check(any(t == "Unpacked into “Gift”." for t in toasts[-3:]), "and says where")
     check(not (WORK / "Gift.vaultsend-part").exists() and staged_left() == [], "with no partial folder and no staging left")
+
+    # Again: the folder is there now, so it gets the next free name, and Save as it is too.
+    drop_on_main_page(share)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    respond("Unpack…")
+    yield SETTLE
+    enter_passphrase(SHARE_PASS)
+    yield 3000
+    yield from answer_folder(WORK)
+    yield from idle()
+    check(tree_digest(WORK / "Gift (2)") == tree_digest(got), "unpacking again goes into “Gift (2)”, never over the first")
+    drop_on_main_page(share)
+    yield SETTLE
+    respond("Decrypt")
+    yield SETTLE
+    respond("Save as it is…")
+    yield SETTLE
+    enter_passphrase(SHARE_PASS)
+    yield 3000
+    yield from answer_folder(WORK)
+    yield from idle()
+    saved = WORK / "Gift.tar"
+    with tarfile.open(saved) as archive:
+        check(sorted(archive.getnames()) == ["album", "album/2025", "album/2025/ünï day.txt", "album/cover.txt", "note.txt"],
+              "Save as it is gives the archive itself, beside the share and not over it")
+    check(share.exists() and b"-> scrypt" in share.read_bytes()[:200], "and the share is untouched")
 
     # -- Add it to a vault --------------------------------------------------------------------
     drop_on_main_page(share)
@@ -863,9 +899,10 @@ def receiving_shares():
     yield SETTLE
     enter_passphrase(ID_PASS)
     yield SETTLE
-    yield from answer_save(WORK, "for me")
+    yield from answer_folder(WORK)
     yield from idle()
-    check((WORK / "for me" / "mine" / "note.txt").read_text() == "a note\n", "and unpacks with your passphrase")
+    mine = WORK / "for me" / "mine" / "note.txt"
+    check(mine.exists() and mine.read_text() == "a note\n", "and unpacks with your passphrase")
 
     one = WORK / "just one.txt.age"
     app.run_backend(["encrypt", "-r", win.my_pubkey, "--in", str(src / "note.txt"), "--out", str(one)])

@@ -452,6 +452,19 @@ def saved_name(file_name: str) -> str:
     return file_name + " decrypted"
 
 
+def free_name(folder: str, name: str) -> str:
+    """`name` in `folder`, or the first of "name (2)", "name (3)"… not already there. The
+    number goes before the extension, so "a.txt" becomes "a (2).txt"."""
+    stem, ext = os.path.splitext(name)
+    if not stem:  # ".age" and the like: all extension
+        stem, ext = name, ""
+    candidate, n = name, 1
+    while os.path.lexists(os.path.join(folder, candidate)):
+        n += 1
+        candidate = f"{stem} ({n}){ext}"
+    return candidate
+
+
 def share_actions(kind: str, file_name: str) -> list:
     """What Decrypt offers for a file, given what `share-kind` said it needs. An archive
     can be unpacked, saved as it is, or added to a vault; one file with a password can be
@@ -1480,16 +1493,21 @@ class Window(Adw.ApplicationWindow):
                 subject=name, note=note, on_done=done, partial=out + STAGING_SUFFIX,
             ))
 
+        def into_folder(title, wanted, command, heading, note):
+            # A folder, not a name: GTK's save chooser completes a typed name, and beside
+            # the share "Photos" completes to "Photos.tar.age", the share itself.
+            def chosen(folder):
+                out = os.path.join(folder, free_name(folder, wanted))
+                run([command, "--in", path, "--out", out], heading=heading, note=note(os.path.basename(out)), out=out)
+
+            self._pick_folder(title, chosen)
+
         if action == "unpack":
-            self._save_then(unpacked_name(name), lambda out: run(
-                ["share-extract", "--in", path, "--out", out],
-                heading="Unpacking…", note="Unpacked.", out=out,
-            ))
+            into_folder("Unpack into which folder?", unpacked_name(name), "share-extract",
+                        "Unpacking…", lambda n: f"Unpacked into “{n}”.")
         elif action == "save":
-            self._save_then(saved_name(name), lambda out: run(
-                ["share-decrypt", "--in", path, "--out", out],
-                heading="Decrypting…", note="Decrypted.", out=out,
-            ))
+            into_folder("Save into which folder?", saved_name(name), "share-decrypt",
+                        "Decrypting…", lambda n: f"Saved as “{n}”.")
         elif action == "import":
             self._pick_vault_for(name, lambda vault: self._import_share(vault, path, key))
 
@@ -2508,7 +2526,7 @@ class Window(Adw.ApplicationWindow):
             heading=f"Share “{what}”",
             body="Encrypted so only you and the person you choose can read it. They open it by "
             "dropping it on VaultSend's main page"
-            + (", which gives them this file." if one_file else ", which gives them a .tar archive of it all."),
+            + (", which gives them this file." if one_file else ", which unpacks it into a folder (or saves it as a .tar archive)."),
         )
         contacts = Gtk.ListBox(selection_mode=Gtk.SelectionMode.NONE)
         contacts.add_css_class("boxed-list")

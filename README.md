@@ -327,6 +327,10 @@ copies it to `NEWDIR.vaultsend-part` and renames it last; `vault-import` commits
 end. So an archive that fails anywhere writes nothing to your folder or vault. Both treat
 SIGTERM as Cancel and clean up; after a SIGKILL, the next run removes the staging.
 
+In the window: **Share…** can share with a password instead of a contact, and dropping a
+share on the main page and choosing **Decrypt** offers to **Unpack** it into a folder, **Save**
+it as it is, or **Add** it to one of your vaults.
+
 Secrets are never passed as arguments (those are visible to other processes):
 the passphrase is read from the file descriptor named by `--pass-fd`. File data
 flows over stdin/stdout unless `--in`/`--out` are given. With `--out`, output is
