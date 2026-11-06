@@ -325,6 +325,28 @@ check "and tar reads the archive" tar -xf "$T/many.tar" -C "$T/untarred"
 check "with the folder exactly as it was, empty folder included" same_tree "$SRC" "$T/untarred/tree"
 check "and the long path whole" cmp "$T/untarred/$(basename "$LONG")/deep.txt" "$LONG/deep.txt"
 
+SHARE_PASS="a share password for anyone"
+friend() { XDG_DATA_HOME="$FRIEND" "$BIN" "$@"; }
+check "share with a password" vault vault-share --entry tree --share-pass-fd 4 --out "$T/pw.tar.age" 4<<<"$SHARE_PASS"
+[ "$(friend share-kind --in "$T/pw.tar.age")" = password ] && ok "share-kind says it needs a password" || bad "share-kind"
+refuses_and_writes_nothing "a wrong password unpacks nothing" "$T/pw-wrong" friend share-extract --in "$T/pw.tar.age" --out "$T/pw-wrong" --share-pass-fd 4 4<<<"not the share password"
+check "anyone with the password unpacks it" friend share-extract --in "$T/pw.tar.age" --out "$T/pw-out" --share-pass-fd 4 4<<<"$SHARE_PASS"
+check "with the folder exactly as it was" same_tree "$SRC" "$T/pw-out/tree"
+check "share-decrypt saves the archive as it is" friend share-decrypt --in "$T/pw.tar.age" --out "$T/pw.tar" --share-pass-fd 4 4<<<"$SHARE_PASS"
+mkdir -p "$T/pw-untarred"
+check "and tar reads it" tar -xf "$T/pw.tar" -C "$T/pw-untarred"
+check "the same tree again" same_tree "$SRC" "$T/pw-untarred/tree"
+check "a key share unpacks with the friend's passphrase" friend share-extract --in "$T/many.tar.age" --out "$T/key-out" --pass-fd 3 3<<<"$ID_PASS"
+check "with the long path whole" cmp "$T/key-out/$(basename "$LONG")/deep.txt" "$LONG/deep.txt"
+FRIEND_VAULT="$T/friend.vsvault"
+check "the friend imports it into a vault" bash -c 'XDG_DATA_HOME="$1" "$2" vault-create --dir "$3" --mode password --pass-fd 3 3<<<"$4" &&
+    XDG_DATA_HOME="$1" "$2" vault-import --dir "$3" --in "$5" --pass-fd 3 --share-pass-fd 4 3<<<"$4" 4<<<"$6"' \
+    _ "$FRIEND" "$BIN" "$FRIEND_VAULT" "$VAULT_PASS" "$T/pw.tar.age" "$SHARE_PASS"
+check "and it extracts as it was" bash -c 'XDG_DATA_HOME="$1" "$2" vault-extract --dir "$3" --entry tree --out "$4" --pass-fd 3 3<<<"$5"' \
+    _ "$FRIEND" "$BIN" "$FRIEND_VAULT" "$T/friend-vault-out" "$VAULT_PASS"
+check "file for file" same_tree "$SRC" "$T/friend-vault-out"
+[ -z "$(ls -A "$FRIEND/vaultsend/staging" | grep -v '^\.lock$')" ] && ok "no staging left behind" || bad "staging left behind"
+
 check "extract several" vault vault-extract --entry tree/nested --entry tree/one-byte.bin --out "$T/several"
 check "they keep their paths" cmp "$T/several/tree/nested/random-3mib.bin" "$SRC/nested/random-3mib.bin"
 [ ! -e "$T/several/tree/empty.txt" ] && ok "and nothing else came with them" || bad "an unselected file was extracted"

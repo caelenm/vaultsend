@@ -4,6 +4,7 @@ Record for `feature/vaults`, version 0.2.0 (spec: `VAULTS_PLAN.md`). Local branc
 only; nothing has been pushed.
 
 - [Summary](#summary)
+- [Ported from the Android build: opening shares safely](#ported-from-the-android-build-opening-shares-safely)
 - [Changes from the owner's testing](#changes-from-the-owners-testing)
 - [Decisions made by the owner](#decisions-made-by-the-owner)
 - [Files touched](#files-touched)
@@ -30,6 +31,115 @@ crate. `FileOperation`, `run_backend`, `spawn_backend` and the audited backend f
 byte-identical to `main`, checked by comparing each definition, except for three the owner
 chose to change so secret buffers are locked in memory: `read_passphrase`, `load_identity` and
 `cmd_keygen`. Those changes are listed below.
+
+---
+
+## Ported from the Android build: opening shares safely
+
+The Android build (`android` branch, `rust/`, 0.3.x) can make password shares and open shares
+as a folder or into a vault. This brings the parts the desktop needs for security and so the
+two can open each other's shares, as backend commands, and the window uses them. The JNI layer,
+the system file picker, FileProvider and the Compose UI stay on Android.
+
+**In the window.**
+
+- **Share…** has a *Share with a password instead* link under the contacts. It asks for the
+  vault's secret, then a password for the share, typed twice and at least 10 characters, then
+  where to save.
+- **Decrypt** on the main page asks the backend what the file needs (`share-kind`, from the
+  header alone). An archive (`.tar.age`), or one file shared with a password, gets a choice:
+  **Unpack…**, **Save as it is…**, or **Add to a vault…** (greyed out with no vaults). A share's
+  password is checked at once (`share-check`), and a wrong one is asked again. One file for your
+  key decrypts exactly as before, with no new step.
+- **Unpack…** and **Save as it is…** ask for a folder rather than a name, and use the next free
+  name there (`Photos`, `Photos (2)`…). GTK's save chooser completes a typed name. When it opens
+  beside the share, "Photos" completes to `Photos.tar.age`, the share itself, and accepting it
+  would replace the share. Checked on GTK 4.14. The existing main-page Decrypt has the same quirk
+  (`x.txt` completes to `x.txt.age`), but GTK asks before replacing, and that flow is unchanged.
+- **Add to a vault…** lists your vaults. What the share holds goes in at the top of the one you
+  pick, in one change, and that vault then opens. For a `self` vault and a share made for you,
+  your passphrase is asked once.
+- `VaultOperation` can now pass several secret pipes (`--pass-fd`, `--share-pass-fd`,
+  `--id-pass-fd`). `run_backend` and `spawn_backend` are unchanged, so `share-check` has its own
+  small helper with its own pipe. Cancel sends SIGTERM as before, which these commands now
+  treat as Cancel.
+
+**Security and correctness.**
+
+- **A tar reader that treats the archive as hostile** (`tar.rs`, `scan`, the same code as
+  Android's). Every name is canonicalized, and `..`, absolute paths, drive prefixes,
+  backslashes, NUL and empty components are refused. Only files and folders are taken. Links,
+  devices, FIFOs and GNU long-name entries are skipped and counted, never created. There are
+  caps of 100,000 entries, 32 GB in total and 8 GB per entry, and 64 KiB per PAX header. Every
+  declared size is checked against the archive's real length, and a bad header checksum is
+  refused. Headers are read a block at a time and data is seeked past, so nothing is held whole.
+- **A safe order for unpacking and importing** (`shared.rs`). The whole file is decrypted to
+  private staging first, so age has checked every byte before any of it is used. `share-extract`
+  builds the whole tree in private storage, copies it to `<out>.vaultsend-part` and renames it
+  last. `vault-import` writes blobs straight from the staged archive and commits once. Only
+  what `scan` accepted is written, and each path is checked again just before it's written.
+- **A 2^18 scrypt limit for opening password shares.** age refuses a file asking for more
+  before scrypt runs. `load_identity` keeps `SCRYPT_MAX_LOG_N` (2^22), so `identity.age` files
+  from earlier, calibrating builds still open.
+- **`add_to` checks folders before it writes any blob.** A file going into a folder that isn't
+  in the vault or the batch (`a/b` with no `a`), or "into" a file, is refused up front. It used
+  to fail at commit, after every blob was written, as an internal error. Importing an archive
+  would have made that reachable. The test `sources_must_bring_the_folders_they_go_in` came
+  with it, plus a case for a file already in the vault.
+
+**Same features as Android.**
+
+- **Password shares.** `vault-share --share-pass-fd M` calls `Vault::share_password`: scrypt
+  at 2^18, with the same 10-character minimum as a vault password. `share_to` and
+  `share_password` now go through a common `share_with`, and the check that refuses an output
+  inside the vault moved there, so it applies to both.
+- **Receiving a share.** `share-kind` reads the header and says whether the file needs a
+  password or a key. `share-check` unwraps only the file key, so a wrong password shows up at
+  once. `share-decrypt`, `share-extract` and `vault-import` save the file as it is, unpack it,
+  or import it. A share that isn't an archive goes into a vault as one file, named by `--name`
+  or after the input with `.age` dropped.
+- **Cancel.** `Progress` carries Cancel as on Android. It asks at most once per MiB and once
+  per entry, then fails with `cancelled` and cleans up like any other failure. The frontend
+  cancels with SIGTERM. `share-decrypt`, `share-extract` and `vault-import` catch it (and
+  SIGINT and SIGHUP) and set a flag that `Progress` reads. Every other command still just dies
+  on SIGTERM, as before.
+
+**Staging between processes.** Android keeps a per-process count of operations. On the
+desktop each operation is its own process, so staging is a folder per run under
+`$XDG_DATA_HOME/vaultsend/staging` (`0700`), held under an exclusive `flock` for the run's life.
+A new run takes the root's lock, then removes every run folder whose lock it can take. The
+kernel releases a dead process's lock, never a live one's, so a SIGKILLed run's plaintext is
+swept by the next staging command, and a concurrent run's is left alone.
+
+**Where it differs from Android.** Inputs and outputs are paths, not a `Store` or SAF
+documents. `share-extract --out` names the new folder, as `vault-extract` does.
+`vault-import` also takes `--dest`, where Android always imports at the top. Extract,
+share and verify on the desktop still read each blob whole into RAM (the existing rule); only
+receiving a share streams through disk staging.
+
+**Tests brought along.** In `tar.rs`: the known-bad archives (traversal names however they
+arrive, links and devices, huge declared sizes, truncation, damaged headers, duplicates and
+file/folder clashes) and the 5,000-case seeded mutation fuzz. In `shared.rs`: the end-to-end
+run of hostile archives through decrypt, the private tree and the output folder, now also
+through `vault-import`; Cancel early and late, for unpack and import; the 2^19 refusal; the
+stale-staging sweep; key shares. `tests/vault_attack.py` gets a `shares` section, and
+`tests/vault_roundtrip.sh` a password-share round trip.
+
+**Results**, on the commit that added this:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked`, Rust 1.75.0 and 1.97.0 | 67 passed, 0 failed, on both |
+| `cargo clippy --all-targets`, 1.97.0 | Nothing in the new code; two notes in older tests, as on `main` |
+| `tests/verify_deps.sh` | All checks pass; `Cargo.toml` and `Cargo.lock` unchanged |
+| `tests/vault_roundtrip.sh` | 145 passed, 0 failed, with `strace` |
+| `tests/vault_attack.py`, with `age` 1.1.1, as root | 239 passed, 3 failed: the three `/proc/pid/{mem,environ,maps}` checks, which root can always read. `main`'s binary fails the same three the same way |
+| `vault_attack.py --only hardening`, as an unprivileged user | 7 passed, 0 failed |
+| `vault_attack.py --only shares` | 27 passed, 0 failed |
+| `tests/test_frontend_helpers.py`, GTK 4.14.5, libadwaita 1.5.0 | 52 passed |
+| `tests/vault_gui_check.sh`, the same, Xvfb | 277 passed, 0 failed (250 before this change, and 27 for sharing with a password, unpacking, saving and adding to a vault) |
+
+The read-only-folder case was skipped, because root runs with permission overrides.
 
 ---
 
@@ -66,7 +176,8 @@ two files with one name can't collide.
 `self` vault only opens for whoever sealed it, so one can't be made for someone else. They need
 only the main page, or the `age` tool. One file stays that file. Anything else becomes a tar
 archive inside the age file, written by `backend/src/tar.rs`, since the plan rules out a new crate
-and this is 75 lines. It only writes, so nothing a stranger sends goes through it. Everything
+and this is 75 lines. It only wrote at first; it now also reads, for opening a share, and treats
+what it reads as hostile (see [the port from Android](#ported-from-the-android-build-opening-shares-safely)). Everything
 verifies in RAM before the output is touched, as with extract.
 
 **How the percentage works.** The backend writes whole percentages, one per line, to a pipe
@@ -155,7 +266,7 @@ written. See the threat model below.
 | File | What |
 |---|---|
 | `backend/src/vault.rs` | New. All vault logic and its unit tests. |
-| `backend/src/tar.rs` | New. Writes the archive Share uses for a folder or several items, with its unit tests. |
+| `backend/src/tar.rs` | New. Writes the archive Share uses for a folder or several items, and (since the Android port) reads one as hostile input, with its unit tests and fuzzing. |
 | `backend/src/main.rs` | `mod vault;`, one dispatch arm, usage text. |
 | `backend/Cargo.toml`, `Cargo.lock` | `sha2` and `rand` as direct dependencies, version, test profile. |
 | `frontend/app.py` | Sidebar toggle, vault page, dialogs, registry, passphrase cache. |
@@ -461,6 +572,12 @@ The same as the rest of VaultSend, plus what someone with write access can still
   next change collects them, and `vault-check` reports them until then.
 - A folder extract killed partway leaves the files written so far in `<out>.vaultsend-part`,
   decrypted, until the same extract is run again. A killed process can't clean up after itself.
+  The same goes for `share-extract` killed with SIGKILL. SIGTERM, the frontend's Cancel, cleans
+  up at once. A SIGKILLed share command also leaves its private staging until the next
+  `share-decrypt`, `share-extract` or `vault-import` sweeps it.
+- Receiving a share stages its plaintext on disk, in `~/.local/share/vaultsend/staging` (`0700`),
+  so a share bigger than RAM can be opened. That's the Android design, and unlike the rest of
+  the desktop, which keeps plaintext in RAM until it's written to the output.
 - Names from inside a vault appear on the backend's command line (`--entry`, `--dest`) while an
   operation runs, so another account on the machine can see them in `ps` unless `/proc` is
   mounted with `hidepid`. Secrets never do. A logging shim recorded every command line of a whole

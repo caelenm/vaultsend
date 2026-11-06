@@ -14,7 +14,7 @@
 // before a byte reaches disk, and age recipients being anonymous (the vault's public
 // key is stored nowhere in the clear, so a manifest can't be forged without the key).
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, DirBuilder, File};
 use std::io::{self, Cursor, Read, Write};
@@ -53,13 +53,17 @@ const ROOT_ENTRY: &str = "/";
 const MIN_PASSWORD_CHARS: usize = 10;
 /// How much plaintext goes by between progress reports, at most.
 const PROGRESS_CHUNK: usize = 1 << 20;
+/// What an operation stopped by Cancel says. The frontend cancels with SIGTERM; the
+/// commands that unpack or import a share catch it (main.rs) and fail with this,
+/// cleaning up as any other failure does.
+pub(crate) const CANCELLED: &str = "cancelled";
 
 // ---------------------------------------------------------------------------
 // Vault paths.  The one validator used by add, remove, extract and the manifest
 // parser; everything joined onto a real directory has passed through it, so a
 // hostile path can never climb out of the output folder.
 // ---------------------------------------------------------------------------
-fn valid_vault_path(p: &str) -> bool {
+pub(crate) fn valid_vault_path(p: &str) -> bool {
     !p.is_empty()
         && p.len() <= 4096
         && !p.contains('\0')
@@ -67,12 +71,12 @@ fn valid_vault_path(p: &str) -> bool {
 }
 
 /// Every parent folder of `path`, outermost first: "a/b/c" gives "a", "a/b".
-fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+pub(crate) fn ancestors(path: &str) -> impl Iterator<Item = &str> {
     path.match_indices('/').map(move |(i, _)| &path[..i])
 }
 
 /// `path` relative to `root` if it lies inside it ("" for the root itself).
-fn within<'a>(path: &'a str, root: &str) -> Option<&'a str> {
+pub(crate) fn within<'a>(path: &'a str, root: &str) -> Option<&'a str> {
     if root == ROOT_ENTRY {
         return Some(path);
     }
@@ -234,7 +238,7 @@ impl Manifest {
 // Small IO helpers.
 // ---------------------------------------------------------------------------
 /// Stage `path` with open_private_new, let `fill` write it, fsync, rename into place.
-fn write_atomic(path: &str, fill: impl FnOnce(File) -> R<File>) -> R<()> {
+pub(crate) fn write_atomic(path: &str, fill: impl FnOnce(File) -> R<File>) -> R<()> {
     let tmp = staging_path(path);
     let file = open_private_new(&tmp)?;
     let staged = fill(file).and_then(|mut f| {
@@ -246,7 +250,7 @@ fn write_atomic(path: &str, fill: impl FnOnce(File) -> R<File>) -> R<()> {
 
 /// Make a rename durable. Best-effort: some filesystems refuse fsync on a folder,
 /// and by now the rename has happened, so failing here would misreport the outcome.
-fn sync_dir(path: &str) {
+pub(crate) fn sync_dir(path: &str) {
     if let Ok(dir) = File::open(path) {
         let _ = dir.sync_all();
     }
@@ -261,14 +265,14 @@ fn read_regular(path: &str) -> io::Result<Vec<u8>> {
     fs::read(path)
 }
 
-fn parent_of(path: &str) -> &str {
+pub(crate) fn parent_of(path: &str) -> &str {
     match Path::new(path).parent().and_then(Path::to_str) {
         Some("") | None => ".",
         Some(parent) => parent,
     }
 }
 
-fn private_dir(path: &str, recursive: bool) -> R<()> {
+pub(crate) fn private_dir(path: &str, recursive: bool) -> R<()> {
     DirBuilder::new()
         .recursive(recursive)
         .mode(0o700)
@@ -298,17 +302,26 @@ impl<W: Write> Write for HashingWriter<W> {
 /// (harden_process) and a vault write has no one output file to measure. Only numbers, so
 /// nothing about the vault's contents. At most 101 short lines, and the frontend marks the
 /// pipe non-blocking, so this can never stall; a report that doesn't fit is just dropped.
+///
+/// It also carries Cancel, as on Android: `cancelled` asks at most once per PROGRESS_CHUNK
+/// of work (and `check` whenever called), and once the answer is yes it stays yes. Work
+/// that stops this way fails with CANCELLED and cleans up as any other failure does.
 #[derive(Default)]
-struct Progress {
+pub(crate) struct Progress {
     /// Not ours to close: a bad number from the command line must not abort at exit.
     pipe: Option<ManuallyDrop<File>>,
+    cancel: Option<Box<dyn Fn() -> bool>>,
     total: Cell<u64>,
     done: Cell<u64>,
     shown: Cell<Option<u64>>,
+    /// Bytes gone by, whatever the total, and when Cancel was last asked about.
+    seen: Cell<u64>,
+    polled_at: Cell<u64>,
+    stopped: Cell<bool>,
 }
 
 impl Progress {
-    fn to_fd(fd: i32) -> R<Progress> {
+    pub(crate) fn to_fd(fd: i32) -> R<Progress> {
         if fd < 3 {
             return Err("--progress-fd must refer to a dedicated pipe (fd >= 3)".into());
         }
@@ -317,12 +330,42 @@ impl Progress {
         Ok(Progress { pipe: Some(ManuallyDrop::new(unsafe { File::from_raw_fd(fd) })), ..Default::default() })
     }
 
-    fn start(&self, total: u64) {
+    /// Ask `cancel` whether the user has stopped this operation.
+    pub(crate) fn with_cancel(mut self, cancel: impl Fn() -> bool + 'static) -> Progress {
+        self.cancel = Some(Box::new(cancel));
+        self
+    }
+
+    /// Whether the user has cancelled, asking only every PROGRESS_CHUNK bytes.
+    pub(crate) fn cancelled(&self) -> bool {
+        if !self.stopped.get() && self.seen.get().saturating_sub(self.polled_at.get()) >= PROGRESS_CHUNK as u64 {
+            self.poll();
+        }
+        self.stopped.get()
+    }
+
+    fn poll(&self) {
+        self.polled_at.set(self.seen.get());
+        if self.cancel.as_ref().is_some_and(|cancel| cancel()) {
+            self.stopped.set(true);
+        }
+    }
+
+    /// Ask now, between steps: Err(CANCELLED) if the user has stopped this.
+    pub(crate) fn check(&self) -> R<()> {
+        if !self.stopped.get() {
+            self.poll();
+        }
+        if self.stopped.get() { Err(CANCELLED.into()) } else { Ok(()) }
+    }
+
+    pub(crate) fn start(&self, total: u64) {
         self.total.set(total);
         self.done.set(0);
     }
 
-    fn advance(&self, n: u64) {
+    pub(crate) fn advance(&self, n: u64) {
+        self.seen.set(self.seen.get().saturating_add(n));
         let (Some(pipe), total) = (&self.pipe, self.total.get()) else { return };
         if total == 0 {
             return;
@@ -338,16 +381,22 @@ impl Progress {
     }
 }
 
-/// Counts what's read through it, for encrypting a source file into a blob.
+/// Counts what's read through it, for encrypting a source into a blob, and keeps the
+/// total, which becomes the size in the manifest. Asks about Cancel as it goes.
 struct CountingReader<R> {
     inner: R,
     progress: Rc<Progress>,
+    count: Rc<Cell<u64>>,
 }
 
 impl<R: Read> Read for CountingReader<R> {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.progress.cancelled() {
+            return Err(io::Error::other(CANCELLED));
+        }
         let n = self.inner.read(buf)?;
         self.progress.advance(n as u64);
+        self.count.set(self.count.get() + n as u64);
         Ok(n)
     }
 }
@@ -477,14 +526,73 @@ fn refuse_out_inside_vault(dir: &str, out: &str) -> R<()> {
     Ok(())
 }
 
-/// Walk one source into `plan` (vault path -> None for a folder, Some(path) for a
+/// Everything to add, as (path below the destination, None for a folder or
+/// Some(index) for a file), and how many items were skipped as neither.
+pub(crate) type Plan = (Vec<(String, Option<usize>)>, usize);
+
+/// What `vault-add` adds: real paths (`PathSources`), or a shared archive that
+/// `vault-import` has decrypted and scanned (shared.rs). The same trait as Android's.
+pub(crate) trait Sources {
+    fn plan(&self) -> R<Plan>;
+    /// The contents of file `index`.
+    fn open(&self, index: usize) -> R<Box<dyn Read>>;
+    /// Its expected size, for the percentage only.
+    fn size(&self, index: usize) -> u64;
+}
+
+/// Real paths, walked as `plan_source` walks them.
+struct PathSources {
+    paths: Vec<String>,
+    files: RefCell<Vec<PathBuf>>,
+}
+
+impl PathSources {
+    fn new<S: AsRef<str>>(paths: &[S]) -> PathSources {
+        PathSources { paths: paths.iter().map(|p| p.as_ref().to_string()).collect(), files: RefCell::default() }
+    }
+}
+
+impl Sources for PathSources {
+    fn plan(&self) -> R<Plan> {
+        let mut plan = BTreeMap::new();
+        let mut skipped = 0;
+        for src in &self.paths {
+            let src = Path::new(src);
+            let name = src.file_name().and_then(|n| n.to_str());
+            let name = name.ok_or_else(|| format!("{}: no usable file name", src.display()))?;
+            plan_source(src, name, &mut plan, &mut skipped)?;
+        }
+        let mut files = self.files.borrow_mut();
+        files.clear();
+        let items = plan.into_iter().map(|(target, src)| {
+            (target, src.map(|path| {
+                files.push(path);
+                files.len() - 1
+            }))
+        });
+        Ok((items.collect(), skipped))
+    }
+
+    fn open(&self, index: usize) -> R<Box<dyn Read>> {
+        let src = &self.files.borrow()[index];
+        let file = File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
+        let meta = file.metadata().map_err(|e| format!("{}: {e}", src.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{} is no longer a regular file", src.display()));
+        }
+        Ok(Box::new(file))
+    }
+
+    fn size(&self, index: usize) -> u64 {
+        fs::symlink_metadata(&self.files.borrow()[index]).map_or(0, |meta| meta.len())
+    }
+}
+
+/// Walk one source into `plan` (path -> None for a folder, Some(path) for a
 /// file). Lstat throughout: symlinks, sockets, devices and FIFOs are never followed
-/// or read, only counted.
+/// or read, only counted. `add_to` checks each path once the destination is on it.
 fn plan_source(src: &Path, target: &str, plan: &mut BTreeMap<String, Option<PathBuf>>, skipped: &mut usize) -> R<()> {
     let fail = |e: io::Error| format!("{}: {e}", src.display());
-    if !valid_vault_path(target) {
-        return Err(format!("can't store this path in a vault: {target}"));
-    }
     let meta = fs::symlink_metadata(src).map_err(fail)?;
     if !meta.is_file() && !meta.is_dir() {
         *skipped += 1;
@@ -529,12 +637,12 @@ fn write_tree(root: &str, tree: &[(&str, Option<Zeroizing<Vec<u8>>>)], progress:
 // ---------------------------------------------------------------------------
 // An unlocked vault.
 // ---------------------------------------------------------------------------
-struct Vault {
+pub(crate) struct Vault {
     dir: String,
     key: x25519::Identity,
     /// Held only for its flock, released when this is dropped.
     _lock: Option<File>,
-    progress: Rc<Progress>,
+    pub(crate) progress: Rc<Progress>,
 }
 
 impl Vault {
@@ -545,7 +653,7 @@ impl Vault {
 
     /// `wrap` already holds key.age's wrapped file key, so scrypt (for a password
     /// vault) has run by now. VAULT goes last: its presence marks a complete vault.
-    fn create(dir: &str, mode: &str, wrap: age::Encryptor) -> R<Vault> {
+    pub(crate) fn create(dir: &str, mode: &str, wrap: age::Encryptor) -> R<Vault> {
         let v = Vault { dir: dir.to_string(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default() };
         let populate = || -> R<()> {
             private_dir(dir, true)?;
@@ -702,21 +810,17 @@ impl Vault {
     }
 
     /// Encrypt one source file to a new blob: stage, hash while writing, fsync, rename.
-    fn write_blob(&self, src: &Path) -> R<Entry> {
-        let file = File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
-        let meta = file.metadata().map_err(|e| format!("{}: {e}", src.display()))?;
-        if !meta.is_file() {
-            return Err(format!("{} is no longer a regular file", src.display()));
-        }
+    fn write_blob(&self, source: Box<dyn Read>) -> R<Entry> {
         let mut raw = [0u8; 16];
         rand::rngs::OsRng.fill_bytes(&mut raw);
         let blob = hex(&raw);
         let path = self.blob_path(&blob);
         private_dir(parent_of(&path), true)?;
         let mut sha256 = String::new();
+        let size = Rc::new(Cell::new(0));
         write_atomic(&path, |out| {
             let hashing = HashingWriter { inner: out, hasher: Sha256::new() };
-            let reader = CountingReader { inner: file, progress: self.progress.clone() };
+            let reader = CountingReader { inner: source, progress: self.progress.clone(), count: size.clone() };
             let hashing = self.encrypt_stream(Box::new(reader), hashing)?;
             sha256 = hex(&hashing.hasher.finalize());
             Ok(hashing.inner)
@@ -725,10 +829,15 @@ impl Vault {
         // before the manifest's is.
         sync_dir(parent_of(&path));
         sync_dir(&format!("{}/{BLOBS_DIR}", self.dir));
-        Ok(Entry::File { blob, sha256, size: meta.len() })
+        Ok(Entry::File { blob, sha256, size: size.get() })
     }
 
-    fn add<S: AsRef<str>>(&self, sources: &[S], dest: Option<&str>, replace: bool) -> R<()> {
+    /// Add files and folders from real paths.
+    pub(crate) fn add<S: AsRef<str>>(&self, sources: &[S], dest: Option<&str>, replace: bool) -> R<()> {
+        self.add_from(&PathSources::new(sources), dest, replace)
+    }
+
+    pub(crate) fn add_from(&self, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<()> {
         let old = self.load_manifest()?;
         let added = self.add_to(old.clone(), sources, dest, replace);
         if added.is_err() {
@@ -737,7 +846,7 @@ impl Vault {
         added
     }
 
-    fn add_to<S: AsRef<str>>(&self, mut m: Manifest, sources: &[S], dest: Option<&str>, replace: bool) -> R<()> {
+    fn add_to(&self, mut m: Manifest, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<()> {
         let dest = dest.filter(|d| *d != ROOT_ENTRY);
         if let Some(d) = dest {
             if !valid_vault_path(d) {
@@ -750,17 +859,33 @@ impl Vault {
                 m.entries.entry(folder.to_string()).or_insert(Entry::Dir);
             }
         }
+        let (items, skipped) = sources.plan()?;
         let mut plan = BTreeMap::new();
-        let mut skipped = 0;
-        for src in sources {
-            let src = Path::new(src.as_ref());
-            let name = src.file_name().and_then(|n| n.to_str());
-            let name = name.ok_or_else(|| format!("{}: no usable file name", src.display()))?;
-            let target = dest.map_or(name.to_string(), |d| format!("{d}/{name}"));
-            plan_source(src, &target, &mut plan, &mut skipped)?;
+        for (rel, source) in items {
+            let target = dest.map_or(rel.clone(), |d| format!("{d}/{rel}"));
+            if !valid_vault_path(&target) {
+                return Err(format!("can't store this path in a vault: {target}"));
+            }
+            if plan.insert(target.clone(), source).is_some() {
+                return Err(format!("two sources would both be stored as '{target}'"));
+            }
         }
         if plan.is_empty() {
             return Err("nothing to add: not a regular file or folder".into());
+        }
+        // Every folder a new entry goes in must be a folder, in the vault or among the
+        // sources. The manifest would refuse anything else at commit time, but only
+        // after the blobs were written, and as an internal error.
+        for path in plan.keys() {
+            for folder in ancestors(path) {
+                let is_dir = match plan.get(folder) {
+                    Some(source) => source.is_none(),
+                    None => m.entries.get(folder) == Some(&Entry::Dir),
+                };
+                if !is_dir {
+                    return Err(format!("'{folder}' is not a folder in the vault, so '{path}' can't go in it"));
+                }
+            }
         }
         // Decide everything before writing anything, so a name clash costs nothing.
         for (path, source) in &plan {
@@ -772,12 +897,13 @@ impl Vault {
                 return Err(format!("'{path}': a file can't replace a folder, or a folder a file"));
             }
         }
-        let sizes = plan.values().flatten().map(|src| fs::symlink_metadata(src).map_or(0, |meta| meta.len()));
+        let sizes = plan.values().flatten().map(|index| sources.size(*index));
         self.progress.start(sizes.fold(0, u64::saturating_add));
         for (path, source) in plan {
+            self.progress.check()?;
             let entry = match source {
                 None => Entry::Dir,
-                Some(src) => self.write_blob(&src)?,
+                Some(index) => self.write_blob(sources.open(index)?)?,
             };
             m.entries.insert(path, entry);
         }
@@ -809,7 +935,7 @@ impl Vault {
         self.commit_next(m)
     }
 
-    fn extract(&self, entry: &str, out: &str) -> R<()> {
+    pub(crate) fn extract(&self, entry: &str, out: &str) -> R<()> {
         refuse_out_inside_vault(&self.dir, out)?;
         let m = self.load_manifest()?;
         match m.entries.get(entry) {
@@ -878,8 +1004,7 @@ impl Vault {
     /// `age` tool can open: not a vault, because `self` vaults only open for whoever sealed
     /// them. One file stays that file; anything else becomes a tar archive inside the age
     /// file. Same RAM-only rule as extract: everything verifies before `out` is touched.
-    fn share(&self, entries: &[&str], to: &[&str], out: &str) -> R<()> {
-        refuse_out_inside_vault(&self.dir, out)?;
+    pub(crate) fn share_to(&self, entries: &[&str], to: &[&str], out: &str) -> R<()> {
         let recipients: Vec<x25519::Recipient> = to.iter()
             .map(|r| r.parse().map_err(|e| format!("invalid recipient '{r}': {e}")))
             .collect::<R<_>>()?;
@@ -888,7 +1013,27 @@ impl Vault {
         }
         let encryptor = age::Encryptor::with_recipients(recipients.iter().map(|r| r as &dyn age::Recipient))
             .map_err(|e| format!("preparing encryption: {e}"))?;
+        self.share_with(entries, encryptor, out)
+    }
 
+    /// Share for anyone who knows `password`, rather than for chosen people: the same
+    /// plain age file, encrypted with scrypt at the cost a password vault uses, so
+    /// VaultSend (`share-extract`, `vault-import`, or the Android app) or `age -d` opens
+    /// it. The same floor on the password as a password vault's.
+    pub(crate) fn share_password(&self, entries: &[&str], password: SecretString, out: &str) -> R<()> {
+        if password.expose_secret().chars().count() < MIN_PASSWORD_CHARS {
+            return Err(format!("use a password of at least {MIN_PASSWORD_CHARS} characters"));
+        }
+        let mut recipient = age::scrypt::Recipient::new(password);
+        recipient.set_work_factor(share_work_factor());
+        let encryptor = age::Encryptor::with_recipients(once(&recipient as &dyn age::Recipient))
+            .map_err(|e| format!("preparing encryption: {e}"))?;
+        self.share_with(entries, encryptor, out)
+    }
+
+    /// What both kinds of share have in common, the check on `out` included.
+    fn share_with(&self, entries: &[&str], encryptor: age::Encryptor, out: &str) -> R<()> {
+        refuse_out_inside_vault(&self.dir, out)?;
         let m = self.load_manifest()?;
         let chosen = m.selection(entries)?;
         if chosen.is_empty() {
@@ -929,7 +1074,7 @@ impl Vault {
     }
 
     /// Names and sizes only, never content.
-    fn listing(&self) -> R<String> {
+    pub(crate) fn listing(&self) -> R<String> {
         let m = self.load_manifest()?;
         let mut out = format!("generation {}\n", m.generation);
         for (path, entry) in &m.entries {
@@ -945,7 +1090,7 @@ impl Vault {
     /// The RAM-only rule for every file, discarding the plaintext; stops at the first
     /// failure. Orphans are reported but are no failure: a crash leaves them behind
     /// and the next change removes them.
-    fn check(&self) -> R<String> {
+    pub(crate) fn check(&self) -> R<String> {
         let m = self.load_manifest()?;
         let orphans = self.orphans(&m)?;
         if !orphans.is_empty() {
@@ -968,10 +1113,17 @@ impl Vault {
     }
 }
 
+/// scrypt cost of a password share: a password vault's, which is also the most that
+/// opening one allows (shared.rs). Tests use less, so they stay fast; the work factor
+/// is in the file, so either opens the same way.
+fn share_work_factor() -> u8 {
+    if cfg!(test) { 10 } else { SCRYPT_LOG_N }
+}
+
 // ---------------------------------------------------------------------------
 // Commands.
 // ---------------------------------------------------------------------------
-struct Opts<'a> {
+pub(crate) struct Opts<'a> {
     pairs: Vec<(&'a str, &'a str)>,
     replace: bool,
     everything: bool,
@@ -980,14 +1132,15 @@ struct Opts<'a> {
 /// Strict "--name value" pairs, unlike the scanning helpers in main.rs, because
 /// values here can be names out of a vault: a folder called "--replace" must not
 /// read as the flag.
-fn parse_opts(args: &[String]) -> R<Opts<'_>> {
+pub(crate) fn parse_opts(args: &[String]) -> R<Opts<'_>> {
     let mut o = Opts { pairs: Vec::new(), replace: false, everything: false };
     let mut it = args.iter().map(String::as_str);
     while let Some(name) = it.next() {
         match name {
             "--replace" => o.replace = true,
             "--all" => o.everything = true,
-            "--dir" | "--mode" | "--pass-fd" | "--progress-fd" | "--src" | "--dest" | "--entry" | "--out" | "--to" => {
+            "--dir" | "--mode" | "--pass-fd" | "--progress-fd" | "--src" | "--dest" | "--entry" | "--out" | "--to"
+            | "--share-pass-fd" | "--id-pass-fd" | "--in" | "--name" => {
                 o.pairs.push((name, it.next().ok_or_else(|| format!("{name} needs a value"))?))
             }
             other => return Err(format!("unknown option '{other}'")),
@@ -997,17 +1150,29 @@ fn parse_opts(args: &[String]) -> R<Opts<'_>> {
 }
 
 impl<'a> Opts<'a> {
-    fn all(&self, name: &str) -> Vec<&'a str> {
+    pub(crate) fn all(&self, name: &str) -> Vec<&'a str> {
         self.pairs.iter().filter(|(n, _)| *n == name).map(|(_, v)| *v).collect()
     }
-    fn get(&self, name: &str) -> Option<&'a str> {
+    pub(crate) fn get(&self, name: &str) -> Option<&'a str> {
         self.all(name).first().copied()
     }
-    fn need(&self, name: &str) -> R<&'a str> {
+    pub(crate) fn need(&self, name: &str) -> R<&'a str> {
         self.get(name).ok_or_else(|| format!("{name} is required"))
     }
     fn pass_fd(&self) -> R<i32> {
-        self.need("--pass-fd")?.parse().map_err(|_| "--pass-fd must be a number".to_string())
+        self.fd("--pass-fd")?.ok_or_else(|| "--pass-fd is required".to_string())
+    }
+    /// A file descriptor option, if given.
+    pub(crate) fn fd(&self, name: &str) -> R<Option<i32>> {
+        self.get(name).map(|v| v.parse().map_err(|_| format!("{name} must be a number"))).transpose()
+    }
+    /// The --progress-fd pipe if given, answering Cancel from main.rs's signal flag.
+    pub(crate) fn progress(&self) -> R<Progress> {
+        let progress = match self.fd("--progress-fd")? {
+            Some(fd) => Progress::to_fd(fd)?,
+            None => Progress::default(),
+        };
+        Ok(progress.with_cancel(crate::terminated))
     }
     fn entries(&self) -> R<Vec<&'a str>> {
         self.need("--entry")?;
@@ -1042,7 +1207,7 @@ fn cmd_create(dir: &str, o: &Opts) -> R<()> {
     Vault::create(dir, mode, wrap).map(|_| ())
 }
 
-fn print_out(text: &str) -> R<()> {
+pub(crate) fn print_out(text: &str) -> R<()> {
     let mut stdout = io::stdout();
     stdout.write_all(text.as_bytes()).and_then(|_| stdout.flush()).map_err(|e| format!("writing output: {e}"))
 }
@@ -1052,10 +1217,7 @@ pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
     let dir = o.need("--dir")?;
     let open = |exclusive| -> R<Vault> {
         let mut vault = Vault::open(dir, o.pass_fd()?, exclusive)?;
-        if let Some(fd) = o.get("--progress-fd") {
-            let fd = fd.parse().map_err(|_| "--progress-fd must be a number".to_string())?;
-            vault.progress = Rc::new(Progress::to_fd(fd)?);
-        }
+        vault.progress = Rc::new(o.progress()?);
         Ok(vault)
     };
     match cmd {
@@ -1068,7 +1230,22 @@ pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
             [one] => open(false)?.extract(one, o.need("--out")?),
             ref many => open(false)?.extract_many(many, o.need("--out")?),
         },
-        "vault-share" => open(false)?.share(&o.entries()?, &o.all("--to"), o.need("--out")?),
+        "vault-share" => {
+            let v = open(false)?;
+            match o.fd("--share-pass-fd")? {
+                Some(_) if o.get("--to").is_some() => Err("give --to or --share-pass-fd, not both".into()),
+                Some(fd) => v.share_password(&o.entries()?, read_passphrase(fd)?, o.need("--out")?),
+                None => v.share_to(&o.entries()?, &o.all("--to"), o.need("--out")?),
+            }
+        }
+        "vault-import" => {
+            let v = open(true)?;
+            let skipped = crate::shared::import_cli(&v, &o)?;
+            if skipped > 0 {
+                eprintln!("warning: skipped {skipped} item(s) that are not regular files or folders");
+            }
+            Ok(())
+        }
         "vault-check" => print_out(&open(false)?.check()?),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -1580,6 +1757,44 @@ mod tests {
         assert!(v.load_manifest().unwrap().entries.contains_key("f.txt"));
     }
 
+    /// Sources listed in any order, missing a folder, or putting a file inside a file.
+    struct Listed(Vec<(String, Option<usize>)>);
+
+    impl Sources for Listed {
+        fn plan(&self) -> R<Plan> {
+            Ok((self.0.clone(), 0))
+        }
+        fn open(&self, _: usize) -> R<Box<dyn Read>> {
+            Ok(Box::new(Cursor::new(b"data".to_vec())))
+        }
+        fn size(&self, _: usize) -> u64 {
+            4
+        }
+    }
+
+    #[test]
+    fn sources_must_bring_the_folders_they_go_in() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        let blobs = || fs::read_dir(t.path("v.vsvault/blobs")).unwrap().count();
+        let before = blobs();
+        let missing = Listed(vec![("a/b.txt".into(), Some(0))]);
+        let err = v.add_from(&missing, None, false).unwrap_err();
+        assert!(err.contains("'a' is not a folder"), "{err}");
+        let in_a_file = Listed(vec![("f".into(), Some(0)), ("f/x".into(), Some(1))]);
+        assert!(v.add_from(&in_a_file, None, false).unwrap_err().contains("'f' is not a folder"));
+        assert_eq!((generation(&v), blobs()), (0, before), "nothing written");
+        // A folder already in the vault will do, and so will one among the sources.
+        v.add_from(&Listed(vec![("a".into(), None), ("a/b.txt".into(), Some(0))]), None, false).unwrap();
+        v.add_from(&Listed(vec![("a/c.txt".into(), Some(0))]), None, false).unwrap();
+        assert!(v.listing().unwrap().ends_with("D a\nF 4 a/b.txt\nF 4 a/c.txt\n"));
+        // Into a file already in the vault, under --dest or not: refused before any blob.
+        let blobs_now = blobs();
+        let into_file = Listed(vec![("a/b.txt/x".into(), Some(0))]);
+        assert!(v.add_from(&into_file, None, false).unwrap_err().contains("'a/b.txt' is not a folder"));
+        assert_eq!((generation(&v), blobs()), (2, blobs_now), "nothing written");
+    }
+
     #[test]
     fn add_skips_specials_and_never_touches_sources() {
         let t = TempDir::new();
@@ -1935,7 +2150,7 @@ mod tests {
         let v = tree_vault(&t);
         let (friend, stranger) = (x25519::Identity::generate(), x25519::Identity::generate());
         let out = t.path("top.txt.age");
-        v.share(&["top.txt"], &[&friend.to_public().to_string()], &out).unwrap();
+        v.share_to(&["top.txt"], &[&friend.to_public().to_string()], &out).unwrap();
         assert_eq!(decrypt_as(&friend, &out), b"top");
         let data = fs::read(&out).unwrap();
         let dec = age::Decryptor::new(&data[..]).unwrap();
@@ -1954,7 +2169,7 @@ mod tests {
         let v = tree_vault(&t);
         let friend = x25519::Identity::generate();
         let out = t.path("many.tar.age");
-        v.share(&["a/sub", "top.txt"], &[&friend.to_public().to_string()], &out).unwrap();
+        v.share_to(&["a/sub", "top.txt"], &[&friend.to_public().to_string()], &out).unwrap();
         let tar = decrypt_as(&friend, &out);
         assert_eq!(tar.len() % 512, 0);
         assert!(tar.ends_with(&[0; 1024]));
@@ -1971,15 +2186,68 @@ mod tests {
         let v = tree_vault(&t);
         let friend = x25519::Identity::generate().to_public().to_string();
         let out = t.path("out.age");
-        assert!(v.share(&["top.txt"], &[], &out).unwrap_err().contains("--to"));
-        assert!(v.share(&["top.txt"], &["age1nonsense"], &out).unwrap_err().contains("invalid recipient"));
-        assert!(v.share(&["nope"], &[&friend], &out).unwrap_err().contains("not in the vault"));
-        assert!(v.share(&["top.txt"], &[&friend], &format!("{}/x.age", v.dir)).unwrap_err().contains("inside the vault"));
+        assert!(v.share_to(&["top.txt"], &[], &out).unwrap_err().contains("--to"));
+        assert!(v.share_to(&["top.txt"], &["age1nonsense"], &out).unwrap_err().contains("invalid recipient"));
+        assert!(v.share_to(&["nope"], &[&friend], &out).unwrap_err().contains("not in the vault"));
+        assert!(v.share_to(&["top.txt"], &[&friend], &format!("{}/x.age", v.dir)).unwrap_err().contains("inside the vault"));
         fs::write(blob_of(&v, "a/2.txt"), b"tampered").unwrap();
-        assert!(v.share(&[ROOT_ENTRY], &[&friend], &out).unwrap_err().contains("failed verification"));
+        assert!(v.share_to(&[ROOT_ENTRY], &[&friend], &out).unwrap_err().contains("failed verification"));
         assert_nothing_written(&out);
         v.remove_everything().unwrap();
-        assert!(v.share(&[ROOT_ENTRY], &[&friend], &out).unwrap_err().contains("nothing"));
+        assert!(v.share_to(&[ROOT_ENTRY], &[&friend], &out).unwrap_err().contains("nothing"));
+    }
+
+    fn secret(s: &str) -> SecretString {
+        SecretString::from(s.to_string())
+    }
+
+    /// A password share is the same plain age file, made with scrypt: the `age` tool or
+    /// any VaultSend opens it. The checks share_to has apply to it too.
+    #[test]
+    fn a_password_share_has_the_vault_password_rules() {
+        let t = TempDir::new();
+        let v = tree_vault(&t);
+        let out = t.path("out.age");
+        let err = v.share_password(&["top.txt"], secret("too short"), &out).unwrap_err();
+        assert!(err.contains("at least 10"), "{err}");
+        let inside = format!("{}/x.age", v.dir);
+        let err = v.share_password(&["top.txt"], secret(VAULT_PASS), &inside).unwrap_err();
+        assert!(err.contains("inside the vault"), "{err}");
+        assert_nothing_written(&inside);
+        assert!(v.share_password(&["nope"], secret(VAULT_PASS), &out).unwrap_err().contains("not in the vault"));
+        assert_nothing_written(&out);
+
+        v.share_password(&["top.txt"], secret(VAULT_PASS), &out).unwrap();
+        let data = fs::read(&out).unwrap();
+        assert!(data.windows(9).any(|w| w == b"-> scrypt") && !data.windows(9).any(|w| w == b"-> X25519"));
+        let dec = age::Decryptor::new(&data[..]).unwrap();
+        let id = age::scrypt::Identity::new(secret(VAULT_PASS));
+        let mut plain = Vec::new();
+        dec.decrypt(once(&id as &dyn age::Identity)).unwrap().read_to_end(&mut plain).unwrap();
+        assert_eq!(plain, fs::read(t.path("src/top.txt")).unwrap());
+
+        // Through the CLI: --share-pass-fd, and never with --to as well.
+        let dir = t.path("cli.vsvault");
+        run("vault-create", &args(&["--dir", &dir, "--mode", "password", "--pass-fd", &pass_fd(VAULT_PASS).to_string()])).unwrap();
+        let fd = || pass_fd(VAULT_PASS).to_string();
+        run("vault-add", &args(&["--dir", &dir, "--pass-fd", &fd(), "--src", &t.path("src/top.txt")])).unwrap();
+        let cli_out = t.path("cli.age");
+        let share = |extra: &[&str]| {
+            let mut a = vec!["--dir".to_string(), dir.clone(), "--pass-fd".into(), fd(), "--entry".into(), "top.txt".into(), "--out".into(), cli_out.clone()];
+            a.extend(extra.iter().map(|s| s.to_string()));
+            run("vault-share", &a)
+        };
+        let err = share(&["--share-pass-fd", &pass_fd("a share password").to_string(), "--to", "age1x"]).unwrap_err();
+        assert!(err.contains("not both"), "{err}");
+        let err = share(&["--share-pass-fd", &pass_fd("short").to_string()]).unwrap_err();
+        assert!(err.contains("at least 10"), "{err}");
+        assert_nothing_written(&cli_out);
+        share(&["--share-pass-fd", &pass_fd("a share password\n").to_string()]).unwrap();
+        let dec = age::Decryptor::new(File::open(&cli_out).unwrap()).unwrap();
+        let id = age::scrypt::Identity::new(secret("a share password"));
+        let mut plain = Vec::new();
+        dec.decrypt(once(&id as &dyn age::Identity)).unwrap().read_to_end(&mut plain).unwrap();
+        assert_eq!(plain, b"top");
     }
 
     #[test]

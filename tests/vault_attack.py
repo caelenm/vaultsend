@@ -1316,9 +1316,257 @@ def section_scale():
 
 
 # ---------------------------------------------------------------------------------------
+SHARE_PASS = "attack share password"
+STAGING = Path(ENV["XDG_DATA_HOME"]) / "vaultsend" / "staging"
+
+
+def with_pipes(argv, secrets, popen=False):
+    """Run the backend with each of `secrets` ({"--pass-fd": text, ...}) on its own pipe."""
+    cmd = [BIN, *map(str, argv)]
+    fds = []
+    for option, text in secrets.items():
+        r, w = os.pipe()
+        os.write(w, text.encode())
+        os.close(w)
+        cmd += [option, str(r)]
+        fds.append(r)
+    try:
+        if popen:
+            return subprocess.Popen(cmd, pass_fds=fds, env=ENV, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, errors="replace")
+        return subprocess.run(cmd, pass_fds=fds, env=ENV, capture_output=True, text=True, timeout=300, errors="replace")
+    finally:
+        for fd in fds:
+            os.close(fd)
+
+
+def staged_left():
+    return sorted(n for n in os.listdir(STAGING) if n != ".lock") if STAGING.exists() else []
+
+
+def tar_entry(name, data=b"", kind=b"0", link=b"", size=None, prefix=b""):
+    h = bytearray(512)
+    h[: len(name)] = name
+    h[100:108] = b"0000644\0"
+    h[124:136] = b"%011o\0" % (len(data) if size is None else size)
+    h[345 : 345 + len(prefix)] = prefix
+    h[156:157] = kind
+    h[157 : 157 + len(link)] = link
+    h[257:263] = b"ustar\0"
+    h[148:156] = b" " * 8
+    h[148:156] = b"%06o\0 " % sum(h)
+    return bytes(h) + data + bytes(-len(data) % 512)
+
+
+def fake_costly_share(log_n):
+    """A password share whose header asks for scrypt 2^log_n. The wrapped key is junk:
+    a backend that honours its limit refuses before running scrypt at all."""
+    stanza = f"-> scrypt {b64(os.urandom(16))} {log_n}\n{b64(os.urandom(32))}\n"
+    header = "age-encryption.org/v1\n" + stanza + "---"
+    return f"{header} {b64(os.urandom(32))}\n".encode() + os.urandom(16) + os.urandom(64)
+
+
+def section_shares():
+    print("== receiving a share: hostile archives, scrypt limits, and kills while unpacking or importing", flush=True)
+    v = new_vault("shares.vsvault")
+    tree = make_files(T / "share-src" / "tree", 40, 256 * 1024)
+    (tree / "big.bin").write_bytes(os.urandom(16 * 1024 * 1024))
+    (tree / "deep" / "er").mkdir(parents=True)
+    (tree / "deep" / "er" / "x.txt").write_bytes(b"deep")
+    assert backend("vault-add", "--dir", v, "--src", tree, secret=ID_PASS).returncode == 0
+    share = T / "tree.tar.age"
+    r = with_pipes(["vault-share", "--dir", v, "--entry", "/", "--out", share], {"--pass-fd": ID_PASS, "--share-pass-fd": SHARE_PASS})
+    check(r.returncode == 0 and share.exists(), "vault-share --share-pass-fd makes a password share", r.stderr[:200])
+    r = with_pipes(["vault-share", "--dir", v, "--entry", "/", "--out", v / "inside.age"], {"--pass-fd": ID_PASS, "--share-pass-fd": SHARE_PASS})
+    check(clean_failure(r) and "inside the vault" in r.stderr and not (v / "inside.age").exists(), "a password share is refused inside the vault too", r.stderr[:200])
+    r = with_pipes(["vault-share", "--dir", v, "--entry", "/", "--out", T / "short.age"], {"--pass-fd": ID_PASS, "--share-pass-fd": "short"})
+    check(clean_failure(r) and "at least 10" in r.stderr, "and needs a password as long as a vault's", r.stderr[:200])
+
+    r = backend("share-kind", "--in", share)
+    check(r.returncode == 0 and r.stdout == "password", "share-kind says a password share needs a password", r.stdout + r.stderr)
+    pub = backend("pubkey").stdout
+    key_share = T / "key.age"
+    r = backend("vault-share", "--dir", v, "--entry", "tree/deep", "--to", pub, "--out", key_share, secret=ID_PASS)
+    assert r.returncode == 0, r.stderr
+    check(backend("share-kind", "--in", key_share).stdout == "key", "and a key share needs a key")
+    r = with_pipes(["share-check", "--in", share], {"--share-pass-fd": "not the share password"})
+    check(clean_failure(r) and "wrong password" in r.stderr, "share-check: a wrong password is said at once", r.stderr[:200])
+    check(with_pipes(["share-check", "--in", share], {"--share-pass-fd": SHARE_PASS}).returncode == 0, "and the right one passes")
+
+    # The scrypt limit: 2^18 for a share, whatever the header asks; refused before scrypt runs.
+    for log_n in (19, 22, 40):
+        costly = T / f"costly-{log_n}.age"
+        costly.write_bytes(fake_costly_share(log_n))
+        began = time.monotonic()
+        r = with_pipes(["share-extract", "--in", costly, "--out", T / f"costly-{log_n}"], {"--share-pass-fd": SHARE_PASS})
+        check(clean_failure(r) and "more work" in r.stderr and time.monotonic() - began < 5 and not (T / f"costly-{log_n}").exists(),
+              f"a share asking for scrypt 2^{log_n} is refused without running it", r.stderr[:200])
+    r = with_pipes(["share-check", "--in", T / "costly-19.age"], {"--share-pass-fd": SHARE_PASS})
+    check(clean_failure(r) and "more work" in r.stderr, "share-check too", r.stderr[:200])
+
+    # Interop: what the backend saves is what age decrypts, byte for byte.
+    saved = T / "saved.tar"
+    r = with_pipes(["share-decrypt", "--in", share, "--out", saved], {"--share-pass-fd": SHARE_PASS})
+    check(r.returncode == 0 and saved.exists(), "share-decrypt saves a password share as it is", r.stderr[:200])
+    if AGE:
+        same = age_decrypt_scrypt(share, SHARE_PASS) == saved.read_bytes()
+        check(same, "age -d opens the password share to the same bytes")
+    r = backend("share-decrypt", "--in", key_share, "--out", T / "key.tar", secret=ID_PASS)
+    check(r.returncode == 0, "share-decrypt opens a key share with the identity passphrase", r.stderr[:200])
+    want = tree_state(tree)
+
+    out = T / "unpacked"
+    began = time.monotonic()
+    r = with_pipes(["share-extract", "--in", share, "--out", out], {"--share-pass-fd": SHARE_PASS})
+    full = time.monotonic() - began
+    check(r.returncode == 0 and tree_state(out / "tree") == want, f"share-extract unpacks it whole ({full:.2f}s)", r.stderr[:200])
+    check(staged_left() == [] and not leftovers(T), "and leaves no staging and no partial folder", staged_left())
+    r = with_pipes(["share-extract", "--in", share, "--out", out], {"--share-pass-fd": SHARE_PASS})
+    check(clean_failure(r) and "already exists" in r.stderr and tree_state(out / "tree") == want, "never over an existing folder", r.stderr[:200])
+    shutil.rmtree(out)
+
+    # Import into a fresh vault: the same tree, verified.
+    iv = new_vault("import.vsvault", "password", VAULT_PASS)
+    r = with_pipes(["vault-import", "--dir", iv, "--in", share], {"--pass-fd": VAULT_PASS, "--share-pass-fd": SHARE_PASS})
+    check(r.returncode == 0 and generation(iv, VAULT_PASS) == 1, "vault-import adds a password share in one change", r.stderr[:200])
+    got = T / "import-check"
+    backend("vault-extract", "--dir", iv, "--entry", "tree", "--out", got, secret=VAULT_PASS)
+    check(tree_state(got) == want and staged_left() == [], "with every file as it was, and no staging left", staged_left())
+    shutil.rmtree(got)
+    r = with_pipes(["vault-import", "--dir", iv, "--in", key_share, "--dest", "from-key"], {"--pass-fd": VAULT_PASS, "--id-pass-fd": ID_PASS})
+    check(r.returncode == 0 and "D from-key/tree/deep/er\n" in backend("vault-list", "--dir", iv, secret=VAULT_PASS).stdout, "and a key share, with --id-pass-fd", r.stderr[:200])
+
+    # Killed partway. SIGTERM (the frontend's Cancel) cleans up at once; SIGKILL can't,
+    # and the next run sweeps the staging. Either way the folder is absent or complete.
+    random.seed(20261106)
+    rounds = max(4, args.rounds // 4)
+    term_ok = kill_ok = True
+    for n in range(rounds):
+        for how in ("TERM", "KILL"):
+            dest = T / f"kill-{how}-{n}"
+            p = with_pipes(["share-extract", "--in", share, "--out", dest], {"--share-pass-fd": SHARE_PASS}, popen=True)
+            time.sleep(random.uniform(0.05, full * 1.1))
+            p.send_signal(signal.SIGTERM if how == "TERM" else signal.SIGKILL)
+            _, err = p.communicate(timeout=60)
+            complete = dest.exists() and tree_state(dest / "tree") == want
+            absent = not dest.exists()
+            part = Path(str(dest) + PART).exists()
+            if how == "TERM":
+                ok = (complete and p.returncode == 0) or (absent and not part and "cancelled" in err and p.returncode == 1)
+                ok = ok and staged_left() == []
+                if not ok:
+                    term_ok = False
+                    print(f"      TERM round {n}: rc={p.returncode} complete={complete} part={part} staged={staged_left()} {err[:160]}", flush=True)
+            else:
+                ok = complete or absent
+                # The next run, to the same name, clears both leftovers.
+                if absent:
+                    r = with_pipes(["share-extract", "--in", share, "--out", dest], {"--share-pass-fd": SHARE_PASS})
+                    ok = ok and r.returncode == 0 and tree_state(dest / "tree") == want
+                ok = ok and staged_left() == [] and not Path(str(dest) + PART).exists()
+                if not ok:
+                    kill_ok = False
+                    print(f"      KILL round {n}: complete={complete} absent={absent} staged={staged_left()}", flush=True)
+            shutil.rmtree(dest, ignore_errors=True)
+    check(term_ok, f"share-extract stopped by SIGTERM {rounds} times: cancelled, with no folder, no partial folder and no staging; or done")
+    check(kill_ok, f"share-extract killed -9 {rounds} times: folder absent or complete, and the next run clears the partial folder and the staging")
+
+    term_ok = kill_ok = True
+    for n in range(rounds):
+        for how in ("TERM", "KILL"):
+            target = new_vault(f"kill-import-{how}-{n}.vsvault")
+            p = with_pipes(["vault-import", "--dir", target, "--in", share], {"--pass-fd": ID_PASS, "--share-pass-fd": SHARE_PASS}, popen=True)
+            time.sleep(random.uniform(0.3, full * 1.5))
+            p.send_signal(signal.SIGTERM if how == "TERM" else signal.SIGKILL)
+            _, err = p.communicate(timeout=60)
+            gen = generation(target)
+            chk = backend("vault-check", "--dir", target, secret=ID_PASS)
+            ok = chk.returncode == 0 and gen in (0, 1)
+            if gen == 1:
+                got = T / f"kill-import-out-{how}-{n}"
+                backend("vault-extract", "--dir", target, "--entry", "tree", "--out", got, secret=ID_PASS)
+                ok = ok and tree_state(got) == want
+                shutil.rmtree(got, ignore_errors=True)
+            if how == "TERM":
+                ok = ok and staged_left() == [] and (gen == 1 or ("cancelled" in err and "orphan" not in chk.stdout))
+                term_ok = term_ok and ok
+            else:
+                # The next change collects the killed run's blobs; the next staging run sweeps.
+                assert backend("vault-add", "--dir", target, "--src", make_files(T / f"after-{n}", 1), secret=ID_PASS).returncode == 0
+                with_pipes(["share-check", "--in", share], {"--share-pass-fd": SHARE_PASS})
+                with_pipes(["share-decrypt", "--in", key_share, "--out", T / "sweep.tar"], {"--pass-fd": ID_PASS})
+                chk = backend("vault-check", "--dir", target, secret=ID_PASS)
+                ok = ok and staged_left() == [] and "orphan" not in chk.stdout
+                kill_ok = kill_ok and ok
+            if not ok:
+                print(f"      {how} import round {n}: gen={gen} staged={staged_left()} {err[:160]} {chk.stdout[-120:]}", flush=True)
+            shutil.rmtree(target, ignore_errors=True)
+    check(term_ok, f"vault-import stopped by SIGTERM {rounds} times: generation 0 with no blobs and no staging, or the whole import")
+    check(kill_ok, f"vault-import killed -9 {rounds} times: generation 0 or the whole import; the next change and the next run clear the rest")
+
+    # Hostile archives, encrypted to this user's key by the backend itself (so any size
+    # is a proper age file), and opened with the identity passphrase.
+    end = bytes(1024)
+    good = tar_entry(b"ok.txt", b"fine")
+    cases = {
+        "dot-dot": tar_entry(b"../escape.txt", b"x") + end,
+        "deep dot-dot": tar_entry(b"a/../../escape.txt", b"x") + end,
+        "absolute": tar_entry(b"/tmp/vs-abs-escape.txt", b"x") + end,
+        "drive": tar_entry(b"C:escape.txt", b"x") + end,
+        "backslash": tar_entry(b"a\\..\\escape.txt", b"x") + end,
+        "prefix dot-dot": tar_entry(b"evil", b"x", prefix=b"..") + end,
+        "duplicate": tar_entry(b"same", b"1") + tar_entry(b"same", b"2") + end,
+        "file then inside it": tar_entry(b"f", b"1") + tar_entry(b"f/x", b"2") + end,
+        "size beyond the end": tar_entry(b"liar", b"x", size=1 << 30) + end,
+        "truncated": (good * 3)[:900],
+        "bad checksum": bytes([good[0] ^ 1]) + good[1:] + end,
+        "huge pax": tar_entry(b"PaxHeaders/x", b"x" * 70000, b"x") + good + end,
+    }
+    # A file whose first block isn't a tar header is one file, not an archive: extract
+    # refuses it, and import adds it whole under --name, as on Android.
+    not_tar = {"truncated", "bad checksum"}
+    refused_ok = True
+    for name, plain in cases.items():
+        f, raw = T / "hostile.age", T / "hostile.tar"
+        raw.write_bytes(plain)
+        assert backend("encrypt", "-r", pub, "--in", raw, "--out", f).returncode == 0
+        dest = T / "hostile-out"
+        r = with_pipes(["share-extract", "--in", f, "--out", dest], {"--pass-fd": ID_PASS})
+        hv = new_vault(f"hostile-{len(name)}-{os.urandom(2).hex()}.vsvault")
+        ri = with_pipes(["vault-import", "--dir", hv, "--in", f, "--name", "x"], {"--pass-fd": ID_PASS, "--id-pass-fd": ID_PASS})
+        ok = clean_failure(r) and not dest.exists() and not leftovers(T) and staged_left() == []
+        if name in not_tar:
+            listing = backend("vault-list", "--dir", hv, secret=ID_PASS).stdout
+            ok = ok and ri.returncode == 0 and listing == f"generation 1\nF {len(plain)} x\n"
+        else:
+            ok = ok and clean_failure(ri) and generation(hv) == 0
+        if not ok:
+            refused_ok = False
+            print(f"      {name}: extract rc={r.returncode} {r.stderr[:120]} | import rc={ri.returncode} {ri.stderr[:120]}", flush=True)
+        shutil.rmtree(dest, ignore_errors=True)
+        shutil.rmtree(hv, ignore_errors=True)
+    escaped = [p for p in (T / "escape.txt", Path("/tmp/vs-abs-escape.txt"), T.parent / "escape.txt") if p.exists()]
+    check(refused_ok and not escaped, f"{len(cases)} hostile archives refused by share-extract and vault-import, writing nothing ({len(not_tar)} not archives at all: imported as one file)", escaped)
+
+    # Links, devices and FIFOs are skipped and never made; the rest arrives. This one is
+    # sealed with the password in Python, as any age implementation would.
+    plain = (tar_entry(b"link", kind=b"2", link=b"/etc") + tar_entry(b"link/passwd", b"plain file")
+             + tar_entry(b"hard", kind=b"1", link=b"/etc/passwd") + tar_entry(b"dev", kind=b"3")
+             + tar_entry(b"fifo", kind=b"6") + good + end)
+    f = T / "links.age"
+    f.write_bytes(sealed_with(SHARE_PASS, plain))
+    dest = T / "links-out"
+    r = with_pipes(["share-extract", "--in", f, "--out", dest], {"--share-pass-fd": SHARE_PASS})
+    kinds = {p.name: ("link" if p.is_symlink() else "dir" if p.is_dir() else "file" if p.is_file() else "other") for p in dest.rglob("*")} if dest.exists() else {}
+    check(r.returncode == 0 and "skipped 4" in r.stderr and kinds == {"link": "dir", "passwd": "file", "ok.txt": "file"},
+          "links, hard links, devices and FIFOs are skipped, and never made", f"{kinds} {r.stderr[:160]}")
+    check(Path("/etc/passwd").read_bytes() != b"plain file", "nothing was written through the link")
+
+
+# ---------------------------------------------------------------------------------------
 SECTIONS = {
     "crash": section_crash, "race": section_race, "traps": section_traps, "fuzz": section_fuzz,
     "hardening": section_hardening, "leaks": section_leaks, "format": section_format, "seal": section_seal, "scale": section_scale,
+    "shares": section_shares,
 }
 
 

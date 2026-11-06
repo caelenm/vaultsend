@@ -229,6 +229,39 @@ class Selection(unittest.TestCase):
         self.assertEqual(name(app.ROOT_ENTRY), "V.tar.age")
         self.assertEqual(name("a/1.txt", "ab.txt"), "V selection.tar.age")
 
+    def test_receiving_a_share_suggests_names_that_round_trip(self):
+        # What Share names a share comes back as what was shared.
+        for selection, unpacked in ((("a/b",), "b"), ((app.ROOT_ENTRY,), "V"), (("a/1.txt",), "1.txt")):
+            shared = app.share_file_name("V", selection, self.ENTRIES)
+            self.assertEqual(app.unpacked_name(shared), unpacked)
+        self.assertEqual(app.saved_name("b.tar.age"), "b.tar")
+        self.assertEqual(app.saved_name("1.txt.age"), "1.txt")
+        self.assertEqual(app.unpacked_name("renamed"), "renamed decrypted")
+        self.assertEqual(app.saved_name("renamed"), "renamed decrypted")
+        for name in (".age", ".tar.age"):  # nothing left once the suffix comes off
+            self.assertNotEqual(app.unpacked_name(name), "")
+            self.assertNotEqual(app.saved_name(name), "")
+
+    def test_a_free_name_never_replaces_anything(self):
+        folder = tempfile.mkdtemp(dir=ROOT)
+        self.assertEqual(app.free_name(folder, "Photos"), "Photos")
+        os.mkdir(os.path.join(folder, "Photos"))
+        self.assertEqual(app.free_name(folder, "Photos"), "Photos (2)")
+        Path(folder, "a.txt").write_text("x")
+        Path(folder, "a (2).txt").write_text("x")
+        self.assertEqual(app.free_name(folder, "a.txt"), "a (3).txt")
+        os.symlink("/nonexistent", os.path.join(folder, "dangling"))  # a broken link is still taken
+        self.assertEqual(app.free_name(folder, "dangling"), "dangling (2)")
+        Path(folder, ".age").write_text("x")
+        self.assertEqual(app.free_name(folder, ".age"), ".age (2)")
+
+    def test_what_decrypt_offers_for_a_share(self):
+        self.assertEqual(app.share_actions("password", "b.tar.age"), ["unpack", "save", "import"])
+        self.assertEqual(app.share_actions("key", "b.tar.age"), ["unpack", "save", "import"])
+        self.assertEqual(app.share_actions("password", "1.txt.age"), ["save", "import"])
+        # One file for your key: the plain decrypt, as before.
+        self.assertEqual(app.share_actions("key", "1.txt.age"), [])
+
     def test_vault_name_from_path(self):
         self.assertEqual(app.vault_name_from_path("/x/My Vault.vsvault"), "My Vault")
         self.assertEqual(app.vault_name_from_path("/x/My Vault.vsvault/"), "My Vault")

@@ -25,8 +25,9 @@ are two parts and a hard line between them:
 - **`backend/`** — a tiny Rust command-line tool. It is the **only** component
   that ever touches your private key. All cryptography is delegated to the `age`
   crate; the backend itself contains no hand-written crypto, just plumbing and
-  process hardening (~515 lines in `main.rs`, ~1,050 more in `vault.rs` for vaults,
-  and 75 in `tar.rs` for sharing folders, plus those files' tests).
+  process hardening (~590 lines in `main.rs`, ~1,250 more in `vault.rs` for vaults,
+  ~370 in `tar.rs` for writing and reading shared folders, and ~570 in `shared.rs`
+  for opening what someone shared, plus those files' tests).
 - **`frontend/`** — a GTK 4 / libadwaita app in Python. It draws the window and
   keeps your contact list. It **never sees your private key** — when a passphrase
   is needed it hands it to the backend over a private pipe and forgets it (unless
@@ -293,7 +294,14 @@ vaultsend-backend vault-remove  --dir P --pass-fd N --entry VAULTPATH [--entry V
 vaultsend-backend vault-remove  --dir P --pass-fd N --all             # empty the vault, keep the vault
 vaultsend-backend vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH   # "/" is the whole vault
 vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH
+vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --share-pass-fd M --out PATH   # for a password
 vaultsend-backend vault-check   --dir P --pass-fd N                   # verify every file in RAM
+vaultsend-backend vault-import  --dir P --pass-fd N (--id-pass-fd M | --share-pass-fd M) [--in PATH] [--name NAME] [--dest VAULTDIR]
+
+vaultsend-backend share-kind    [--in PATH]                           # password | key
+vaultsend-backend share-check   --share-pass-fd N [--in PATH]         # is this the password?
+vaultsend-backend share-decrypt (--pass-fd N | --share-pass-fd N) [--in PATH] --out PATH     # save as it is
+vaultsend-backend share-extract (--pass-fd N | --share-pass-fd N) [--in PATH] --out NEWDIR   # unpack an archive
 ```
 
 Any vault command that opens a vault also takes `--progress-fd N`: whole percentages, one
@@ -302,6 +310,26 @@ dropped rather than waited on, so give it a non-blocking pipe.
 
 `vault-share` writes an ordinary age file, readable with `vaultsend-backend decrypt` or the
 `age` tool. A single file stays that file; anything else is a tar archive inside the age file.
+With `--share-pass-fd` it is encrypted to a password instead of to people (scrypt at 2^18, and
+at least 10 characters, as for a password vault), as the Android app's password shares are.
+
+The `share-*` commands and `vault-import` open such a file, from this app or from Android.
+`--pass-fd` (or `--id-pass-fd` for `vault-import`, where `--pass-fd` unlocks the vault) is
+your passphrase, for a share made for you; `--share-pass-fd` is a share's password. Opening a
+password share allows scrypt up to 2^18, what VaultSend makes, and refuses a file asking for
+more before running it (your own `identity.age` still opens up to 2^22). An archive is read
+as hostile input: names that could leave the folder (`..`, absolute paths, drive prefixes,
+backslashes, NUL) are refused; links, devices and FIFOs are skipped and never created; at most
+100,000 entries and 32 GB, and every declared size is checked against the file. Everything is
+decrypted to a private staging folder (`~/.local/share/vaultsend/staging`, `0700`) and
+authenticated before any of it is used. `share-extract` builds the whole tree there, then
+copies it to `NEWDIR.vaultsend-part` and renames it last; `vault-import` commits once at the
+end. So an archive that fails anywhere writes nothing to your folder or vault. Both treat
+SIGTERM as Cancel and clean up; after a SIGKILL, the next run removes the staging.
+
+In the window: **Share…** can share with a password instead of a contact, and dropping a
+share on the main page and choosing **Decrypt** offers to **Unpack** it into a folder, **Save**
+it as it is, or **Add** it to one of your vaults.
 
 Secrets are never passed as arguments (those are visible to other processes):
 the passphrase is read from the file descriptor named by `--pass-fd`. File data
