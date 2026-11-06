@@ -7,6 +7,7 @@ import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,14 +34,13 @@ import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.ArrowDropDown
-import androidx.compose.material.icons.filled.ArrowDropUp
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
+import androidx.compose.material.icons.filled.KeyboardArrowUp
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.RemoveCircleOutline
@@ -49,7 +49,6 @@ import androidx.compose.material.icons.filled.Unarchive
 import androidx.compose.material.icons.filled.UploadFile
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
-import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
@@ -205,7 +204,13 @@ fun SlidingToggle(
                     .weight(share)
                     .fillMaxHeight()
                     .background(if (chosen) MaterialTheme.colorScheme.secondaryContainer else Color.Transparent)
-                    .selectable(selected = chosen, role = Role.Tab, onClick = { onSelect(i) }),
+                    .selectable(
+                        selected = chosen,
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        role = Role.Tab,
+                        onClick = { onSelect(i) },
+                    ),
                 contentAlignment = Alignment.Center,
             ) {
                 Row(verticalAlignment = Alignment.CenterVertically) {
@@ -456,8 +461,8 @@ private fun VaultActionSheet(
 ) {
     Surface(
         shape = RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp),
+        color = MaterialTheme.colorScheme.background,
         border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        tonalElevation = 2.dp,
         modifier = Modifier.fillMaxWidth(),
     ) {
         Column {
@@ -470,23 +475,27 @@ private fun VaultActionSheet(
                 contentAlignment = Alignment.Center,
             ) {
                 Icon(
-                    if (open) Icons.Filled.ArrowDropDown else Icons.Filled.ArrowDropUp,
+                    if (open) Icons.Filled.KeyboardArrowDown else Icons.Filled.KeyboardArrowUp,
                     contentDescription = toggle,
-                    modifier = Modifier.size(36.dp),
+                    modifier = Modifier.size(32.dp),
                 )
             }
             AnimatedVisibility(visible = open) {
-                Column(
-                    modifier = Modifier.padding(start = 12.dp, end = 12.dp, bottom = 12.dp),
-                    verticalArrangement = Arrangement.spacedBy(6.dp),
-                ) {
+                // Plain rows with a line between each, on the app's own background.
+                Column(modifier = Modifier.padding(bottom = 8.dp)) {
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.UploadFile, "Add files…", idle, actions.onAddFiles)
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.CreateNewFolder, "Add folder…", idle, actions.onAddFolder)
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.FileOpen, "Open", idle && chosen, actions.onOpen)
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.Unarchive, "Extract…", idle && chosen, actions.onExtract)
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.Share, "Share…", idle && chosen, actions.onShare)
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.Delete, "Delete", idle && chosen, actions.onDelete, destructive = true)
-                    HorizontalDivider(modifier = Modifier.padding(vertical = 2.dp))
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.Lock, "Lock", unlocked, actions.onLock)
                 }
             }
@@ -496,18 +505,19 @@ private fun VaultActionSheet(
 
 @Composable
 private fun SheetItem(icon: ImageVector, label: String, enabled: Boolean, onClick: () -> Unit, destructive: Boolean = false) {
-    val color = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
-    OutlinedButton(
-        onClick = onClick,
-        enabled = enabled,
-        shape = RoundedCornerShape(12.dp),
-        colors = ButtonDefaults.outlinedButtonColors(contentColor = color),
-        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
-        modifier = Modifier.fillMaxWidth().heightIn(min = 44.dp),
+    val base = if (destructive) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary
+    val color = if (enabled) base else MaterialTheme.colorScheme.onSurface.copy(alpha = 0.38f)
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .heightIn(min = 48.dp)
+            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+            .padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
     ) {
-        Icon(icon, contentDescription = null, modifier = Modifier.size(20.dp))
-        Spacer(Modifier.width(12.dp))
-        Text(label, modifier = Modifier.weight(1f))
+        Icon(icon, contentDescription = null, tint = color, modifier = Modifier.size(20.dp))
+        Spacer(Modifier.width(16.dp))
+        Text(label, color = color, modifier = Modifier.weight(1f))
     }
 }
 

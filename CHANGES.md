@@ -1,5 +1,16 @@
 # What changed in this build
 
+## 0.3.1
+
+- **Set password:** Share… → Set password instead now opens a dialog titled just
+  "Set password", with the password fields and no explanatory paragraph.
+- **Vault actions panel:** on the app's own background instead of a tinted one;
+  the actions are plain rows with a line between each instead of outlined
+  buttons, and the handle is a chevron (^ closed, V open) instead of a solid
+  triangle.
+- **Contacts | Vaults toggle:** no ripple when tapped; the sliding change of
+  width still animates.
+
 ## Build
 
 - **Gradle wrapper committed:** `gradle/wrapper/` (jar and properties) is now in

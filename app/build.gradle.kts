@@ -14,8 +14,8 @@ android {
         applicationId = "org.vaultsend"
         minSdk = 26
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.3.0"
+        versionCode = 7
+        versionName = "0.3.1"
 
         // Device independence: package the native library for every Android ABI
         // into one universal APK, so a single .apk installs on any device.

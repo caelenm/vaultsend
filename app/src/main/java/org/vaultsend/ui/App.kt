@@ -1610,9 +1610,8 @@ fun App(vm: AppViewModel = viewModel()) {
                     onAddNew = { picked -> dialog = ShareAddContact(d.copy(picked = picked)) },
                     onPassword = {
                         dialog = AskPassphrase(
-                            "Set a password",
-                            "Anyone with this password and the file can open it, in VaultSend or with " +
-                                "age. Tell them the password some other way than the file itself.",
+                            "Set password",
+                            "",
                             confirm = true,
                             fieldLabel = "Password",
                             onCancel = { dialog = d },

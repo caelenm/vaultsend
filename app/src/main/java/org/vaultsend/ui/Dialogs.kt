@@ -202,7 +202,7 @@ fun PassphraseDialog(
         title = { Text(heading) },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text(body, style = MaterialTheme.typography.bodyMedium)
+                if (body.isNotEmpty()) Text(body, style = MaterialTheme.typography.bodyMedium)
                 OutlinedTextField(
                     value = pass,
                     onValueChange = { pass = it; error = null },
