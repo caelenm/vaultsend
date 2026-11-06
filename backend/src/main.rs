@@ -12,6 +12,8 @@
 //   encrypt -r AGE1.. [..] [--armor] [--in P] [--out P]   (no secret needed)
 //   decrypt --pass-fd N [--in P] [--out P]
 //   vault-create|list|add|remove|extract|share|check   Encrypted folders; see vault.rs.
+//   vault-import                  Add a share's contents to a vault; see shared.rs.
+//   share-kind|check|decrypt|extract   Open a file someone shared; see shared.rs.
 //
 // Secrets never travel on argv (which is world-readable via /proc). The identity
 // passphrase is read from a file descriptor handed over by the parent process.
@@ -24,6 +26,7 @@
 // or paged to a swap device. Secret buffers are additionally held in zeroizing
 // storage so they are wiped from memory on drop.
 
+mod shared;
 mod tar;
 mod vault;
 
@@ -34,6 +37,7 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::io::FromRawFd;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use age::armor::{ArmoredReader, ArmoredWriter, Format};
 use age::secrecy::{ExposeSecret, SecretString};
@@ -92,6 +96,38 @@ fn harden_process() {
     // equivalents on macOS (PT_DENY_ATTACH) and elsewhere differ; left as a
     // no-op so the binary still builds on other platforms.
 }
+
+/// Set once the process has been asked to stop (SIGTERM, which is how the frontend's
+/// Cancel stops the backend; SIGINT and SIGHUP too). Only the commands that unpack or
+/// import a share catch these (`catch_stop_signals`), so they fail with CANCELLED and
+/// clean up like any other failure. Every other command still just dies, as it always
+/// has. A process stuck where it can't ask (scrypt, a blocking read) is killed by the
+/// frontend two seconds later; the next run sweeps what it staged (shared.rs).
+static STOP_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+pub(crate) fn terminated() -> bool {
+    STOP_REQUESTED.load(Ordering::Relaxed)
+}
+
+#[cfg(target_os = "linux")]
+fn catch_stop_signals() {
+    extern "C" fn on_stop(_: libc::c_int) {
+        STOP_REQUESTED.store(true, Ordering::Relaxed); // async-signal-safe: one atomic store
+    }
+    // SAFETY: the handler only stores to an atomic.
+    unsafe {
+        let mut action: libc::sigaction = std::mem::zeroed();
+        action.sa_sigaction = on_stop as extern "C" fn(libc::c_int) as libc::sighandler_t;
+        action.sa_flags = libc::SA_RESTART;
+        libc::sigemptyset(&mut action.sa_mask);
+        for signal in [libc::SIGTERM, libc::SIGINT, libc::SIGHUP] {
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+        }
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn catch_stop_signals() {}
 
 /// Keep one secret buffer out of swap. harden_process's mlockall is all or nothing, so a
 /// low limit on locked memory defeats it; these few small buffers usually still fit.
@@ -524,9 +560,19 @@ fn run() -> R<()> {
         ),
         "vault-create" | "vault-list" | "vault-add" | "vault-remove" | "vault-extract"
         | "vault-share" | "vault-check" => vault::run(cmd, rest),
+        "vault-import" => {
+            catch_stop_signals();
+            vault::run(cmd, rest)
+        }
+        "share-kind" | "share-check" => shared::run(cmd, rest),
+        "share-decrypt" | "share-extract" => {
+            catch_stop_signals();
+            shared::run(cmd, rest)
+        }
         other => Err(format!(
             "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt|\
-             vault-create|vault-list|vault-add|vault-remove|vault-extract|vault-share|vault-check)"
+             vault-create|vault-list|vault-add|vault-remove|vault-extract|vault-share|vault-check|\
+             vault-import|share-kind|share-check|share-decrypt|share-extract)"
         )),
     }
 }
