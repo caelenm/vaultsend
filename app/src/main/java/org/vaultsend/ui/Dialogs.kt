@@ -45,6 +45,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalUriHandler
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.input.KeyboardType
@@ -474,13 +475,21 @@ fun PublicKeyDialog(pubkey: String, onCopy: () -> Unit, onClose: () -> Unit) {
 @Composable
 fun AboutDialog(onClose: () -> Unit) {
     val uriHandler = LocalUriHandler.current
+    val context = LocalContext.current
+    // Read from the installed package, so it always matches versionName/versionCode in build.gradle.kts.
+    val version = remember {
+        runCatching {
+            val info = context.packageManager.getPackageInfo(context.packageName, 0)
+            "Version ${info.versionName} (build ${androidx.core.content.pm.PackageInfoCompat.getLongVersionCode(info)})"
+        }.getOrDefault("")
+    }
     val source = "https://github.com/caelenm/vaultsend/tree/android"
     AlertDialog(
         onDismissRequest = onClose,
         title = { Text("VaultSend") },
         text = {
             Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                Text("Version 0.2.0", style = MaterialTheme.typography.bodyMedium)
+                if (version.isNotEmpty()) Text(version, style = MaterialTheme.typography.bodyMedium)
                 Text(
                     "File and text encryption using the age format.\n" +
                         "All cryptography is performed by a small separate backend.\n" +
