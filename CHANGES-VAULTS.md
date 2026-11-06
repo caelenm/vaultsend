@@ -103,6 +103,20 @@ through `vault-import`; Cancel early and late, for unpack and import; the 2^19 r
 stale-staging sweep; key shares. `tests/vault_attack.py` gets a `shares` section, and
 `tests/vault_roundtrip.sh` a password-share round trip.
 
+**Results**, on the commit that added this:
+
+| Check | Result |
+|---|---|
+| `cargo test --locked`, Rust 1.75.0 and 1.97.0 | 67 passed, 0 failed, on both |
+| `cargo clippy --all-targets`, 1.97.0 | Nothing in the new code; two notes in older tests, as on `main` |
+| `tests/verify_deps.sh` | All checks pass; `Cargo.toml` and `Cargo.lock` unchanged |
+| `tests/vault_roundtrip.sh` | 145 passed, 0 failed, with `strace` |
+| `tests/vault_attack.py`, with `age` 1.1.1, as root | 239 passed, 3 failed: the three `/proc/pid/{mem,environ,maps}` checks, which root can always read. `main`'s binary fails the same three the same way |
+| `vault_attack.py --only hardening`, as an unprivileged user | 7 passed, 0 failed |
+| `vault_attack.py --only shares` | 27 passed, 0 failed |
+
+The read-only-folder case was skipped, because root runs with permission overrides.
+
 ---
 
 ## Changes from the owner's testing
