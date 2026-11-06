@@ -1,9 +1,12 @@
 package org.vaultsend
 
 import android.content.Context
+import android.media.MediaScannerConnection
 import android.net.Uri
+import android.os.Build
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -168,13 +171,33 @@ class Backend(private val context: Context) {
      */
     private inline fun <T> withFds(input: Uri, output: Uri, block: (Int, Int) -> T): T {
         val resolver = context.contentResolver
-        resolver.openFileDescriptor(input, "r").use { inPfd ->
+        val result = resolver.openFileDescriptor(input, "r").use { inPfd ->
             requireNotNull(inPfd) { "Couldn't open the selected file." }
             // "wt" = write + truncate, so re-using an existing file fully replaces it.
             resolver.openFileDescriptor(output, "wt").use { outPfd ->
                 requireNotNull(outPfd) { "Couldn't open the destination." }
-                return block(inPfd.fd, outPfd.fd)
+                block(inPfd.fd, outPfd.fd)
             }
+        }
+        refreshMediaIndex(output)
+        return result
+    }
+
+    /**
+     * Ask Android's media index to re-read a file we just wrote. Save as creates the
+     * file empty, and the index can record that size before a slow write (a password
+     * share runs scrypt first) fills it, then keep showing 0 bytes. Best effort: a
+     * location the index doesn't cover is left alone.
+     */
+    private fun refreshMediaIndex(uri: Uri) {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) return
+        runCatching {
+            val media = MediaStore.getMediaUri(context, uri) ?: return
+            val path = context.contentResolver
+                .query(media, arrayOf(MediaStore.MediaColumns.DATA), null, null, null)
+                ?.use { c -> if (c.moveToFirst()) c.getString(0) else null }
+                ?: return
+            MediaScannerConnection.scanFile(context, arrayOf(path), null, null)
         }
     }
 

@@ -1,5 +1,13 @@
 # What changed in this build
 
+## 0.3.4
+
+- **Saved files showing 0 bytes:** a file unlocked from a password share could be
+  listed as 0 bytes by Photos and file managers, though it opened fine. Save as
+  creates the file empty, and the slow password step meant Android's media index
+  recorded that size before the picture was written. After every save VaultSend
+  now asks the index to re-read the file.
+
 ## 0.3.3
 
 - **Open file… → Encrypt → Set password instead**, as on a vault's Share…: a
