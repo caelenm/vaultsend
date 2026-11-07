@@ -377,8 +377,8 @@ desktop's end-to-end `vault_roundtrip.sh` passes 131 of 131 against this code
 (`rust/tests/`, run in CI), and `vault_attack.py` passes everything about vaults
 (211 checks). Its 4 process-hardening checks don't apply here, for the reason given in
 *Security model*. The Kotlin vault helpers have JVM unit tests (`testDebugUnitTest`,
-in CI). The app itself is built by CI; it wasn't built or run on a device or emulator
-for this change. See `CHANGES-VAULTS.md`.
+in CI). The app itself is built by CI, and vaults have been tested on a real device.
+See `CHANGES-VAULTS.md`.
 
 The Rust core in this tree was compiled and unit-tested with `cargo test` —
 encrypt/decrypt round-trips, multi-recipient, key recovery, status transitions,
