@@ -356,7 +356,8 @@ identically under a 1 GiB memory limit, where the process used to be killed. The
 app was built here with the Android SDK and NDK 27: `assembleDebug` (all four ABIs,
 through `build-rust.sh --locked`), `assembleRelease` (R8), and `testDebugUnitTest`
 (VaultHelpersTest 52, SessionTest 4). Each `.so` exports exactly the 33 functions
-`VaultSendNative` declares. The app wasn't run on a device or emulator.
+`VaultSendNative` declares. Version 0.3.5, vaults included, has been tested on a real
+device.
 
 **Password shares, receiving shares, vault page (0.2.x).** `cargo test` passes 78
 tests on Rust 1.75 and current stable. Among them are known-bad archives (traversal
@@ -367,7 +368,7 @@ passes 131 of 131. `VaultHelpersTest` passes 52, including the new invert, Add
 destination and shared-name cases. The Compose UI was type-checked against Compose
 Multiplatform 1.7 and `android-all` with stubs for the AndroidX activity, lifecycle
 and `FileProvider` calls, and the vault page was rendered off-screen to compare
-with the design. The app wasn't built or run on a device here; CI builds it.
+with the design. CI builds the app.
 
 **Vaults (0.2.0).** Remember passphrase offers only Off and Until VaultSend
 closes; the timed choices from 0.2.0 beta 1 were removed, and a saved timed choice
@@ -377,8 +378,7 @@ desktop's end-to-end `vault_roundtrip.sh` passes 131 of 131 against this code
 (`rust/tests/`, run in CI), and `vault_attack.py` passes everything about vaults
 (211 checks). Its 4 process-hardening checks don't apply here, for the reason given in
 *Security model*. The Kotlin vault helpers have JVM unit tests (`testDebugUnitTest`,
-in CI). The app itself is built by CI, and vaults have been tested on a real device.
-See `CHANGES-VAULTS.md`.
+in CI). The app itself is built by CI. See `CHANGES-VAULTS.md`.
 
 The Rust core in this tree was compiled and unit-tested with `cargo test` —
 encrypt/decrypt round-trips, multi-recipient, key recovery, status transitions,
