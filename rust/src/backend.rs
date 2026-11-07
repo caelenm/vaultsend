@@ -454,8 +454,20 @@ pub(crate) fn session_identity() -> R<x25519::Identity> {
 }
 
 // ---------------------------------------------------------------------------
-// Small fs helpers (unchanged from desktop).
+// Small fs helpers (from desktop, plus sync_file).
 // ---------------------------------------------------------------------------
+
+/// fsync, where the descriptor can be synced. A provider may hand a SAF document over as
+/// a pipe or a proxy descriptor (`ProxyFileDescriptorCallback`, whose fsync defaults to
+/// EINVAL); there the provider decides when the bytes are stored, and refusing would make
+/// every write to that folder fail. A regular file never returns EINVAL here, so for one
+/// this is exactly `sync_all`.
+pub(crate) fn sync_file(file: &File) -> io::Result<()> {
+    match file.sync_all() {
+        Err(e) if e.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+        other => other,
+    }
+}
 
 /// Create a brand-new 0600 file, refusing to follow or reuse anything already at
 /// the path (O_CREAT|O_EXCL). A stale file from an interrupted run is removed and
@@ -925,6 +937,23 @@ mod tests {
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         p.to_string_lossy().into_owned()
+    }
+
+    /// A pipe can't be fsynced (EINVAL), as some SAF providers' descriptors can't:
+    /// that's no failure. A regular file still is synced, and other errors still count.
+    #[test]
+    fn sync_file_accepts_a_descriptor_that_cannot_be_synced() {
+        use std::os::unix::io::FromRawFd;
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let (read, write) = unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) };
+        assert_eq!(write.sync_all().unwrap_err().raw_os_error(), Some(libc::EINVAL));
+        sync_file(&write).unwrap();
+        drop(read);
+        let dir = std::env::temp_dir().join(format!("vaultsend-sync-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        sync_file(&File::create(dir.join("f")).unwrap()).unwrap();
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

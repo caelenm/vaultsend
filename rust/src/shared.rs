@@ -25,7 +25,7 @@ use age::armor::ArmoredReader;
 use age::DecryptError;
 
 use crate::backend::{
-    decrypt_file_staged, open_private_new, passphrase_from_bytes, session_identity, staging_named, PrivateDir,
+    decrypt_file_staged, open_private_new, passphrase_from_bytes, session_identity, staging_named, sync_file, PrivateDir,
     StagingGuard, SCRYPT_LOG_N,
 };
 use crate::tar::{self, Item, Limits, Scan};
@@ -217,7 +217,7 @@ fn write_items(
                 let mut source = open(rel, offset)?;
                 let mut out = store.create_new(&path)?;
                 copy_exact(&mut source, &mut out, size, progress, &store.show(&path))?;
-                out.sync_all().map_err(|e| format!("flushing {}: {e}", store.show(&path)))?;
+                sync_file(&out).map_err(|e| format!("flushing {}: {e}", store.show(&path)))?;
             }
         }
     }

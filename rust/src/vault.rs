@@ -55,7 +55,7 @@ use sha2::{Digest, Sha256};
 use zeroize::Zeroizing;
 
 use crate::backend::{
-    encrypt_to, load_identity, lock_in_ram, open_private_new, passphrase_from_bytes,
+    encrypt_to, load_identity, lock_in_ram, sync_file, open_private_new, passphrase_from_bytes,
     secret_buffer, session_identity, Held, RamLock, StagedFile, MIN_PASSPHRASE_CHARS, SCRYPT_LOG_N,
 };
 use crate::{tar, R};
@@ -490,7 +490,7 @@ fn write_atomic(store: &dyn Store, rel: &str, fill: impl FnOnce(File) -> R<File>
     let file = store.create_new(&tmp)?;
     let staged = fill(file).and_then(|mut f| {
         f.flush().map_err(|e| format!("writing {shown}: {e}"))?;
-        f.sync_all().map_err(|e| format!("flushing {shown}: {e}"))
+        sync_file(&f).map_err(|e| format!("flushing {shown}: {e}"))
     });
     commit_staged(store, staged, &tmp, rel)
 }
@@ -1068,7 +1068,7 @@ fn write_tree(store: &dyn Store, root: &str, tree: Vec<(&str, Option<StagedFile>
                 }
                 let mut file = store.create_new(&path)?;
                 copy_counted(&mut staged.open()?, &mut file, progress, &store.show(&path))?;
-                file.sync_all().map_err(|e| format!("flushing {}: {e}", store.show(&path)))?;
+                sync_file(&file).map_err(|e| format!("flushing {}: {e}", store.show(&path)))?;
             }
         }
     }
@@ -1636,7 +1636,7 @@ impl Vault {
                 match out {
                     Out::File(file) => {
                         copy_counted(&mut plain, file, &self.progress, "the output")?;
-                        file.flush().and_then(|_| file.sync_all()).map_err(|e| format!("writing the output: {e}"))
+                        file.flush().and_then(|_| sync_file(file)).map_err(|e| format!("writing the output: {e}"))
                     }
                     Out::In(folder, name) => {
                         write_atomic(folder, name, |mut file| {
@@ -1788,7 +1788,7 @@ impl Vault {
         match out {
             Out::File(file) => {
                 let file = encrypt_to(encryptor, false, reader, file)?;
-                file.flush().and_then(|_| file.sync_all()).map_err(|e| format!("writing the output: {e}"))
+                file.flush().and_then(|_| sync_file(file)).map_err(|e| format!("writing the output: {e}"))
             }
             Out::In(folder, name) => {
                 write_atomic(folder, name, |file| encrypt_to(encryptor, false, reader, file))?;
