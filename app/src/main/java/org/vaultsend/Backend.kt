@@ -329,6 +329,45 @@ class Backend(private val context: Context) {
         result(VaultSendNative.vaultRemove(dataDir, openVault(record), secret, entries.toTypedArray(), all, progress))
     }
 
+    /** Rename or move `from` to `to`; only the vault's file list changes. */
+    suspend fun vaultRename(record: VaultRecord, secret: ByteArray?, from: String, to: String): VaultResult =
+        withContext(Dispatchers.IO) {
+            result(VaultSendNative.vaultRename(dataDir, openVault(record), secret, from, to))
+        }
+
+    /** Save a note's text as `path`, in place of `previous` (null for a new note). */
+    suspend fun vaultWriteText(
+        record: VaultRecord,
+        secret: ByteArray?,
+        path: String,
+        text: ByteArray,
+        previous: String?,
+        replace: Boolean,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        result(VaultSendNative.vaultWriteText(dataDir, openVault(record), secret, path, text, previous, replace, progress))
+    }
+
+    /**
+     * A note's text. Refused unless it's valid UTF-8: saving a lossy decoding back
+     * would change the file. The decrypted bytes are wiped once decoded.
+     */
+    suspend fun vaultReadText(record: VaultRecord, secret: ByteArray?, entry: String): String =
+        withContext(Dispatchers.IO) {
+            val bytes = VaultSendNative.vaultReadText(dataDir, openVault(record), secret, entry, NOTE_MAX_BYTES.toLong())
+            try {
+                Charsets.UTF_8.newDecoder()
+                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
+                    .decode(java.nio.ByteBuffer.wrap(bytes))
+                    .toString()
+            } catch (e: java.nio.charset.CharacterCodingException) {
+                throw BackendException("“${entry.substringAfterLast('/')}” isn't plain text, so it can't be edited as a note.")
+            } finally {
+                bytes.fill(0)
+            }
+        }
+
     private fun refuseInside(vault: VaultTree, out: Uri) {
         if (vault.contains(out)) throw BackendException("the output path must not be inside the vault")
     }

@@ -188,6 +188,50 @@ fun vaultNameFromShared(fileName: String): String {
 fun vaultNameFromPath(path: String): String =
     path.trimEnd('/').substringAfterLast('/').removeSuffix(VAULT_SUFFIX)
 
+/** What a new note is saved as: its title, then this. */
+const val NOTE_SUFFIX = ".md"
+
+/** Files the note editor opens for editing (case-insensitive). */
+val NOTE_SUFFIXES = listOf(".md", ".txt")
+
+/** The largest note the editor opens: text this long is already unwieldy on a phone. */
+const val NOTE_MAX_BYTES = 1 shl 20
+
+/** The extension that makes `path` a note, as it's written there, or null if it isn't one. */
+fun noteSuffix(path: String): String? {
+    val name = path.substringAfterLast('/')
+    return NOTE_SUFFIXES.firstOrNull { name.length > it.length && name.lowercase().endsWith(it) }
+        ?.let { name.takeLast(it.length) }
+}
+
+/** The title a note's editor shows: its name without the note extension. */
+fun noteTitle(path: String): String {
+    val name = path.substringAfterLast('/')
+    return noteSuffix(name)?.let { name.dropLast(it.length) } ?: name
+}
+
+/**
+ * The file name a title saves as: "Shopping" gives "Shopping.md". The suffix is
+ * always added (the editor shows it after the title), so a note's title and name
+ * go back and forth unchanged.
+ */
+fun noteFileName(title: String, suffix: String = NOTE_SUFFIX): String = title.trim() + suffix
+
+/** Why `name` can't name a file or folder in a vault (the core's rule for one path part), or null. */
+fun entryNameProblem(name: String): String? = when {
+    name.isEmpty() -> "Enter a name."
+    '/' in name -> "A name can't contain “/”."
+    '\u0000' in name || name == "." || name == ".." -> "That name can't be used."
+    name.toByteArray(Charsets.UTF_8).size > 255 -> "That name is too long."
+    else -> null
+}
+
+/** `path` with its last part replaced by `name`: Rename… stays in the same folder. */
+fun renamedPath(path: String, name: String): String {
+    val folder = path.substringBeforeLast('/', "")
+    return if (folder.isEmpty()) name else "$folder/$name"
+}
+
 /** A file size as people read it. */
 fun humanSize(bytes: Long): String {
     if (bytes < 1024) return if (bytes == 1L) "1 byte" else "$bytes bytes"
@@ -278,6 +322,12 @@ data class VaultSelection(
         val one = if (chosen.size == 1) chosen[0] else ROOT_ENTRY
         return if (entries[one]?.isDir == true) one else one.substringBeforeLast('/', "").removePrefix("/")
     }
+
+    /** The one file or folder chosen, for Rename…; null for none, several or the whole vault. */
+    fun oneChosen(): String? = chosen().singleOrNull()?.takeIf { it != ROOT_ENTRY && it in entries }
+
+    /** The one note chosen, for Edit note: a .md or .txt file. */
+    fun chosenNote(): String? = oneChosen()?.takeIf { entries[it]?.isDir == false && noteSuffix(it) != null }
 
     /** Select all takes the tick boxes; pressed again with everything ticked, Select none. */
     fun selectAll(): VaultSelection =

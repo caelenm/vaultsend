@@ -501,6 +501,65 @@ class VaultHelpersTest {
         assertEquals("", page.withMultiple(true).tick("a/1.txt", true).tick("ab.txt", true).addDestination())
     }
 
+    // --- Notes and Rename… (Android only) --------------------------------------
+
+    @Test
+    fun noteNames() {
+        assertEquals("Shopping.md", noteFileName("Shopping"))
+        assertEquals("Shopping.md", noteFileName("  Shopping  "))
+        assertEquals("Shopping.md.md", noteFileName("Shopping.md"))
+        assertEquals(".md", noteFileName(""))
+        assertEquals("plan.txt", noteFileName("plan", ".txt"))
+        assertEquals("plan.md.txt", noteFileName("plan.md", ".txt"))
+
+        assertEquals(".md", noteSuffix("a/Note.md"))
+        assertEquals(".TXT", noteSuffix("LOG.TXT"))
+        assertNull(noteSuffix("photo.jpg"))
+        assertNull(noteSuffix(".md"))
+        assertNull(noteSuffix("md"))
+
+        assertEquals("Note", noteTitle("a/b/Note.md"))
+        assertEquals("LOG", noteTitle("LOG.TXT"))
+        assertEquals("x.md", noteTitle("x.md.md"))
+        // A title and its suffix make the name back.
+        for (path in listOf("Note.md", "a/plan.txt", "x.md.md", "UP.MD")) {
+            assertEquals(path.substringAfterLast('/'), noteFileName(noteTitle(path), noteSuffix(path)!!))
+        }
+    }
+
+    @Test
+    fun entryNamesFollowTheCoresRule() {
+        assertNull(entryNameProblem("Note.md"))
+        assertNull(entryNameProblem("a b ü"))
+        assertNull(entryNameProblem("x".repeat(255)))
+        for (bad in listOf("", "a/b", "/", ".", "..", "nul\u0000", "x".repeat(256), "ü".repeat(128))) {
+            assertTrue(bad, entryNameProblem(bad) != null)
+        }
+    }
+
+    @Test
+    fun renameStaysInItsFolder() {
+        assertEquals("b.txt", renamedPath("a.txt", "b.txt"))
+        assertEquals("a/b/new", renamedPath("a/b/old", "new"))
+    }
+
+    @Test
+    fun renameAndEditNoteNeedOneEntry() {
+        assertNull(page.oneChosen())
+        assertEquals("a", page.select("a").oneChosen())
+        assertEquals("a/1.txt", page.select("a/1.txt").oneChosen())
+        assertNull(page.selectAll().oneChosen())
+        assertEquals("a", page.withMultiple(true).tick("a", true).oneChosen())
+        assertNull(page.withMultiple(true).tick("a/1.txt", true).tick("ab.txt", true).oneChosen())
+
+        assertEquals("ab.txt", page.select("ab.txt").chosenNote())
+        assertNull(page.select("a").chosenNote())
+        assertNull(page.select("empty").chosenNote())
+        val withPhoto = VaultSelection().withEntries(listOf(VaultEntry("p.jpg", false, 3), VaultEntry("n.md", false, 3)))
+        assertNull(withPhoto.select("p.jpg").chosenNote())
+        assertEquals("n.md", withPhoto.select("n.md").chosenNote())
+    }
+
     // --- Names for shared files ------------------------------------------------
 
     @Test

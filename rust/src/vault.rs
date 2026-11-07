@@ -581,6 +581,26 @@ impl<W: Write> Write for HashingWriter<W> {
     }
 }
 
+/// A buffer that refuses to grow past `cap`, so plaintext written into it is never
+/// reallocated (which would leave an unwiped copy in freed heap). `read_text`.
+struct Capped<'a> {
+    buf: &'a mut Vec<u8>,
+    cap: usize,
+}
+
+impl Write for Capped<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.len() > self.cap - self.buf.len() {
+            return Err(io::Error::other("longer than the vault's manifest says"));
+        }
+        self.buf.extend_from_slice(data);
+        Ok(data.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 /// Hashes a blob's ciphertext on its way to age, so one read both verifies and
 /// decrypts it. Remembers a read error, so one can be told from tampering.
 struct HashingReader<R> {
@@ -1483,6 +1503,108 @@ impl Vault {
         self.commit_next(m)
     }
 
+    /// Rename or move `from`, a file or a folder with everything in it, to `to`,
+    /// which must not exist yet and must be in a folder that does. Android only (the
+    /// app's Rename…). Only the manifest changes: every blob stays as it is, so a
+    /// folder of any size is one commit, and nothing is decrypted.
+    pub fn rename(&self, from: &str, to: &str) -> R<()> {
+        for p in [from, to] {
+            if !valid_vault_path(p) {
+                return Err(format!("invalid vault path: {p}"));
+            }
+        }
+        let mut m = self.load_manifest()?;
+        if !m.entries.contains_key(from) {
+            return Err(format!("'{from}' is not in the vault"));
+        }
+        if from == to {
+            return Ok(());
+        }
+        if m.entries.contains_key(to) {
+            return Err(format!("'{to}' already exists in the vault"));
+        }
+        if within(to, from).is_some() {
+            return Err(format!("'{from}' can't be moved inside itself"));
+        }
+        if let Some(folder) = ancestors(to).find(|f| m.entries.get(*f) != Some(&Entry::Dir)) {
+            return Err(format!("'{folder}' is not a folder in the vault, so '{to}' can't go in it"));
+        }
+        let moving: Vec<(String, String)> = m.entries.keys().filter_map(|old| {
+            let rest = within(old, from)?;
+            Some((old.clone(), if rest.is_empty() { to.to_string() } else { format!("{to}/{rest}") }))
+        }).collect();
+        if let Some((_, bad)) = moving.iter().find(|(_, new)| !valid_vault_path(new)) {
+            return Err(format!("can't store this path in a vault: {bad}"));
+        }
+        for (old, new) in moving {
+            let entry = m.entries.remove(&old).expect("listed above");
+            m.entries.insert(new, entry);
+        }
+        self.commit_next(m)
+    }
+
+    /// Save `text` as the file `path`: a note written in the app (Android only). With
+    /// `previous`, it takes the place of that file, an edited note that may also have
+    /// been renamed, in the same commit. A different file already at `path` is
+    /// replaced only if `replace`; a folder never is. The folder it goes in must exist.
+    pub fn write_text(&self, path: &str, text: &[u8], previous: Option<&str>, replace: bool) -> R<()> {
+        let old = self.load_manifest()?;
+        let saved = self.write_text_to(old.clone(), path, text, previous, replace);
+        if saved.is_err() {
+            self.collect_garbage(&old); // the failed attempt's blob; old is still current
+        }
+        saved
+    }
+
+    fn write_text_to(&self, mut m: Manifest, path: &str, text: &[u8], previous: Option<&str>, replace: bool) -> R<()> {
+        for p in once(path).chain(previous) {
+            if !valid_vault_path(p) {
+                return Err(format!("invalid vault path: {p}"));
+            }
+        }
+        if let Some(p) = previous {
+            if !matches!(m.entries.get(p), Some(Entry::File { .. })) {
+                return Err(format!("'{p}' is not a file in the vault"));
+            }
+        }
+        if let Some(folder) = ancestors(path).find(|f| m.entries.get(*f) != Some(&Entry::Dir)) {
+            return Err(format!("'{folder}' is not a folder in the vault, so '{path}' can't go in it"));
+        }
+        match m.entries.get(path) {
+            Some(Entry::Dir) => return Err(format!("'{path}': a file can't replace a folder, or a folder a file")),
+            Some(Entry::File { .. }) if previous != Some(path) && !replace => {
+                return Err(format!("'{path}' already exists in the vault"));
+            }
+            _ => {}
+        }
+        self.progress.start(text.len() as u64);
+        let entry = self.write_blob(Box::new(Cursor::new(Zeroizing::new(text.to_vec()))))?;
+        if let Some(p) = previous {
+            m.entries.remove(p);
+        }
+        m.entries.insert(path.to_string(), entry);
+        self.commit_next(m)
+    }
+
+    /// One file's whole plaintext, verified, for the app's note editor (Android only).
+    /// Refused, before anything is decrypted, if the manifest says it is over `max`
+    /// bytes. It is held only in a buffer of exactly the manifest's size, wiped when
+    /// dropped, which a file longer than that (so not this vault's) can't overrun.
+    pub fn read_text(&self, entry: &str, max: u64) -> R<Zeroizing<Vec<u8>>> {
+        let m = self.load_manifest()?;
+        let Some(Entry::File { blob, sha256, size }) = m.entries.get(entry) else {
+            return Err(format!("'{entry}' is not a file in the vault"));
+        };
+        if *size > max {
+            return Err(format!("'{entry}' is too large to edit as a note"));
+        }
+        self.progress.start(*size);
+        let mut plain = Zeroizing::new(Vec::with_capacity(*size as usize));
+        let mut out = Capped { buf: &mut plain, cap: *size as usize };
+        self.verify_into(entry, blob, sha256, &mut out)?;
+        Ok(plain)
+    }
+
     /// Extract to a real path (the desktop's `extract`).
     pub fn extract(&self, entry: &str, out: &str) -> R<()> {
         let (folder, name) = path_out(out)?;
@@ -2328,6 +2450,114 @@ mod tests {
         // A top-level symlink alone is nothing to add.
         let err = v.add(&[t.path("tree/link.txt")], None, false).unwrap_err();
         assert!(err.contains("nothing to add"), "{err}");
+    }
+
+    #[test]
+    fn rename_moves_entries_and_keeps_blobs() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        add(&v, &t.write("a.txt", b"aaa"));
+        t.write("dir/sub/x.txt", b"x");
+        add(&v, &t.path("dir"));
+        add(&v, &t.write("dir2", b"sibling"));
+        let a_blob = blob_of(&v, "a.txt");
+        let x_blob = blob_of(&v, "dir/sub/x.txt");
+
+        // A file: same blob, new name, one commit.
+        let before = generation(&v);
+        v.rename("a.txt", "b.txt").unwrap();
+        assert_eq!(generation(&v), before + 1);
+        assert_eq!(blob_of(&v, "b.txt"), a_blob);
+        assert!(Path::new(&a_blob).exists());
+        let out = t.path("b-out.txt");
+        v.extract("b.txt", &out).unwrap();
+        assert_eq!(fs::read(&out).unwrap(), b"aaa");
+
+        // A folder takes everything in it; a sibling sharing the prefix stays.
+        v.rename("dir", "renamed").unwrap();
+        let m = v.load_manifest().unwrap();
+        let names: Vec<&str> = m.entries.keys().map(String::as_str).collect();
+        assert_eq!(names, ["b.txt", "dir2", "renamed", "renamed/sub", "renamed/sub/x.txt"]);
+        assert_eq!(blob_of(&v, "renamed/sub/x.txt"), x_blob);
+
+        // Refusals change nothing.
+        let before = generation(&v);
+        assert!(v.rename("missing", "m").unwrap_err().contains("not in the vault"));
+        assert!(v.rename("b.txt", "dir2").unwrap_err().contains("already exists"));
+        assert!(v.rename("renamed", "renamed/sub/inner").unwrap_err().contains("inside itself"));
+        assert!(v.rename("b.txt", "nowhere/b.txt").unwrap_err().contains("not a folder"));
+        assert!(v.rename("b.txt", "dir2/b.txt").unwrap_err().contains("not a folder"));
+        assert!(v.rename("b.txt", "../b.txt").unwrap_err().contains("invalid"));
+        assert!(v.rename("/", "x").unwrap_err().contains("invalid"));
+        assert_eq!(generation(&v), before);
+        // Into an existing folder is a move.
+        v.rename("b.txt", "renamed/b.txt").unwrap();
+        assert!(v.load_manifest().unwrap().entries.contains_key("renamed/b.txt"));
+        v.check().unwrap();
+    }
+
+    #[test]
+    fn write_text_adds_edits_and_renames_notes() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        t.write("folder/keep.txt", b"keep");
+        add(&v, &t.path("folder"));
+
+        v.write_text("folder/Note.md", b"# hello\n", None, false).unwrap();
+        assert_eq!(&*v.read_text("folder/Note.md", 1 << 20).unwrap(), b"# hello\n");
+        let first = blob_of(&v, "folder/Note.md");
+
+        // Saving over itself: new blob, old one collected.
+        v.write_text("folder/Note.md", "edited \u{e9}".as_bytes(), Some("folder/Note.md"), false).unwrap();
+        assert_eq!(&*v.read_text("folder/Note.md", 1 << 20).unwrap(), "edited \u{e9}".as_bytes());
+        assert!(!Path::new(&first).exists());
+
+        // An edit under a new title replaces the old file in one commit.
+        let before = generation(&v);
+        v.write_text("folder/Renamed.md", b"moved", Some("folder/Note.md"), false).unwrap();
+        assert_eq!(generation(&v), before + 1);
+        let m = v.load_manifest().unwrap();
+        assert!(!m.entries.contains_key("folder/Note.md"));
+        assert_eq!(&*v.read_text("folder/Renamed.md", 100).unwrap(), b"moved");
+
+        // Clashes and bad places change nothing and leave no blob behind.
+        let blobs = || v.orphans(&v.load_manifest().unwrap()).unwrap().len();
+        let before = generation(&v);
+        let err = v.write_text("folder/keep.txt", b"x", None, false).unwrap_err();
+        assert!(err.contains("already exists"), "{err}");
+        assert!(v.write_text("folder", b"x", None, true).unwrap_err().contains("can't replace a folder"));
+        assert!(v.write_text("nowhere/n.md", b"x", None, false).unwrap_err().contains("not a folder"));
+        assert!(v.write_text("n.md", b"x", Some("missing.md"), false).unwrap_err().contains("not a file"));
+        assert!(v.write_text("../n.md", b"x", None, false).unwrap_err().contains("invalid"));
+        assert_eq!((generation(&v), blobs()), (before, 0));
+        // With replace, a clash is overwritten.
+        v.write_text("folder/keep.txt", b"replaced", None, true).unwrap();
+        assert_eq!(&*v.read_text("folder/keep.txt", 100).unwrap(), b"replaced");
+        // An empty note is a file too.
+        v.write_text("empty.md", b"", None, false).unwrap();
+        assert!(v.read_text("empty.md", 0).unwrap().is_empty());
+
+        // Reading: too large, a folder, or missing.
+        assert!(v.read_text("folder/keep.txt", 3).unwrap_err().contains("too large"));
+        assert!(v.read_text("folder", 100).unwrap_err().contains("not a file"));
+        assert!(v.read_text("missing", 100).unwrap_err().contains("not a file"));
+        v.check().unwrap();
+    }
+
+    #[test]
+    fn read_text_never_grows_past_the_manifest_size() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        add(&v, &t.write("n.md", b"exactly this"));
+        // A manifest whose size is understated (only someone with the key could write
+        // one) still can't make the buffer grow: the read stops at the size.
+        let mut m = v.load_manifest().unwrap();
+        if let Some(Entry::File { size, .. }) = m.entries.get_mut("n.md") {
+            *size = 4;
+        }
+        v.write_manifest(&m).unwrap();
+        let err = v.read_text("n.md", 100).unwrap_err();
+        assert!(err.contains("longer than"), "{err}");
     }
 
     #[test]

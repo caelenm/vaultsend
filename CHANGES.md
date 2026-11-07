@@ -1,5 +1,25 @@
 # What changed in this build
 
+## Unreleased: notes and Rename… in vaults
+
+- **Add note…** on a vault's action panel opens a note editor in place of the page:
+  a title at the top (saved as *title*.md, the extension shown after it), a text
+  box below like the main page's, and Save in the top-right corner. The note goes
+  where Add files… would put a file. Its text goes from memory straight into the
+  vault; no plaintext copy is written anywhere. Close or Back asks before
+  discarding anything unsaved.
+- **Edit note** opens the one chosen .md or .txt file (up to 1 MB, and only if it is
+  valid UTF-8) in the same editor. Saving writes the new text, under a changed title
+  if it was changed, and drops the old file in the same commit. Locking the vault, by
+  Lock, Lock now or the background lock, closes the editor and discards the draft.
+- **Rename…** renames the one chosen file or folder, within its folder. Only the
+  vault's encrypted file list changes: nothing is decrypted or re-encrypted, so a
+  folder of any size is renamed in one step, along with everything in it.
+- Core: `Vault::rename`, `Vault::write_text` and `Vault::read_text` in `vault.rs`
+  (Android only: the desktop has no counterpart yet), with JNI calls `vaultRename`,
+  `vaultWriteText` and `vaultReadText`. `read_text` holds the plaintext in a buffer
+  of exactly the manifest's size, wiped when dropped, which it never grows.
+
 ## 0.3.4
 
 - **Saved files showing 0 bytes:** a file unlocked from a password share could be

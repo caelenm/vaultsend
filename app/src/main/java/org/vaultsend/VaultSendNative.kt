@@ -123,6 +123,27 @@ object VaultSendNative {
         progress: ProgressSink?,
     ): String
 
+    /** Rename…: [from], a file or a folder with all it holds, becomes [to]. */
+    @Throws(BackendException::class)
+    external fun vaultRename(dataDir: String, tree: VaultTree, secret: ByteArray?, from: String, to: String): String
+
+    /** A note from the editor saved as [path], in place of [previous] (null for a new one). */
+    @Throws(BackendException::class)
+    external fun vaultWriteText(
+        dataDir: String,
+        tree: VaultTree,
+        secret: ByteArray?,
+        path: String,
+        text: ByteArray,
+        previous: String?,
+        replace: Boolean,
+        progress: ProgressSink?,
+    ): String
+
+    /** A note's whole text, verified, if it's no more than [max] bytes. The caller wipes it. */
+    @Throws(BackendException::class)
+    external fun vaultReadText(dataDir: String, tree: VaultTree, secret: ByteArray?, entry: String, max: Long): ByteArray
+
     /** One file into [outFd], a document the caller made and removes if this fails. */
     @Throws(BackendException::class)
     external fun vaultExtractFile(

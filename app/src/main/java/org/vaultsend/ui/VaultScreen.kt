@@ -33,11 +33,14 @@ import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
+import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
+import androidx.compose.material.icons.filled.DriveFileRenameOutline
+import androidx.compose.material.icons.filled.Edit
 import androidx.compose.material.icons.filled.FileOpen
 import androidx.compose.material.icons.filled.KeyboardArrowDown
 import androidx.compose.material.icons.filled.KeyboardArrowUp
@@ -67,7 +70,9 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.VerticalDivider
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
@@ -76,10 +81,16 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.text.TextRange
 import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
+import androidx.compose.ui.text.input.KeyboardCapitalization
+import androidx.compose.ui.text.input.TextFieldValue
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -89,8 +100,10 @@ import org.vaultsend.VaultEntry
 import org.vaultsend.VaultRecord
 import org.vaultsend.VaultSelection
 import org.vaultsend.entryIndent
+import org.vaultsend.entryNameProblem
 import org.vaultsend.humanSize
 import org.vaultsend.isValidVaultName
+import org.vaultsend.noteFileName
 import org.vaultsend.shortKey
 
 /*
@@ -287,6 +300,9 @@ class VaultActions(
     val onUnlock: () -> Unit,
     val onAddFiles: () -> Unit,
     val onAddFolder: () -> Unit,
+    val onAddNote: () -> Unit,
+    val onEditNote: () -> Unit,
+    val onRename: () -> Unit,
     val onOpen: () -> Unit,
     val onExtract: () -> Unit,
     val onShare: () -> Unit,
@@ -397,6 +413,8 @@ fun VaultPage(
             onOpen = onMenuOpen,
             idle = page != null && progress == null,
             chosen = page?.chosen().orEmpty().isNotEmpty(),
+            one = page?.oneChosen() != null,
+            note = page?.chosenNote() != null,
             unlocked = page != null,
             actions = actions,
         )
@@ -456,6 +474,10 @@ private fun VaultActionSheet(
     onOpen: (Boolean) -> Unit,
     idle: Boolean,
     chosen: Boolean,
+    /** Exactly one file or folder is chosen: Rename… */
+    one: Boolean,
+    /** That one is a .md or .txt file: Edit note. */
+    note: Boolean,
     unlocked: Boolean,
     actions: VaultActions,
 ) {
@@ -488,7 +510,13 @@ private fun VaultActionSheet(
                     HorizontalDivider()
                     SheetItem(Icons.Filled.CreateNewFolder, "Add folder…", idle, actions.onAddFolder)
                     HorizontalDivider()
+                    SheetItem(Icons.AutoMirrored.Filled.NoteAdd, "Add note…", idle, actions.onAddNote)
+                    HorizontalDivider()
                     SheetItem(Icons.Filled.FileOpen, "Open", idle && chosen, actions.onOpen)
+                    HorizontalDivider()
+                    SheetItem(Icons.Filled.Edit, "Edit note", idle && note, actions.onEditNote)
+                    HorizontalDivider()
+                    SheetItem(Icons.Filled.DriveFileRenameOutline, "Rename…", idle && one, actions.onRename)
                     HorizontalDivider()
                     SheetItem(Icons.Filled.Unarchive, "Extract…", idle && chosen, actions.onExtract)
                     HorizontalDivider()
@@ -564,7 +592,123 @@ private fun EntryRow(entry: VaultEntry, page: VaultSelection, onChange: (VaultSe
     }
 }
 
+// --- The note editor (Android only) -----------------------------------------
+
+/**
+ * A note being written: a new one in `folder` ("" for the top of the vault), or the
+ * file `previous` opened for editing. Saving writes `title` + `suffix` there.
+ */
+data class NoteDraft(
+    val vaultUri: String,
+    val folder: String,
+    val previous: String?,
+    val suffix: String,
+    val title: String,
+    val body: String,
+    /** What it held when opened, to tell whether closing loses anything. */
+    val openedTitle: String = title,
+    val openedBody: String = body,
+) {
+    val changed: Boolean get() = title != openedTitle || body != openedBody
+
+    /** The file name it saves as. */
+    val fileName: String get() = noteFileName(title, suffix)
+
+    /** Why it can't be saved under this title, or null; nothing to say while the title is blank. */
+    val titleProblem: String? get() = if (title.isBlank()) null else entryNameProblem(fileName)
+
+    val canSave: Boolean get() = title.isNotBlank() && titleProblem == null
+}
+
+/**
+ * The note editor, in place of the vault's page: a title at the top, with the
+ * extension it's saved with after it, and a text box below like the main page's.
+ * Save is in the top bar (App.kt).
+ */
+@Composable
+fun NoteEditor(
+    draft: NoteDraft,
+    onChange: (NoteDraft) -> Unit,
+    progress: Int?,
+    progressHeading: String,
+    modifier: Modifier = Modifier,
+) {
+    val busy = progress != null
+    Column(modifier = modifier, verticalArrangement = Arrangement.spacedBy(12.dp)) {
+        OutlinedTextField(
+            value = draft.title,
+            onValueChange = { onChange(draft.copy(title = it)) },
+            label = { Text("Title") },
+            suffix = { Text(draft.suffix) },
+            singleLine = true,
+            enabled = !busy,
+            isError = draft.titleProblem != null,
+            supportingText = {
+                Text(
+                    draft.titleProblem
+                        ?: if (draft.folder.isEmpty()) "Saved at the top of the vault." else "Saved in “${draft.folder}”.",
+                )
+            },
+            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences, imeAction = ImeAction.Next),
+            textStyle = MaterialTheme.typography.titleMedium,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = draft.body,
+            onValueChange = { onChange(draft.copy(body = it)) },
+            enabled = !busy,
+            placeholder = { Text("Write your note…") },
+            keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
+            modifier = Modifier.fillMaxWidth().weight(1f),
+        )
+        if (progress != null) ProgressRow(progress, progressHeading, null)
+    }
+}
+
 // --- Dialogs ----------------------------------------------------------------
+
+/**
+ * Rename…: a new name for one file or folder, in the same folder. Rename stays off
+ * until the name is usable and different, and says why when it can't be used.
+ */
+@Composable
+fun RenameDialog(
+    current: String,
+    isDir: Boolean,
+    taken: (String) -> Boolean,
+    onCancel: () -> Unit,
+    onRename: (String) -> Unit,
+) {
+    // A file's name starts selected up to its extension, so typing keeps the type.
+    val stem = if (isDir) current.length else current.lastIndexOf('.').takeIf { it > 0 } ?: current.length
+    var field by remember { mutableStateOf(TextFieldValue(current, TextRange(0, stem))) }
+    val name = field.text.trim()
+    val problem = entryNameProblem(name)?.takeIf { name.isNotEmpty() }
+        ?: "Something here already has that name.".takeIf { name != current && taken(name) }
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(Unit) { focus.requestFocus() }
+    AlertDialog(
+        onDismissRequest = onCancel,
+        title = { Text(if (isDir) "Rename folder" else "Rename file") },
+        text = {
+            OutlinedTextField(
+                value = field,
+                onValueChange = { field = it },
+                label = { Text("Name") },
+                singleLine = true,
+                isError = problem != null,
+                supportingText = { if (problem != null) Text(problem) },
+                modifier = Modifier.fillMaxWidth().focusRequester(focus),
+            )
+        },
+        confirmButton = {
+            TextButton(onClick = { onRename(name) }, enabled = name.isNotEmpty() && problem == null && name != current) {
+                Text("Rename")
+            }
+        },
+        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
+    )
+}
 
 /** The desktop's Adw.AlertDialog with Cancel and one action. */
 @Composable

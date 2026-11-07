@@ -178,6 +178,12 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Whether the vault page's action panel is open. Starts open; kept for the session. */
     var vaultMenuOpen by mutableStateOf(true)
 
+    /**
+     * The note being written or edited on the open vault's page, or null. Closed
+     * with the page when the vault locks: an edited note is decrypted text.
+     */
+    var noteDraft by mutableStateOf<NoteDraft?>(null)
+
     /** Copies Open has handed to other apps, deleted on Lock, Lock now and close. */
     val openedCopies = mutableStateListOf<OpenedCopy>()
 
@@ -201,7 +207,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** Show a vault's page, locked until it's unlocked. */
     fun selectVault(record: VaultRecord?) {
-        if (record?.uri != selectedVault?.uri) vaultPage = null
+        if (record?.uri != selectedVault?.uri) lockVaultPage()
         selectedVault = record
     }
 
@@ -253,6 +259,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /** Drop the listing. It is only metadata, but locked means locked. */
     fun lockVaultPage() {
         vaultPage = null
+        noteDraft = null
     }
 
     /** The desktop vault page's Lock: forget this vault's key and its opened copies. */

@@ -19,6 +19,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.FolderOpen
 import androidx.compose.material.icons.filled.MoreVert
 import androidx.compose.material.icons.filled.Menu
@@ -66,6 +67,7 @@ import kotlinx.coroutines.withContext
 import org.vaultsend.Backend
 import org.vaultsend.Contact
 import org.vaultsend.KEY_MISMATCH
+import org.vaultsend.NOTE_SUFFIX
 import org.vaultsend.OPEN_ASK_ABOVE
 import org.vaultsend.PASSWORD_NEEDED
 import org.vaultsend.ProgressSink
@@ -77,6 +79,9 @@ import org.vaultsend.VaultTree
 import org.vaultsend.archiveFolderName
 import org.vaultsend.filesInSelection
 import org.vaultsend.isArchiveName
+import org.vaultsend.noteSuffix
+import org.vaultsend.noteTitle
+import org.vaultsend.renamedPath
 import org.vaultsend.singleNameFromShared
 import org.vaultsend.vaultNameFromShared
 import org.vaultsend.parseListing
@@ -140,6 +145,8 @@ private data class Share(
 // Add contact on top of Share: back to the same Share afterwards.
 private data class ShareAddContact(val share: Share) : DialogState
 private data object RememberChoices : DialogState
+// Rename… for one file or folder.
+private data class RenameEntry(val vault: VaultRecord, val path: String, val isDir: Boolean) : DialogState
 
 // Receiving a share (shared.rs). `password` is the share's, copied out of the prompt
 // and wiped once used or abandoned; null for one made for this person's key.
@@ -1369,6 +1376,132 @@ fun App(vm: AppViewModel = viewModel()) {
         vm.lockVault(vault)
     }
 
+    // --- Notes and Rename… (Android only) -------------------------------------
+
+    /** Add note…: an empty note, going where Add files… would put a file. */
+    fun vaultAddNote() {
+        val vault = vm.selectedVault ?: return
+        val page = vm.vaultPage ?: return
+        vm.noteDraft = NoteDraft(vault.uri, page.addDestination(), previous = null, suffix = NOTE_SUFFIX, title = "", body = "")
+    }
+
+    /** Edit note: the chosen .md or .txt file, decrypted into the editor. */
+    fun vaultEditNote() {
+        val vault = vm.selectedVault ?: return
+        val path = vm.vaultPage?.chosenNote() ?: return
+        withVaultSecret(vault) { secret ->
+            vm.vaultProgressHeading = "Opening note…"
+            vm.vaultProgress = -1
+            val text = try {
+                vm.backend.vaultReadText(vault, secret, path)
+            } catch (e: Exception) {
+                vaultFailed(vault, e.message ?: "The note couldn't be read.")
+                null
+            } finally {
+                vm.vaultProgress = null
+            }
+            vm.afterSecretUse()
+            // Only if the vault is still open: it may have locked meanwhile.
+            if (text != null && vm.selectedVault?.uri == vault.uri && vm.vaultPage != null) {
+                vm.noteDraft = NoteDraft(
+                    vault.uri, path.substringBeforeLast('/', ""), previous = path,
+                    suffix = noteSuffix(path) ?: NOTE_SUFFIX, title = noteTitle(path), body = text,
+                )
+            }
+        }
+    }
+
+    /**
+     * Save: the note goes into the vault as `title` + its extension, in place of the
+     * file it was opened from. A different file of that name is replaced only once
+     * that's confirmed.
+     */
+    fun saveNote() {
+        val draft = vm.noteDraft ?: return
+        val vault = vm.selectedVault ?: return
+        val page = vm.vaultPage ?: return
+        if (!draft.canSave || vm.vaultProgress != null || vault.uri != draft.vaultUri) return
+        val path = if (draft.folder.isEmpty()) draft.fileName else "${draft.folder}/${draft.fileName}"
+        val existing = page.entries[path]
+        if (existing?.isDir == true) {
+            vaultError("Can't save the note", "There's already a folder called “${draft.fileName}” here. Choose another title.")
+            return
+        }
+
+        fun run(replace: Boolean) {
+            val text = draft.body.toByteArray(Charsets.UTF_8)
+            withVaultSecret(vault, onCancel = { text.fill(0) }) { secret ->
+                val ok = try {
+                    runVaultOp(vault, secret, "Saving note…", "Note saved.", relist = true) { sink ->
+                        vm.backend.vaultWriteText(vault, secret, path, text, draft.previous, replace, sink)
+                    }
+                } finally {
+                    text.fill(0)
+                }
+                if (ok) {
+                    vm.noteDraft = null
+                    vm.vaultPage = vm.vaultPage?.let { p -> if (p.multiple || path !in p.entries) p else p.select(path) }
+                }
+            }
+        }
+
+        if (existing == null || path == draft.previous) {
+            run(false)
+            return
+        }
+        dialog = Confirm(
+            "Replace “${draft.fileName}”?",
+            "There's already a file with that name here. Saving the note replaces it. This can't be undone.",
+            action = "Replace",
+            destructive = true,
+        ) {
+            dialog = null
+            run(true)
+        }
+    }
+
+    /** Close the editor, asking first if that would lose what was written. */
+    fun closeNote() {
+        val draft = vm.noteDraft ?: return
+        if (vm.vaultProgress != null) return // saving: it closes when done
+        if (!draft.changed) {
+            vm.noteDraft = null
+            return
+        }
+        dialog = Confirm(
+            if (draft.previous == null) "Discard this note?" else "Discard your changes?",
+            if (draft.previous == null) "It hasn't been saved to the vault." else "They haven't been saved to the vault.",
+            action = "Discard",
+            destructive = true,
+        ) {
+            dialog = null
+            vm.noteDraft = null
+        }
+    }
+
+    fun vaultRename() {
+        val vault = vm.selectedVault ?: return
+        val page = vm.vaultPage ?: return
+        val path = page.oneChosen() ?: return
+        dialog = RenameEntry(vault, path, page.entries[path]?.isDir == true)
+    }
+
+    /** Rename `from` to `to`, keeping it chosen and, for a folder, open folders open. */
+    fun renameEntry(vault: VaultRecord, from: String, to: String) {
+        withVaultSecret(vault) { secret ->
+            val ok = runVaultOp(vault, secret, "Renaming…", "Renamed.", relist = true) { _ ->
+                vm.backend.vaultRename(vault, secret, from, to)
+            }
+            if (ok) {
+                vm.vaultPage = vm.vaultPage?.let { p ->
+                    fun moved(e: String) = if (e == from || e.startsWith("$from/")) to + e.removePrefix(from) else e
+                    val kept = p.copy(expanded = p.expanded.map(::moved).toSet())
+                    if (kept.multiple || to !in kept.entries) kept else kept.select(to)
+                }
+            }
+        }
+    }
+
     val vaultActions = VaultActions(
         onUnlock = { vaultUnlock() },
         onAddFiles = {
@@ -1376,6 +1509,9 @@ fun App(vm: AppViewModel = viewModel()) {
             openFiles.launch(arrayOf("*/*"))
         },
         onAddFolder = { pickFolder { addToVault(emptyList(), listOf(it)) } },
+        onAddNote = { vaultAddNote() },
+        onEditNote = { vaultEditNote() },
+        onRename = { vaultRename() },
         onOpen = { vaultOpen() },
         onExtract = { vaultExtract() },
         onShare = { vaultShare() },
@@ -1416,6 +1552,8 @@ fun App(vm: AppViewModel = viewModel()) {
 
     // Back from a vault's page goes to the main page.
     BackHandler(enabled = vm.phase == AppPhase.Main && vm.selectedVault != null) { vm.selectVault(null) }
+    // Back from the note editor closes it (asking first if it would lose anything). Later, so it wins.
+    BackHandler(enabled = vm.phase == AppPhase.Main && vm.noteDraft != null) { closeNote() }
 
     // --- First-run / recovery flow on launch ----------------------------------
     LaunchedEffect(Unit) {
@@ -1511,6 +1649,8 @@ fun App(vm: AppViewModel = viewModel()) {
             onForgetVault = { dialog = RemoveFromList(it) },
             describeVault = { describeVault(it) },
             vaultActions = vaultActions,
+            onSaveNote = { saveNote() },
+            onCloseNote = { closeNote() },
             onRemember = { dialog = RememberChoices },
             onLock = { vm.lockSession(); toast("Locked.") },
             onBackupKey = { backupPrivateKey(thenGoMain = false) },
@@ -1696,6 +1836,18 @@ fun App(vm: AppViewModel = viewModel()) {
                 )
             }
         }
+        is RenameEntry -> {
+            val page = vm.vaultPage
+            if (page == null || vm.selectedVault?.uri != d.vault.uri) { dialog = null } else {
+                RenameDialog(
+                    current = d.path.substringAfterLast('/'),
+                    isDir = d.isDir,
+                    taken = { name -> renamedPath(d.path, name) in page.entries },
+                    onCancel = { dialog = null },
+                    onRename = { name -> dialog = null; renameEntry(d.vault, d.path, renamedPath(d.path, name)) },
+                )
+            }
+        }
         is ShareAddContact -> AddContactDialog(
             onCancel = { dialog = d.share },
             onAdd = { name, key ->
@@ -1752,6 +1904,8 @@ private fun MainScreen(
     onForgetVault: (VaultRecord) -> Unit,
     describeVault: (VaultRecord) -> String,
     vaultActions: VaultActions,
+    onSaveNote: () -> Unit,
+    onCloseNote: () -> Unit,
     onRemember: () -> Unit,
     onLock: () -> Unit,
     onBackupKey: () -> Unit,
@@ -1760,6 +1914,8 @@ private fun MainScreen(
     onExportContacts: () -> Unit,
     onAbout: () -> Unit,
 ) {
+    // The note editor takes the vault page's place, and the top bar becomes its own.
+    val note = vm.noteDraft?.takeIf { it.vaultUri == vm.selectedVault?.uri && vm.vaultPage != null }
     ModalNavigationDrawer(
         drawerState = drawerState,
         drawerContent = {
@@ -1782,9 +1938,13 @@ private fun MainScreen(
         Scaffold(
             topBar = {
                 TopAppBar(
-                    title = { Text("VaultSend") },
+                    title = { Text(if (note == null) "VaultSend" else if (note.previous == null) "New note" else "Edit note") },
                     navigationIcon = {
-                        if (vm.selectedVault != null) {
+                        if (note != null) {
+                            IconButton(onClick = onCloseNote) {
+                                Icon(Icons.Filled.Close, contentDescription = "Close note")
+                            }
+                        } else if (vm.selectedVault != null) {
                             IconButton(onClick = { vm.selectVault(null) }) {
                                 Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
                             }
@@ -1795,17 +1955,23 @@ private fun MainScreen(
                         }
                     },
                     actions = {
-                        OverflowMenu(
-                            canLock = vm.unlocked || vm.messageIsDecrypted || vm.vaultPage != null || vm.openedCopies.isNotEmpty(),
-                            hasKey = vm.myPubkey != null,
-                            onRemember = onRemember,
-                            onLock = onLock,
-                            onBackupKey = onBackupKey,
-                            onPublicKey = onPublicKey,
-                            onImportContacts = onImportContacts,
-                            onExportContacts = onExportContacts,
-                            onAbout = onAbout,
-                        )
+                        if (note != null) {
+                            TextButton(onClick = onSaveNote, enabled = note.canSave && vm.vaultProgress == null) {
+                                Text("Save")
+                            }
+                        } else {
+                            OverflowMenu(
+                                canLock = vm.unlocked || vm.messageIsDecrypted || vm.vaultPage != null || vm.openedCopies.isNotEmpty(),
+                                hasKey = vm.myPubkey != null,
+                                onRemember = onRemember,
+                                onLock = onLock,
+                                onBackupKey = onBackupKey,
+                                onPublicKey = onPublicKey,
+                                onImportContacts = onImportContacts,
+                                onExportContacts = onExportContacts,
+                                onAbout = onAbout,
+                            )
+                        }
                     },
                 )
             },
@@ -1814,7 +1980,13 @@ private fun MainScreen(
             val vault = vm.selectedVault
             if (vault != null) {
                 Column(modifier = Modifier.fillMaxSize().padding(padding).padding(horizontal = 16.dp)) {
-                    VaultPage(
+                    if (note != null) NoteEditor(
+                        draft = note,
+                        onChange = { vm.noteDraft = it },
+                        progress = vm.vaultProgress,
+                        progressHeading = vm.vaultProgressHeading,
+                        modifier = Modifier.weight(1f).padding(bottom = 12.dp),
+                    ) else VaultPage(
                         vault = vault,
                         page = vm.vaultPage,
                         progress = vm.vaultProgress,

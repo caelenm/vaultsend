@@ -784,6 +784,78 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultRemove<'l>(
     ret_string(&mut env, r)
 }
 
+/// Rename…: `from` becomes `to`, a file or a folder with all it holds. Only the
+/// manifest changes.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultRename<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    tree: JObject<'l>,
+    secret: JByteArray<'l>,
+    from: JString<'l>,
+    to: JString<'l>,
+) -> jstring {
+    let r = guard(|| {
+        let (from, to) = (get_string(&mut env, &from)?, get_string(&mut env, &to)?);
+        with_vault(&mut env, &data_dir, &tree, &secret, true, &JObject::null(), &mut |_, v| {
+            v.rename(&from, &to).map(|()| String::new())
+        })
+    });
+    ret_string(&mut env, r)
+}
+
+/// A note from the editor: `text` saved as the file `path`, in place of `previous`
+/// (null for a new note). `text` is wiped here once encrypted; the app wipes its own.
+#[no_mangle]
+#[allow(clippy::too_many_arguments)]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultWriteText<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    tree: JObject<'l>,
+    secret: JByteArray<'l>,
+    path: JString<'l>,
+    text: JByteArray<'l>,
+    previous: JString<'l>,
+    replace: jboolean,
+    progress: JObject<'l>,
+) -> jstring {
+    let r = guard(|| {
+        let path = get_string(&mut env, &path)?;
+        let text = get_bytes(&mut env, &text)?;
+        let previous = if previous.is_null() { None } else { Some(get_string(&mut env, &previous)?) };
+        with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| {
+            v.write_text(&path, &text, previous.as_deref(), replace == JNI_TRUE).map(|()| String::new())
+        })
+    });
+    ret_string(&mut env, r)
+}
+
+/// A note's text for the editor: the whole file, verified, if it is no more than
+/// `max` bytes. The caller wipes the array once it has the text.
+#[no_mangle]
+pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultReadText<'l>(
+    mut env: JNIEnv<'l>,
+    _class: JClass<'l>,
+    data_dir: JString<'l>,
+    tree: JObject<'l>,
+    secret: JByteArray<'l>,
+    entry: JString<'l>,
+    max: jni::sys::jlong,
+) -> jbyteArray {
+    let r = guard(|| {
+        let entry = get_string(&mut env, &entry)?;
+        let dir = get_string(&mut env, &data_dir)?;
+        let bytes = opt_bytes(&mut env, &secret)?;
+        let store = SafStore::new(&mut env, &tree)?;
+        let secret = Secret { data_dir: &dir, bytes: bytes.as_deref().map(Vec::as_slice) };
+        let vault = Vault::open_in(Box::new(store), &secret, false)?;
+        vault.read_text(&entry, max.max(0) as u64)
+    });
+    ret_bytes(&mut env, r)
+}
+
 /// `vault-extract` of one file into `out_fd`, a document the app created and
 /// checked is outside the vault; it deletes the document if this fails.
 #[no_mangle]
