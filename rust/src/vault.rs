@@ -1092,6 +1092,8 @@ pub struct Vault {
     /// The desktop printed these to stderr as "warning: ...". Kept here so the app
     /// can show them; vault_cli still prints them.
     warnings: RefCell<Vec<String>>,
+    /// The blobs the change in progress has written (`change`).
+    written: RefCell<Vec<String>>,
 }
 
 impl Vault {
@@ -1111,6 +1113,7 @@ impl Vault {
             _lock: lock,
             progress: Rc::default(),
             warnings: RefCell::default(),
+            written: RefCell::default(),
         }
     }
 
@@ -1297,6 +1300,25 @@ impl Vault {
         Ok(())
     }
 
+    /// Every change goes through here: load the manifest, let `edit` change it (writing
+    /// any new blobs), and commit it as the next generation. If that fails, the blobs
+    /// `edit` wrote are deleted again, unless the manifest naming them may still take
+    /// effect: a store that can't rename over a file (SAF) deletes the old manifest
+    /// before renaming the new one in, and if that rename fails, the staged manifest is
+    /// the committed state, which `recover_manifest` puts in place at the next open.
+    fn change<T>(&self, edit: impl FnOnce(&mut Manifest) -> R<T>) -> R<T> {
+        let mut m = self.load_manifest()?;
+        self.written.borrow_mut().clear();
+        let changed = edit(&mut m).and_then(|done| self.commit_next(m).map(|()| done));
+        let written = self.written.take();
+        if changed.is_err() && self.store.kind(&staging_path(MANIFEST_FILE)) != Kind::File {
+            for blob in written {
+                let _ = self.store.remove_file(&self.blob_rel(&blob));
+            }
+        }
+        changed
+    }
+
     /// The write protocol, once any new blobs are durable: bump the generation and
     /// rename the manifest into place (the commit point), then delete everything the
     /// new manifest does not reference. A crash at any moment leaves the old vault or
@@ -1376,6 +1398,7 @@ impl Vault {
         // before the manifest's is.
         self.store.sync_dir(parent_rel(&rel));
         self.store.sync_dir(BLOBS_DIR);
+        self.written.borrow_mut().push(blob.clone());
         Ok(Entry::File { blob, sha256, size: size.get() })
     }
 
@@ -1385,15 +1408,15 @@ impl Vault {
     }
 
     pub fn add_from(&self, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<()> {
-        let old = self.load_manifest()?;
-        let added = self.add_to(old.clone(), sources, dest, replace);
-        if added.is_err() {
-            self.collect_garbage(&old); // the failed attempt's blobs; old is still current
+        let skipped = self.change(|m| self.add_to(m, sources, dest, replace))?;
+        if skipped > 0 {
+            self.warn(format!("skipped {skipped} item(s) that are not regular files or folders"));
         }
-        added
+        Ok(())
     }
 
-    fn add_to(&self, mut m: Manifest, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<()> {
+    /// Returns how many sources were skipped as neither a file nor a folder.
+    fn add_to(&self, m: &mut Manifest, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<usize> {
         let dest = dest.filter(|d| *d != ROOT_ENTRY);
         if let Some(d) = dest {
             if !valid_vault_path(d) {
@@ -1453,11 +1476,7 @@ impl Vault {
             };
             m.entries.insert(path, entry);
         }
-        self.commit_next(m)?;
-        if skipped > 0 {
-            self.warn(format!("skipped {skipped} item(s) that are not regular files or folders"));
-        }
-        Ok(())
+        Ok(skipped)
     }
 
     /// All of these or none of them: one new manifest, so one new generation.
@@ -1465,20 +1484,22 @@ impl Vault {
         if let Some(bad) = entries.iter().find(|e| !valid_vault_path(e)) {
             return Err(format!("invalid vault path: {bad}"));
         }
-        let mut m = self.load_manifest()?;
-        if let Some(missing) = entries.iter().find(|e| !m.entries.contains_key(**e)) {
-            return Err(format!("'{missing}' is not in the vault"));
-        }
-        m.entries.retain(|path, _| entries.iter().all(|entry| within(path, entry).is_none()));
-        self.commit_next(m)
+        self.change(|m| {
+            if let Some(missing) = entries.iter().find(|e| !m.entries.contains_key(**e)) {
+                return Err(format!("'{missing}' is not in the vault"));
+            }
+            m.entries.retain(|path, _| entries.iter().all(|entry| within(path, entry).is_none()));
+            Ok(())
+        })
     }
 
     /// Empties the vault and leaves it in place. Its own flag rather than
     /// `--entry /`, so that no path, however it got built, can mean this by accident.
     pub fn remove_everything(&self) -> R<()> {
-        let mut m = self.load_manifest()?;
-        m.entries.clear();
-        self.commit_next(m)
+        self.change(|m| {
+            m.entries.clear();
+            Ok(())
+        })
     }
 
     /// Rename or move `from`, a file or a folder with everything in it, to `to`,
@@ -1491,12 +1512,19 @@ impl Vault {
                 return Err(format!("invalid vault path: {p}"));
             }
         }
-        let mut m = self.load_manifest()?;
+        if from == to {
+            // Nothing to commit, so no new generation.
+            return match self.load_manifest()?.entries.contains_key(from) {
+                true => Ok(()),
+                false => Err(format!("'{from}' is not in the vault")),
+            };
+        }
+        self.change(|m| self.rename_in(m, from, to))
+    }
+
+    fn rename_in(&self, m: &mut Manifest, from: &str, to: &str) -> R<()> {
         if !m.entries.contains_key(from) {
             return Err(format!("'{from}' is not in the vault"));
-        }
-        if from == to {
-            return Ok(());
         }
         if m.entries.contains_key(to) {
             return Err(format!("'{to}' already exists in the vault"));
@@ -1518,7 +1546,7 @@ impl Vault {
             let entry = m.entries.remove(&old).expect("listed above");
             m.entries.insert(new, entry);
         }
-        self.commit_next(m)
+        Ok(())
     }
 
     /// Save `text` as the file `path`: a note written in the app (Android only). With
@@ -1526,15 +1554,10 @@ impl Vault {
     /// been renamed, in the same commit. A different file already at `path` is
     /// replaced only if `replace`; a folder never is. The folder it goes in must exist.
     pub fn write_text(&self, path: &str, text: &[u8], previous: Option<&str>, replace: bool) -> R<()> {
-        let old = self.load_manifest()?;
-        let saved = self.write_text_to(old.clone(), path, text, previous, replace);
-        if saved.is_err() {
-            self.collect_garbage(&old); // the failed attempt's blob; old is still current
-        }
-        saved
+        self.change(|m| self.write_text_to(m, path, text, previous, replace))
     }
 
-    fn write_text_to(&self, mut m: Manifest, path: &str, text: &[u8], previous: Option<&str>, replace: bool) -> R<()> {
+    fn write_text_to(&self, m: &mut Manifest, path: &str, text: &[u8], previous: Option<&str>, replace: bool) -> R<()> {
         for p in once(path).chain(previous) {
             if !valid_vault_path(p) {
                 return Err(format!("invalid vault path: {p}"));
@@ -1561,7 +1584,7 @@ impl Vault {
             m.entries.remove(p);
         }
         m.entries.insert(path.to_string(), entry);
-        self.commit_next(m)
+        Ok(())
     }
 
     /// One file's whole plaintext, verified, for the app's note editor (Android only).
@@ -3198,6 +3221,53 @@ mod tests {
         fs::rename(t.path(&format!("elsewhere/{MANIFEST_FILE}")), &staged).unwrap();
         assert!(v.load_manifest().is_err());
         assert!(Path::new(&staged).exists() && !Path::new(&manifest).exists());
+    }
+
+    /// SAF, with the manifest's rename refused once: after the old manifest is gone.
+    struct FailingRenameStore(NoReplaceStore, Cell<bool>);
+
+    impl Store for FailingRenameStore {
+        fn key(&self) -> R<String> { self.0.key() }
+        fn show(&self, rel: &str) -> String { self.0.show(rel) }
+        fn kind(&self, rel: &str) -> Kind { self.0.kind(rel) }
+        fn read(&self, rel: &str) -> io::Result<Vec<u8>> { self.0.read(rel) }
+        fn open(&self, rel: &str) -> io::Result<File> { self.0.open(rel) }
+        fn create_new(&self, rel: &str) -> R<File> { self.0.create_new(rel) }
+        fn rename(&self, from: &str, to: &str) -> io::Result<()> {
+            if to == MANIFEST_FILE && self.1.replace(false) {
+                return Err(io::Error::other("the provider refused the rename"));
+            }
+            self.0.rename(from, to)
+        }
+        fn replaces_on_rename(&self) -> bool { false }
+        fn remove_file(&self, rel: &str) -> io::Result<()> { self.0.remove_file(rel) }
+        fn remove_tree(&self, rel: &str) { self.0.remove_tree(rel) }
+        fn mkdir(&self, rel: &str, recursive: bool) -> R<()> { self.0.mkdir(rel, recursive) }
+        fn list(&self, rel: &str) -> R<Vec<(String, Kind)>> { self.0.list(rel) }
+        fn sync_dir(&self, rel: &str) { self.0.sync_dir(rel) }
+        fn lock(&self, _exclusive: bool) -> R<Box<dyn Any>> { Ok(Box::new(())) }
+    }
+
+    /// The change is reported as failed, but its staged manifest is the committed
+    /// state and the next open puts it in place, so the blobs it names must survive.
+    #[test]
+    fn a_manifest_rename_refused_after_the_delete_keeps_the_new_blobs() {
+        let t = TempDir::new();
+        let built = quick_vault(&t);
+        add(&built, &t.write("a.txt", b"aaa"));
+        let failing = FailingRenameStore(NoReplaceStore(PathStore::new(&built.dir)), Cell::new(true));
+        let v = Vault::with(Box::new(failing), built.key.clone(), None, &host_staging_dir().unwrap());
+        let err = v.add(&[t.write("b.txt", b"bbb")], None, false).unwrap_err();
+        assert!(err.contains("finalizing"), "{err}");
+        assert!(!Path::new(&t.path(&format!("v.vsvault/{MANIFEST_FILE}"))).exists());
+
+        let v = Vault::with(Box::new(NoReplaceStore(PathStore::new(&built.dir))), built.key.clone(), None, &host_staging_dir().unwrap());
+        assert_eq!(generation(&v), 2);
+        for (name, data) in [("a.txt", b"aaa"), ("b.txt", b"bbb")] {
+            let out = t.path(&format!("{name}.out"));
+            v.extract(name, &out).unwrap();
+            assert_eq!(fs::read(&out).unwrap(), data);
+        }
     }
 
     #[test]
