@@ -1203,41 +1203,12 @@ fun App(vm: AppViewModel = viewModel()) {
         }
     }
 
-    /**
-     * Changes never delete encrypted files the vault doesn't list, since they may be
-     * another device's change that hasn't finished syncing. Verify all finds them, and
-     * this removes them, only if the user says so.
-     */
-    fun offerClean(vault: VaultRecord, orphans: Int) {
-        val files = if (orphans == 1) "1 encrypted file" else "$orphans encrypted files"
-        dialog = Confirm(
-            "Remove unused files?",
-            "Every file in “${vault.name}” verified, but its folder also holds $files that the vault " +
-                "doesn't list. An interrupted change leaves these behind. So does a change made on " +
-                "another device, while its folder is still syncing: if that might be the case, wait " +
-                "until syncing finishes.\n\nRemove them?",
-            action = "Remove",
-            destructive = true,
-        ) {
-            dialog = null
-            withVaultSecret(vault) { secret ->
-                runVaultOp(vault, secret, "Removing…", "Unused files removed.") { sink ->
-                    vm.backend.vaultCheck(vault, secret, clean = true, sink)
-                }
-            }
-        }
-    }
-
     fun vaultVerify() {
         val vault = vm.selectedVault ?: return
         withVaultSecret(vault) { secret ->
-            var orphans = 0
-            val ok = runVaultOp(vault, secret, "Verifying…", "Every file verified.") { sink ->
-                vm.backend.vaultCheck(vault, secret, clean = false, sink).also { result ->
-                    orphans = result.output.lines().count { it.startsWith("orphan ") }
-                }
+            runVaultOp(vault, secret, "Verifying…", "Every file verified.") { sink ->
+                vm.backend.vaultCheck(vault, secret, sink)
             }
-            if (ok && orphans > 0) offerClean(vault, orphans)
         }
     }
 

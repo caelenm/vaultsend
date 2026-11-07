@@ -1727,7 +1727,9 @@ impl Vault {
             }
         }
         if clean && !orphans.is_empty() {
-            report.push_str(&format!("removed {} unused blob file(s)\n", self.delete_blobs(orphans)));
+            let removed = self.delete_blobs(orphans);
+            self.warn(format!("removed {removed} unused encrypted file(s) left by an interrupted change"));
+            report.push_str(&format!("removed {removed} unused blob file(s)\n"));
         }
         report.push_str(&format!("ok {verified} file(s) verified\n"));
         Ok(report)

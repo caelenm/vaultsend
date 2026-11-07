@@ -173,11 +173,11 @@ is the device-independent default requested here.)
   choose, and everything in it, so a folder just for vaults is best. Tap a vault, then **Unlock**, to see its files. Above the list,
   **Select all** ticks every row, **Select multiple** turns the rows into tick boxes,
   **Invert selection** (with Select multiple on) flips every tick, and **Verify all**
-  checks every file for tampering. If the vault's folder also holds encrypted files
-  the vault doesn't list, Verify all offers to remove them. Changes never delete those
-  on their own, because a folder synced between devices can hold another device's
-  change before its file list arrives. Change a synced vault from one device at a time,
-  and let syncing finish in between. Below it, a panel you can fold away holds **Add
+  checks every file for tampering; once all of them pass, it also removes encrypted
+  files the vault doesn't list, which an interrupted change leaves behind. Ordinary
+  changes never delete those, because a folder synced between devices can hold another
+  device's change before its file list arrives. So with a synced vault, change it from
+  one device at a time, and don't run Verify all until syncing has finished. Below it, a panel you can fold away holds **Add
   files…** and **Add folder…** (into the selected folder, if one is), **Open**,
   **Extract…**, **Share…** and **Delete** (which act on what's selected, and wait
   until something is), and **Lock**. **Share…** encrypts what's selected as an

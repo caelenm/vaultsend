@@ -653,9 +653,9 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultList<'l>(
     ret_string(&mut env, r)
 }
 
-/// `vault-check`: "orphan ..." lines, then "ok N file(s) verified". With `clean`,
-/// and only once every file has verified, the orphans are deleted instead, and a
-/// "removed N unused blob file(s)" line replaces them.
+/// `vault-check --clean`: verify every file, then, only if all verified, delete blob
+/// files the manifest doesn't name (left by an interrupted change). Ends with
+/// "ok N file(s) verified".
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultCheck<'l>(
     mut env: JNIEnv<'l>,
@@ -663,13 +663,9 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultCheck<'l>(
     data_dir: JString<'l>,
     tree: JObject<'l>,
     secret: JByteArray<'l>,
-    clean: jboolean,
     progress: JObject<'l>,
 ) -> jstring {
-    let clean = clean != 0;
-    let r = guard(|| {
-        with_vault(&mut env, &data_dir, &tree, &secret, clean, &progress, &mut |_, v| if clean { v.clean() } else { v.check() })
-    });
+    let r = guard(|| with_vault(&mut env, &data_dir, &tree, &secret, true, &progress, &mut |_, v| v.clean()));
     ret_string(&mut env, r)
 }
 
