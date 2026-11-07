@@ -4,7 +4,7 @@
 // drive exactly as they drive the desktop binary.
 //
 //   vault-create  --dir P --mode self|password --pass-fd N
-//   vault-list|vault-check  --dir P --pass-fd N
+//   vault-list|vault-check  --dir P --pass-fd N   (vault-check --clean also removes orphans)
 //   vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
 //   vault-remove  --dir P --pass-fd N (--entry VAULTPATH... | --all)
 //   vault-extract --dir P --pass-fd N --entry VAULTPATH... --out PATH
@@ -79,18 +79,20 @@ pub(crate) struct Opts<'a> {
     pairs: Vec<(&'a str, &'a str)>,
     pub(crate) replace: bool,
     everything: bool,
+    clean: bool,
 }
 
 /// Strict "--name value" pairs, unlike the scanning helpers in main.rs, because
 /// values here can be names out of a vault: a folder called "--replace" must not
 /// read as the flag.
 pub(crate) fn parse_opts(args: &[String]) -> R<Opts<'_>> {
-    let mut o = Opts { pairs: Vec::new(), replace: false, everything: false };
+    let mut o = Opts { pairs: Vec::new(), replace: false, everything: false, clean: false };
     let mut it = args.iter().map(String::as_str);
     while let Some(name) = it.next() {
         match name {
             "--replace" => o.replace = true,
             "--all" => o.everything = true,
+            "--clean" => o.clean = true,
             "--dir" | "--mode" | "--pass-fd" | "--progress-fd" | "--src" | "--dest" | "--entry" | "--out" | "--to" => {
                 o.pairs.push((name, it.next().ok_or_else(|| format!("{name} needs a value"))?))
             }
@@ -163,6 +165,7 @@ pub fn run(cmd: &str, args: &[String]) -> R<()> {
             ref many => v.extract_many(many, o.need("--out")?),
         }),
         "vault-share" => with(open(false)?, &|v| v.share(&o.entries()?, &o.all("--to"), o.need("--out")?)),
+        "vault-check" if o.clean => with(open(true)?, &|v| print_out(&v.clean()?)),
         "vault-check" => with(open(false)?, &|v| print_out(&v.check()?)),
         other => Err(format!("unknown command '{other}'")),
     }

@@ -88,9 +88,12 @@ object VaultSendNative {
     @Throws(BackendException::class)
     external fun vaultList(dataDir: String, tree: VaultTree, secret: ByteArray?): String
 
-    /** "orphan ..." lines, then "ok N file(s) verified". */
+    /**
+     * "orphan ..." lines, then "ok N file(s) verified". With [clean], once every file
+     * has verified, the orphans are deleted and "removed N unused blob file(s)" replaces them.
+     */
     @Throws(BackendException::class)
-    external fun vaultCheck(dataDir: String, tree: VaultTree, secret: ByteArray?, progress: ProgressSink?): String
+    external fun vaultCheck(dataDir: String, tree: VaultTree, secret: ByteArray?, clean: Boolean, progress: ProgressSink?): String
 
     @Throws(BackendException::class)
     external fun vaultAdd(

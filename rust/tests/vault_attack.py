@@ -196,8 +196,8 @@ def section_crash():
 
     if committed + aborted:
         check(backend("vault-add", "--dir", v, "--src", make_files(T / "crash-after-add", 1), secret=ID_PASS).returncode == 0, "the next change works")
-        chk = backend("vault-check", "--dir", v, secret=ID_PASS)
-        check(chk.returncode == 0 and "orphan" not in chk.stdout, "and collects what the killed runs left", chk.stdout[-200:])
+        chk = backend("vault-check", "--clean", "--dir", v, secret=ID_PASS)
+        check(chk.returncode == 0 and "orphan" not in chk.stdout, "and vault-check --clean collects what the killed runs left", chk.stdout[-200:])
 
     # Removing: the same promise.
     r = backend("vault-list", "--dir", v, secret=ID_PASS)

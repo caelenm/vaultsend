@@ -205,7 +205,10 @@ for MODE in self password; do
     echo stray >"$V/blobs/ab/abababababababababababababababab.age"
     check "vault-check reports the stray blob" grep -qx 'orphan blobs/ab/abababababababababababababababab.age' \
         <<<"$(vault vault-check 2>/dev/null)"
-    check "a change collects the stray blob" vault vault-remove --entry tree/empty.txt
+    check "a change succeeds with the stray blob there" vault vault-remove --entry tree/empty.txt
+    check "and leaves it alone (it may be another device's)" [ -e "$V/blobs/ab/abababababababababababababababab.age" ]
+    check "vault-check --clean removes the stray blob" grep -qx 'removed 1 unused blob file(s)' \
+        <<<"$(vault vault-check --clean 2>/dev/null)"
     check "stray blob is gone" [ ! -e "$V/blobs/ab/abababababababababababababababab.age" ]
     check "a file that isn't a blob is left alone" [ -e "$V/blobs/ab_not_a_blob" ]
 done

@@ -349,9 +349,9 @@ class Backend(private val context: Context) {
         result(VaultSendNative.vaultList(dataDir, openVault(record), secret))
     }
 
-    suspend fun vaultCheck(record: VaultRecord, secret: ByteArray?, progress: ProgressSink?): VaultResult =
+    suspend fun vaultCheck(record: VaultRecord, secret: ByteArray?, clean: Boolean, progress: ProgressSink?): VaultResult =
         withContext(Dispatchers.IO) {
-            result(VaultSendNative.vaultCheck(dataDir, openVault(record), secret, progress))
+            result(VaultSendNative.vaultCheck(dataDir, openVault(record), secret, clean, progress))
         }
 
     /** Add picked files and folders, under `dest` (null for the top of the vault). */
