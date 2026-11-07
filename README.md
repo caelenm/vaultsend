@@ -16,8 +16,16 @@ curl https://raw.githubusercontent.com/caelenm/vaultsend/refs/heads/main/install
 This will download the necessary build dependencies, compile the program, pack it into an appimage, and add it to your launcher.
 
 # Description
-A small, auditable desktop app for encrypting files and text to people you
-choose, using the [age](https://github.com/str4d/rage) encryption format. Allows you to encrypt and decrypt text messages, files, and folders (if zipped) using public-private key cryptography. You can use it just to easily protect your own data, or for securely sharing data with others. Integrated functionality for file drag and drop and persistent contacts list.
+VaultSend is a small, auditable desktop app for Linux that keeps your files and
+messages private. Encrypt text, files and whole folders to the people you choose,
+or keep a folder of your own permanently encrypted in a vault. It uses public-private
+key cryptography through the [age](https://github.com/str4d/rage) encryption format,
+so what you produce can be opened with standard tools as well as VaultSend.
+
+Use it to protect your own data, or to share something securely with others: send
+them an encrypted message or file, or hand over a whole vault protected by a password.
+Drag and drop is built in, and a persistent contacts list keeps the people you write
+to one click away. There is no account, no sign-in and no network access.
 
 It is built so that one person can read the whole thing in an afternoon. There
 are two parts and a hard line between them:
@@ -134,40 +142,40 @@ applies on Linux for now — see Platform support below.
 
 ## Features
 
-- **Encrypt / decrypt text.** Paste or type a message, encrypt it to one or
-  more recipients, and get back armored (ASCII) text you can paste into an
-  email or chat. Decrypting is the same in reverse — paste the armored text,
-  enter your passphrase.
-- **Encrypt / decrypt files.** Drag a file onto the window or use **Open
-  file…**; choose the operation and where to save the result. Files stream
-  through the backend rather than loading fully into memory.
-- **Multi-recipient encryption.** Pick any number of contacts when encrypting;
-  everyone you choose (plus you, automatically) can decrypt the result. This
-  costs nothing extra in security — age wraps one randomly generated body key
-  per recipient rather than re-encrypting the body multiple times.
-- **Contacts.** A simple, exportable JSON address book of names and public
-  keys. Nothing in it is secret, so it's safe to back up or sync however you
-  like.
+- **Encrypt and decrypt text.** Paste or type a message, choose who it is for, and
+  get back armored (ASCII) text to paste into an email or chat. To read one, paste
+  it back in and enter your passphrase.
+- **Encrypt and decrypt files.** Drag a file onto the window or use **Open file…**,
+  choose the operation and where to save the result. Files stream through the
+  backend rather than loading fully into memory.
+- **Send to several people at once.** Pick any number of contacts; each of them (and
+  you, automatically) can decrypt the result. This costs nothing extra in security.
+- **Contacts.** A simple, exportable address book of names and public keys. Nothing
+  in it is secret, so it is safe to back up or sync however you like.
 - **Vaults.** Keep a whole folder encrypted and change it one file at a time. Add
   files and folders, open a file in its default app from a copy held in memory,
-  extract files where you choose, delete them, and verify the whole vault for tampering. Open one with your own key, or with a password if you
-  want to share it. Names and folder structure stay hidden; see the limitations
-  below for what a vault does reveal. Once every file passes, **Verify all** also
-  removes encrypted files the vault doesn't list, which an interrupted change leaves
-  behind. Ordinary changes never delete those, because a folder synced between devices
-  can hold another device's change before its file list arrives. So with a synced
-  vault, change it from one device at a time, and don't run Verify all until syncing
-  has finished.
+  extract files where you choose, delete them, and verify the whole vault for
+  tampering. Open a vault with your own key, or with a password if you want to
+  share it. File names and folder structure stay hidden; see the limitations below
+  for what a vault does reveal. Once every file passes, **Verify all** also removes
+  encrypted files the vault doesn't list, which an interrupted change leaves behind.
+  Ordinary changes never delete those, because a folder synced between devices can
+  hold another device's change before its file list arrives. So with a synced vault,
+  change it from one device at a time, and don't run Verify all until syncing has
+  finished.
+- **Share from a vault.** Select files or folders in a vault and share them with a
+  contact, or with a password. The result is an ordinary age file that only they
+  can open. Shares from the Android app open here too, and the other way round.
+- **Multi-select.** Select several vault items at once to open, extract, share or
+  delete them together.
 - **Remember passphrase.** Optionally keep your passphrase in memory until the app
-  closes, with **Lock now** in the menu.
-  Off by default; see the security model above for the trade-off.
-- **No network code, no plugins, one identity per user.** VaultSend doesn't
-  fetch keys from anywhere or phone home. What you see in the three source files
-  is the entire app.
-- **Plaintext touches disk only when you ask.** Decrypting writes a file to
-  disk only if you choose **Open file… → Decrypt** with an output path;
-  decrypting pasted text keeps the result in memory and on screen, never on
-  disk, unless you explicitly save it.
+  closes, with **Lock now** in the menu. Off by default; see the security model
+  above for the trade-off.
+- **Plaintext touches disk only when you ask.** Decrypting writes a file to disk
+  only if you choose an output path; decrypting pasted text keeps the result in
+  memory and on screen unless you explicitly save it.
+- **Private by design.** No network code, no plugins, one identity per user.
+  VaultSend doesn't fetch keys from anywhere or phone home.
 
 ## Build
 
@@ -345,6 +353,39 @@ the destination is never a partial file (and `--out` may safely name the input).
 For a vault, `--pass-fd` carries your passphrase for a `self` vault and the vault's
 password for a `password` vault.
 
+## Changing your passphrase
+
+Your passphrase only protects `identity.age`, the encrypted file holding your private
+key. Changing it re-wraps that same key under a new passphrase, so your public key,
+contacts, past messages and every vault that opens with your key keep working. (The
+window doesn't have a button for this yet, so it is done with the standard
+[`age`](https://github.com/FiloSottile/age) command-line tool, or `rage`, from a
+terminal.)
+
+Close VaultSend first, then run:
+
+```sh
+cd ~/.local/share/vaultsend        # or $XDG_DATA_HOME/vaultsend
+cp identity.age identity.age.bak   # keep a copy until you've checked the new one
+(set -o pipefail; age -d identity.age | age -p -o identity.age.new) \
+  && chmod 600 identity.age.new \
+  && mv identity.age.new identity.age
+```
+
+`age` asks for your **current** passphrase, then for the **new** one twice. Use at
+least 10 characters, the same as VaultSend requires; `age` itself won't enforce that.
+The `pipefail` and `&&` mean `identity.age` is replaced only if both steps succeeded,
+so a mistyped current passphrase leaves everything untouched. `age -p` uses the
+standard work factor (2^18), the same one VaultSend uses.
+
+Then start VaultSend and decrypt something with the new passphrase to confirm it works.
+Once it does, delete the backup with `rm identity.age.bak`. Any older copy of
+`identity.age` you made elsewhere still opens with the old passphrase, so replace those
+with the new file or delete them.
+
+This is for your key's passphrase only. A password vault's password can't be changed yet
+(see Scope / limitations).
+
 ## Backing up and restoring
 
 VaultSend keeps all of your state in two well-known locations outside the
@@ -450,8 +491,9 @@ pipe uses Unix file descriptors). This repo will not attempt to port to windows 
   `hidepid`. Passphrases and passwords never do.
 - A folder extract that is killed partway leaves the files written so far, decrypted, in
   `<name>.vaultsend-part`. Running the same extract again clears them.
-- A password can't be changed yet, and there's no single-file export: sharing a
-  password vault means copying its folder.
+- A password vault's password can't be changed yet (your own passphrase can; see
+  *Changing your passphrase*), and there's no single-file export: sharing a password
+  vault means copying its folder.
 - No third-party security audit has been performed. See the security warning
   at the top of this document.
 
