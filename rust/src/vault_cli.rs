@@ -13,16 +13,19 @@
 // Anything that opens a vault also takes --progress-fd N. The identity is read
 // from $XDG_DATA_HOME/vaultsend (default ~/.local/share/vaultsend), as on desktop.
 
+use std::cell::RefCell;
+use std::collections::BTreeMap;
 use std::env;
-use std::fs::File;
+use std::fs::{self, DirBuilder, File};
 use std::io::{self, Read, Write};
 use std::mem::ManuallyDrop;
+use std::os::unix::fs::DirBuilderExt;
 use std::os::unix::io::FromRawFd;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use crate::backend::{secret_buffer, SecretBuf};
-use crate::vault::{self, PathStore, Progress, Secret, Vault};
+use crate::vault::{self, Out, PathStore, Plan, Progress, Secret, Sources, Vault};
 use crate::R;
 
 /// Where the desktop keeps identity.age.
@@ -73,7 +76,136 @@ impl Vault {
         let data_dir = data_dir();
         Vault::open_in(Box::new(PathStore::new(dir)), &Secret { data_dir: &data_dir, bytes: Some(&secret) }, exclusive)
     }
+
+    /// A vault on a real path (the desktop's `Vault::create`, kept for the tests).
+    /// It stages plaintext in a private folder of this process's under the temp dir.
+    pub fn create(dir: &str, mode: &str, wrap: age::Encryptor) -> R<Vault> {
+        Vault::create_in(Box::new(PathStore::new(dir)), mode, wrap, &host_staging_dir()?)
+    }
+
+    /// Add files and folders from real paths (the desktop's `add`).
+    pub fn add<S: AsRef<str>>(&self, sources: &[S], dest: Option<&str>, replace: bool) -> R<()> {
+        self.add_from(&PathSources::new(sources), dest, replace)
+    }
+
+    /// Extract to a real path (the desktop's `extract`).
+    pub fn extract(&self, entry: &str, out: &str) -> R<()> {
+        let (folder, name) = path_out(out)?;
+        self.extract_to(entry, Out::In(&folder, &name))
+    }
+
+    /// Several entries into a new folder `out` (the desktop's `extract` of several).
+    pub fn extract_many(&self, entries: &[&str], out: &str) -> R<()> {
+        let (folder, name) = path_out(out)?;
+        self.extract_many_to(entries, Out::In(&folder, &name))
+    }
+
+    /// Share to a real path (the desktop's `share`).
+    pub fn share(&self, entries: &[&str], to: &[&str], out: &str) -> R<()> {
+        let (folder, name) = path_out(out)?;
+        self.share_to(entries, to, Out::In(&folder, &name))
+    }
 }
+
+/// The folder `path` is in, "." for a bare name.
+pub(crate) fn parent_of(path: &str) -> &str {
+    match Path::new(path).parent().and_then(Path::to_str) {
+        Some("") | None => ".",
+        Some(parent) => parent,
+    }
+}
+
+/// A path as an output: its folder as a store, and its name.
+fn path_out(out: &str) -> R<(PathStore, String)> {
+    let name = Path::new(out).file_name().and_then(|n| n.to_str());
+    let name = name.ok_or_else(|| format!("--out must name a file or folder: {out}"))?;
+    Ok((PathStore::new(parent_of(out)), name.to_string()))
+}
+
+/// Real paths, walked as the desktop does.
+pub struct PathSources {
+    paths: Vec<String>,
+    files: RefCell<Vec<PathBuf>>,
+}
+
+impl PathSources {
+    pub fn new<S: AsRef<str>>(paths: &[S]) -> PathSources {
+        PathSources { paths: paths.iter().map(|p| p.as_ref().to_string()).collect(), files: RefCell::default() }
+    }
+}
+
+impl Sources for PathSources {
+    fn plan(&self) -> R<Plan> {
+        let mut plan = BTreeMap::new();
+        let mut skipped = 0;
+        for src in &self.paths {
+            let src = Path::new(src);
+            let name = src.file_name().and_then(|n| n.to_str());
+            let name = name.ok_or_else(|| format!("{}: no usable file name", src.display()))?;
+            plan_source(src, name, &mut plan, &mut skipped)?;
+        }
+        let mut files = self.files.borrow_mut();
+        let items = plan.into_iter().map(|(target, src)| {
+            (target, src.map(|path| {
+                files.push(path);
+                files.len() - 1
+            }))
+        });
+        Ok((items.collect(), skipped))
+    }
+
+    fn open(&self, index: usize) -> R<Box<dyn Read>> {
+        let src = &self.files.borrow()[index];
+        let file = File::open(src).map_err(|e| format!("opening {}: {e}", src.display()))?;
+        let meta = file.metadata().map_err(|e| format!("{}: {e}", src.display()))?;
+        if !meta.is_file() {
+            return Err(format!("{} is no longer a regular file", src.display()));
+        }
+        Ok(Box::new(file))
+    }
+
+    fn size(&self, index: usize) -> u64 {
+        fs::symlink_metadata(&self.files.borrow()[index]).map_or(0, |meta| meta.len())
+    }
+}
+
+/// Walk one source into `plan` (path -> None for a folder, Some(path) for a
+/// file). Lstat throughout: symlinks, sockets, devices and FIFOs are never followed
+/// or read, only counted.
+fn plan_source(src: &Path, target: &str, plan: &mut BTreeMap<String, Option<PathBuf>>, skipped: &mut usize) -> R<()> {
+    let fail = |e: io::Error| format!("{}: {e}", src.display());
+    let meta = fs::symlink_metadata(src).map_err(fail)?;
+    if !meta.is_file() && !meta.is_dir() {
+        *skipped += 1;
+        return Ok(());
+    }
+    if plan.insert(target.to_string(), meta.is_file().then(|| src.to_path_buf())).is_some() {
+        return Err(format!("two sources would both be stored as '{target}'"));
+    }
+    if meta.is_dir() {
+        for child in fs::read_dir(src).map_err(fail)? {
+            let child = child.map_err(fail)?;
+            let name = child.file_name();
+            let name = name.to_str().ok_or_else(|| format!("{}: name is not valid UTF-8", child.path().display()))?;
+            plan_source(&child.path(), &format!("{target}/{name}"), plan, skipped)?;
+        }
+    }
+    Ok(())
+}
+
+/// Where a vault made by `Vault::create` (the tests) stages plaintext: a private
+/// folder of this process's under the temp dir, so its sweep of leftovers can't
+/// touch another process's staging.
+pub(crate) fn host_staging_dir() -> R<String> {
+    let dir = std::env::temp_dir().join(format!("vaultsend-staging-{}", std::process::id()));
+    DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dir)
+        .map_err(|e| format!("creating {}: {e}", dir.display()))?;
+    dir.to_str().map(str::to_string).ok_or_else(|| format!("{}: not valid UTF-8", dir.display()))
+}
+
 
 pub(crate) struct Opts<'a> {
     pairs: Vec<(&'a str, &'a str)>,
