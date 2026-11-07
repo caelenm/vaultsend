@@ -17,4 +17,3 @@
 -keep class org.vaultsend.VaultTree { public *; }
 -keep class org.vaultsend.VaultSources { public int openSource(int); }
 -keep class org.vaultsend.ProgressSink { public void report(int); public boolean isCancelled(); }
--keep class * extends org.vaultsend.ProgressSink { public void report(int); public boolean isCancelled(); }

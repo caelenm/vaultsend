@@ -20,6 +20,7 @@ import androidx.compose.ui.platform.PlatformTextInputMethodRequest
 import androidx.core.content.IntentCompat
 import org.vaultsend.ui.App
 import org.vaultsend.ui.AppViewModel
+import org.vaultsend.ui.PendingShare
 import org.vaultsend.ui.VaultSendTheme
 
 class MainActivity : ComponentActivity() {
@@ -93,19 +94,19 @@ class MainActivity : ComponentActivity() {
                     ?: return
                 val accepted = uris.filter { accept(it) }
                 if (accepted.size < uris.size) refused()
-                if (accepted.isNotEmpty()) vm.offerShareMany(accepted)
+                if (accepted.isNotEmpty()) vm.pendingShare = PendingShare.ManyFiles(accepted)
             }
             Intent.ACTION_SEND -> {
                 val uri = IntentCompat.getParcelableExtra(intent, Intent.EXTRA_STREAM, Uri::class.java)
                 if (uri != null) {
-                    if (accept(uri)) vm.setPendingShare(uri, null) else refused()
+                    if (accept(uri)) vm.pendingShare = PendingShare.OneFile(uri) else refused()
                 } else {
                     val text = intent.getStringExtra(Intent.EXTRA_TEXT)
-                    if (!text.isNullOrEmpty()) vm.setPendingShare(null, text)
+                    if (!text.isNullOrEmpty()) vm.pendingShare = PendingShare.Text(text)
                 }
             }
             Intent.ACTION_VIEW -> {
-                intent.data?.let { if (accept(it)) vm.setPendingShare(it, null) else refused() }
+                intent.data?.let { if (accept(it)) vm.pendingShare = PendingShare.OneFile(it) else refused() }
             }
         }
     }

@@ -19,7 +19,7 @@ import org.vaultsend.BACKGROUND_LOCK_MS
 import org.vaultsend.Backend
 import org.vaultsend.Contact
 import org.vaultsend.ContactStore
-import org.vaultsend.REMEMBER_SECONDS
+import org.vaultsend.REMEMBER_CHOICES
 import org.vaultsend.VaultRecord
 import org.vaultsend.VaultSelection
 import org.vaultsend.VaultStore
@@ -33,6 +33,18 @@ enum class SidebarMode { Contacts, Vaults }
 
 /** A decrypted copy handed to another app by Open, and the vault it came from. */
 data class OpenedCopy(val vaultUri: String, val file: File)
+
+/** What another app handed over (share sheet, "open with"), waiting for the UI. */
+sealed interface PendingShare {
+    /** A file: the encrypt/decrypt chooser. */
+    data class OneFile(val uri: Uri) : PendingShare
+
+    /** Plain text: into the message box. */
+    data class Text(val text: String) : PendingShare
+
+    /** Several files: added to the open vault. */
+    data class ManyFiles(val uris: List<Uri>) : PendingShare
+}
 
 /** The top-level screen the app is showing. Dialogs overlay these. */
 enum class AppPhase {
@@ -114,17 +126,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     /**
-     * A file or text shared into the app from outside (share sheet / "open with").
-     * Picked up by the UI once the app is past onboarding, then cleared.
+     * A file, text or several files shared into the app from outside (share sheet,
+     * "open with"). Picked up by the UI once the app is past onboarding, then cleared.
      */
-    var pendingShareUri by mutableStateOf<Uri?>(null)
-        private set
-    var pendingShareText by mutableStateOf<String?>(null)
-        private set
-
-    /** Several files shared in at once (SEND_MULTIPLE): offered to the open vault. */
-    var pendingShareMany by mutableStateOf<List<Uri>?>(null)
-        private set
+    var pendingShare by mutableStateOf<PendingShare?>(null)
 
     val contacts = mutableStateListOf<Contact>().apply { addAll(contactStore.load()) }
 
@@ -136,14 +141,16 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * Clear the session key and every remembered vault key (the native lock()
      * does both), and update [unlocked]. Open vaults show as locked again and
-     * their opened copies are deleted: the desktop's Lock now.
+     * decrypted text leaves the box. Unless [keepCopies] (the background lock,
+     * when one is probably being looked at in another app), opened copies are
+     * deleted too: the desktop's Lock now.
      */
-    fun lockSession() {
+    fun lockSession(keepCopies: Boolean = false) {
         backend.lock()
         unlocked = false
         lockVaultPage()
         clearDecryptedMessage()
-        discardCopies()
+        if (!keepCopies) discardCopies()
     }
 
     // --- Vaults ---------------------------------------------------------------
@@ -188,13 +195,13 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
     val openedCopies = mutableStateListOf<OpenedCopy>()
 
     init {
-        backend.setVaultRemember(rememberSeconds())
+        backend.setVaultRemember(settings.remembers)
         // A new view model means a new process, or an activity that finished (and
         // locked) before this one: no opened copy can be in use, and none would be in
         // [openedCopies] if Android had restarted the app, so they're swept here. So
         // is plaintext staging a killed run left in the data dir; the core skips that
         // if something is staging, so it can run off the main thread.
-        backend.discardCopies()
+        backend.discardAllCopies()
         viewModelScope.launch(Dispatchers.IO) { runCatching { backend.sweepStaging() } }
     }
 
@@ -227,19 +234,9 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
         backend.forgetVault(record)
         discardCopies(record)
         if (selectedVault?.uri == record.uri) selectVault(null)
-        runCatching {
-            val uri = android.net.Uri.parse(record.uri)
-            val tree = android.provider.DocumentsContract.buildTreeDocumentUri(
-                uri.authority, android.provider.DocumentsContract.getTreeDocumentId(uri),
-            )
-            // Keep the grant if another vault in the list lives under the same tree.
-            if (vaults.none { it.uri.startsWith("$tree/") }) {
-                getApplication<Application>().contentResolver.releasePersistableUriPermission(
-                    tree,
-                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION or android.content.Intent.FLAG_GRANT_WRITE_URI_PERMISSION,
-                )
-            }
-        }
+        // Keep the grant if another vault in the list lives under the same tree.
+        val tree = runCatching { backend.vaultTree(record).treeUri }.getOrNull() ?: return
+        if (vaults.none { it.uri.startsWith("$tree/") }) backend.releaseAccess(tree)
     }
 
     /** Accept a listing: remember its generation, and show it with nothing selected. */
@@ -276,7 +273,7 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
      */
     fun discardCopies(record: VaultRecord? = null) {
         if (record == null) {
-            backend.discardCopies()
+            backend.discardAllCopies()
             openedCopies.clear()
             return
         }
@@ -287,36 +284,23 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     // --- Remember passphrase --------------------------------------------------
 
-    /** The chosen lifetime: 0 none, null until the app closes. */
-    fun rememberSeconds(): Long? = REMEMBER_SECONDS[settings.remember]
-
     /**
-     * Change how long secrets are remembered. As on desktop, this forgets what
+     * Change whether secrets are remembered. As on desktop, this forgets what
      * was remembered: the session locks and remembered vault keys go.
      */
     fun setRemember(choice: String) {
-        if (choice == settings.remember || choice !in REMEMBER_SECONDS) return
+        if (choice == settings.remember || choice !in REMEMBER_CHOICES) return
         updateSettings(settings.copy(remember = choice))
-        backend.setVaultRemember(rememberSeconds())
+        backend.setVaultRemember(settings.remembers)
         lockSession()
-    }
-
-    /** Sweep remembered vault keys. Polled; no choice is timed, so nothing else expires. */
-    fun enforceRemember() {
-        backend.sweepVaultKeys()
-    }
-
-    /** The background auto-lock: keys, open vault pages and decrypted text, but not opened copies. */
-    fun lockForBackground() {
-        backend.lock()
-        unlocked = false
-        lockVaultPage()
-        clearDecryptedMessage()
     }
 
     // --- The background lock's timing ---------------------------------------
     // Here rather than in the activity, so that one instance can cancel the timer
     // another posted (a rotation while away makes a new activity).
+
+    /** The background auto-lock: everything Lock now does, except deleting opened copies. */
+    private fun lockForBackground() = lockSession(keepCopies = true)
 
     private val lockHandler = Handler(Looper.getMainLooper())
     private val backgroundLock = Runnable { lockForBackground() }
@@ -348,26 +332,10 @@ class AppViewModel(app: Application) : AndroidViewModel(app) {
 
     /** After an operation that used the session: with Remember off, lock straight away. */
     fun afterSecretUse() {
-        if (rememberSeconds() == 0L && unlocked) {
+        if (!settings.remembers && unlocked) {
             backend.lock()
             unlocked = false
         }
-    }
-
-    /** Record content shared into the app; consumed by the UI when ready. */
-    fun setPendingShare(uri: Uri?, text: String?) {
-        pendingShareUri = uri
-        pendingShareText = text
-    }
-
-    fun clearPendingShare() {
-        pendingShareUri = null
-        pendingShareText = null
-        pendingShareMany = null
-    }
-
-    fun offerShareMany(uris: List<Uri>) {
-        pendingShareMany = uris
     }
 
     fun addContact(name: String, pubkey: String) {

@@ -1,6 +1,7 @@
 package org.vaultsend
 
 import android.content.Context
+import android.content.Intent
 import android.media.MediaScannerConnection
 import android.net.Uri
 import android.os.Build
@@ -11,6 +12,9 @@ import android.provider.OpenableColumns
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.File
+import java.nio.ByteBuffer
+import java.nio.charset.CharacterCodingException
+import java.nio.charset.CodingErrorAction
 import java.nio.file.Files
 import java.nio.file.attribute.PosixFilePermissions
 
@@ -19,6 +23,11 @@ import java.nio.file.attribute.PosixFilePermissions
  * private internal storage, the Android equivalent of the desktop XDG data dir)
  * and runs every native call on the IO dispatcher, so a large file never blocks
  * the UI thread. The cryptography and the on-disk layout are identical to desktop.
+ *
+ * Every decrypt uses the unlocked session key (or a share's password): the UI
+ * unlocks the session first, and locks it again afterwards when Remember
+ * passphrase is off. No call here takes the identity passphrase except keygen,
+ * unlock, import and recoverPubkey.
  *
  * Contacts are deliberately NOT handled here: like the desktop frontend, they
  * live entirely on the UI side (see [ContactStore]) and never cross into the
@@ -52,7 +61,7 @@ class Backend(private val context: Context) {
         VaultSendNative.unlock(dataDir, passphrase)
     }
 
-    /** Forget the cached session key. Cheap; safe to call from any thread. */
+    /** Forget the session key and every remembered vault key. Cheap; safe from any thread. */
     fun lock() = VaultSendNative.lock()
 
     /** Whether a session key is currently held. */
@@ -65,10 +74,7 @@ class Backend(private val context: Context) {
      */
     suspend fun importIdentity(passphrase: ByteArray, input: Uri): String =
         withContext(Dispatchers.IO) {
-            context.contentResolver.openFileDescriptor(input, "r").use { pfd ->
-                requireNotNull(pfd) { "Couldn't open the selected file." }
-                VaultSendNative.importIdentity(dataDir, passphrase, pfd.fd)
-            }
+            readFd(input) { VaultSendNative.importIdentity(dataDir, passphrase, it) }
         }
 
     /**
@@ -77,7 +83,7 @@ class Backend(private val context: Context) {
      * copy with no key material exposed in the clear.
      */
     suspend fun exportIdentity(output: Uri) = withContext(Dispatchers.IO) {
-        val src = java.io.File(dataDir, "identity.age")
+        val src = File(dataDir, "identity.age")
         if (!src.exists()) throw BackendException("There's no identity to back up yet.")
         context.contentResolver.openOutputStream(output, "wt").use { os ->
             requireNotNull(os) { "Couldn't open the destination." }
@@ -96,92 +102,80 @@ class Backend(private val context: Context) {
         return runCatching { VaultSendNative.encryptBytes(arrayOf(k), false, ByteArray(0)) }.isSuccess
     }
 
+    // --- Text and files on the main page ---------------------------------------
+
     /** Encrypt copy/paste text; result is ASCII-armored so it pastes anywhere. */
     suspend fun encryptText(recipients: List<String>, text: String): String =
         withContext(Dispatchers.IO) {
-            val out = VaultSendNative.encryptBytes(
-                recipients.toTypedArray(),
-                /* armor = */ true,
-                text.toByteArray(Charsets.UTF_8),
-            )
+            val out = VaultSendNative.encryptBytes(recipients.toTypedArray(), true, text.toByteArray(Charsets.UTF_8))
             String(out, Charsets.UTF_8)
         }
 
-    suspend fun decryptText(passphrase: ByteArray, text: String): String =
-        withContext(Dispatchers.IO) {
-            val out = VaultSendNative.decryptBytes(
-                dataDir,
-                passphrase,
-                text.toByteArray(Charsets.UTF_8),
-            )
-            String(out, Charsets.UTF_8)
-        }
-
-    /** Decrypt copy/paste text with the unlocked session key (no passphrase). */
-    suspend fun decryptTextSession(text: String): String =
+    /** Decrypt copy/paste text with the unlocked session key. */
+    suspend fun decryptText(text: String): String =
         withContext(Dispatchers.IO) {
             val out = VaultSendNative.decryptBytesSession(text.toByteArray(Charsets.UTF_8))
             String(out, Charsets.UTF_8)
         }
 
-    /** Encrypt a picked file to a chosen destination; binary (no armor) for files. */
+    /** Encrypt a picked file for [recipients] into `output`, which is removed if this fails. */
     suspend fun encryptFile(recipients: List<String>, input: Uri, output: Uri) =
         withContext(Dispatchers.IO) {
-            withFds(input, output) { inFd, outFd ->
-                VaultSendNative.encryptFd(recipients.toTypedArray(), /* armor = */ false, inFd, outFd)
-            }
+            withFds(input, output) { inFd, outFd -> VaultSendNative.encryptFd(recipients.toTypedArray(), inFd, outFd) }
         }
 
-    /** Encrypt a picked file for anyone with [password]. */
+    /** Encrypt a picked file for anyone with [password], as [encryptFile]. */
     suspend fun encryptFilePassword(password: ByteArray, input: Uri, output: Uri) =
         withContext(Dispatchers.IO) {
-            withFds(input, output) { inFd, outFd ->
-                VaultSendNative.encryptFdPassword(password, inFd, outFd)
-            }
-        }
-
-    suspend fun decryptFile(passphrase: ByteArray, input: Uri, output: Uri) =
-        withContext(Dispatchers.IO) {
-            withFds(input, output) { inFd, outFd ->
-                VaultSendNative.decryptFd(dataDir, passphrase, inFd, outFd)
-            }
-        }
-
-    /** Decrypt a picked file with the unlocked session key (no passphrase). */
-    suspend fun decryptFileSession(input: Uri, output: Uri) =
-        withContext(Dispatchers.IO) {
-            withFds(input, output) { inFd, outFd ->
-                VaultSendNative.decryptFdSession(dataDir, inFd, outFd)
-            }
+            withFds(input, output) { inFd, outFd -> VaultSendNative.encryptFdPassword(password, inFd, outFd) }
         }
 
     /**
-     * Remove a destination created by "Save as" for an operation that failed,
-     * so a failed encrypt doesn't leave a truncated .age file (and a failed
-     * decrypt an empty one) that looks like a real result. Best-effort.
+     * Decrypt a file as it is (a share's archive stays one) into `output`, which is
+     * removed if this fails. `password` is a password share's, or null for the
+     * unlocked session key. Nothing reaches `output` until all of it has authenticated.
+     */
+    suspend fun decryptFile(password: ByteArray?, input: Uri, output: Uri) =
+        withContext(Dispatchers.IO) {
+            withFds(input, output) { inFd, outFd -> VaultSendNative.sharedDecrypt(dataDir, password, inFd, outFd) }
+        }
+
+    /**
+     * Remove a destination created by "Save as" for an operation that failed or was
+     * abandoned, so a truncated .age file (or an empty one) doesn't look like a real
+     * result. Best-effort, and a no-op for a staged share file (the caller deletes it).
      */
     fun discardOutput(output: Uri) {
         runCatching { DocumentsContract.deleteDocument(context.contentResolver, output) }
     }
 
     /**
-     * Open read/write file descriptors for the two content URIs and hand their
-     * raw fds to [block]. The descriptors stay owned by these
-     * ParcelFileDescriptors (closed by `use`); the Rust side only borrows them.
+     * Open the two content URIs and hand their raw fds to [block]. The descriptors
+     * stay owned by these ParcelFileDescriptors (closed by `use`); the Rust side
+     * only borrows them. If [block] fails, `output` is removed.
      */
-    private inline fun <T> withFds(input: Uri, output: Uri, block: (Int, Int) -> T): T {
-        val resolver = context.contentResolver
-        val result = resolver.openFileDescriptor(input, "r").use { inPfd ->
-            requireNotNull(inPfd) { "Couldn't open the selected file." }
-            // "wt" = write + truncate, so re-using an existing file fully replaces it.
-            resolver.openFileDescriptor(output, "wt").use { outPfd ->
-                requireNotNull(outPfd) { "Couldn't open the destination." }
-                block(inPfd.fd, outPfd.fd)
-            }
+    private inline fun withFds(input: Uri, output: Uri, block: (Int, Int) -> Unit) {
+        try {
+            readFd(input) { inFd -> writeFd(output) { outFd -> block(inFd, outFd) } }
+        } catch (e: Exception) {
+            discardOutput(output)
+            throw e
         }
         refreshMediaIndex(output)
-        return result
     }
+
+    private inline fun <T> readFd(input: Uri, block: (Int) -> T): T =
+        context.contentResolver.openFileDescriptor(input, "r").use { pfd ->
+            requireNotNull(pfd) { "Couldn't open the selected file." }
+            block(pfd.fd)
+        }
+
+    /** "wt" = write + truncate, so re-using an existing file fully replaces it. */
+    private inline fun <T> writeFd(output: Uri, block: (Int) -> T): T =
+        context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
+            requireNotNull(pfd) { "Couldn't open the destination." }
+            block(pfd.fd)
+        }
 
     /**
      * Ask Android's media index to re-read a file we just wrote. Save as creates the
@@ -216,13 +210,58 @@ class Backend(private val context: Context) {
         return uri.lastPathSegment?.substringAfterLast('/') ?: "file"
     }
 
+    // --- Shares in -------------------------------------------------------------
+
+    /** "password" or "key": which prompt a shared file needs. */
+    suspend fun sharedKind(input: Uri): String = withContext(Dispatchers.IO) {
+        readFd(input) { VaultSendNative.sharedKind(it) }
+    }
+
+    /** Null if `password` opens the file, else what to say. Only the file key is unwrapped. */
+    suspend fun sharedCheckPassword(input: Uri, password: ByteArray): String? = withContext(Dispatchers.IO) {
+        try {
+            readFd(input) { VaultSendNative.sharedCheckPassword(it, password) }
+            null
+        } catch (e: Exception) {
+            e.message ?: "Wrong password."
+        }
+    }
+
+    /** Unpack a shared archive into a new folder `name` inside the picked folder `outTree`. */
+    suspend fun sharedExtract(
+        password: ByteArray?,
+        input: Uri,
+        outTree: Uri,
+        name: String,
+        progress: ProgressSink?,
+    ): VaultResult = withContext(Dispatchers.IO) {
+        val folder = VaultTree.fromTree(context, outTree)
+        readFd(input) { result(VaultSendNative.sharedExtract(dataDir, password, it, folder, name, progress)) }
+    }
+
+    // --- Folder access -----------------------------------------------------------
+
+    /**
+     * Keep access to a picked folder across restarts. For a new vault that's the
+     * folder it's made in, not just the vault's own folder: SAF only grants what
+     * the user picked, so the app can reach everything in that folder.
+     */
+    fun keepAccess(tree: Uri) {
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(tree, READ_WRITE)
+        }
+    }
+
+    fun releaseAccess(tree: Uri) {
+        runCatching { context.contentResolver.releasePersistableUriPermission(tree, READ_WRITE) }
+    }
+
     // --- Vaults ---------------------------------------------------------------
     //
     // Thin wrappers over the vault calls in VaultSendNative, on the IO dispatcher.
     // Each returns the core's output with the warnings split off. `secret` is the
-    // identity passphrase (a "self" vault), the vault password (a "password"
-    // vault), or null for the unlocked session or a remembered key; the caller
-    // wipes it afterwards.
+    // vault password (a "password" vault), or null for the unlocked session or a
+    // remembered key; the caller wipes it afterwards.
 
     /** Output of a vault call, and what the desktop would have printed as warnings. */
     data class VaultResult(val output: String, val warnings: List<String>)
@@ -251,6 +290,22 @@ class Backend(private val context: Context) {
             )
         }
         return vault
+    }
+
+    /**
+     * Write into `output`, a document from "Save as" or a staged share file, from
+     * the vault in `record`: refused if `output` is inside the vault, and removed
+     * if this fails.
+     */
+    private fun vaultInto(record: VaultRecord, output: Uri, block: (VaultTree, Int) -> String): VaultResult {
+        try {
+            val vault = openVault(record)
+            if (vault.contains(output)) throw BackendException("the output path must not be inside the vault")
+            return writeFd(output) { result(block(vault, it)) }
+        } catch (e: Exception) {
+            discardOutput(output)
+            throw e
+        }
     }
 
     /** The vault folder a user picked as itself (Add existing vault), and its mode, or null. */
@@ -357,20 +412,16 @@ class Backend(private val context: Context) {
             val bytes = VaultSendNative.vaultReadText(dataDir, openVault(record), secret, entry, NOTE_MAX_BYTES.toLong())
             try {
                 Charsets.UTF_8.newDecoder()
-                    .onMalformedInput(java.nio.charset.CodingErrorAction.REPORT)
-                    .onUnmappableCharacter(java.nio.charset.CodingErrorAction.REPORT)
-                    .decode(java.nio.ByteBuffer.wrap(bytes))
+                    .onMalformedInput(CodingErrorAction.REPORT)
+                    .onUnmappableCharacter(CodingErrorAction.REPORT)
+                    .decode(ByteBuffer.wrap(bytes))
                     .toString()
-            } catch (e: java.nio.charset.CharacterCodingException) {
+            } catch (e: CharacterCodingException) {
                 throw BackendException("“${entry.substringAfterLast('/')}” isn't plain text, so it can't be edited as a note.")
             } finally {
                 bytes.fill(0)
             }
         }
-
-    private fun refuseInside(vault: VaultTree, out: Uri) {
-        if (vault.contains(out)) throw BackendException("the output path must not be inside the vault")
-    }
 
     /** One file into `output`, a document from "Save as", which is removed if this fails. */
     suspend fun vaultExtractFile(
@@ -380,17 +431,7 @@ class Backend(private val context: Context) {
         output: Uri,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        val vault = openVault(record)
-        try {
-            refuseInside(vault, output)
-            context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
-                requireNotNull(pfd) { "Couldn't open the destination." }
-                result(VaultSendNative.vaultExtractFile(dataDir, vault, secret, entry, pfd.fd, progress))
-            }
-        } catch (e: Exception) {
-            discardOutput(output)
-            throw e
-        }
+        vaultInto(record, output) { vault, fd -> VaultSendNative.vaultExtractFile(dataDir, vault, secret, entry, fd, progress) }
     }
 
     /** A folder, or several entries, into a new folder `name` inside the picked folder `outTree`. */
@@ -403,7 +444,7 @@ class Backend(private val context: Context) {
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
         val vault = openVault(record)
-        refuseInside(vault, outTree)
+        if (vault.contains(outTree)) throw BackendException("the output path must not be inside the vault")
         val folder = VaultTree.fromTree(context, outTree)
         result(VaultSendNative.vaultExtractTree(dataDir, vault, secret, entries.toTypedArray(), folder, name, progress))
     }
@@ -417,20 +458,8 @@ class Backend(private val context: Context) {
         output: Uri,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        val vault = openVault(record)
-        try {
-            refuseInside(vault, output)
-            context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
-                requireNotNull(pfd) { "Couldn't open the destination." }
-                result(
-                    VaultSendNative.vaultShare(
-                        dataDir, vault, secret, entries.toTypedArray(), recipients.toTypedArray(), pfd.fd, progress,
-                    ),
-                )
-            }
-        } catch (e: Exception) {
-            discardOutput(output)
-            throw e
+        vaultInto(record, output) { vault, fd ->
+            VaultSendNative.vaultShare(dataDir, vault, secret, entries.toTypedArray(), recipients.toTypedArray(), fd, progress)
         }
     }
 
@@ -443,20 +472,8 @@ class Backend(private val context: Context) {
         output: Uri,
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
-        val vault = openVault(record)
-        try {
-            refuseInside(vault, output)
-            context.contentResolver.openFileDescriptor(output, "wt").use { pfd ->
-                requireNotNull(pfd) { "Couldn't open the destination." }
-                result(
-                    VaultSendNative.vaultSharePassword(
-                        dataDir, vault, secret, entries.toTypedArray(), password, pfd.fd, progress,
-                    ),
-                )
-            }
-        } catch (e: Exception) {
-            discardOutput(output)
-            throw e
+        vaultInto(record, output) { vault, fd ->
+            VaultSendNative.vaultSharePassword(dataDir, vault, secret, entries.toTypedArray(), password, fd, progress)
         }
     }
 
@@ -473,59 +490,13 @@ class Backend(private val context: Context) {
         progress: ProgressSink?,
     ): VaultResult = withContext(Dispatchers.IO) {
         val vault = openVault(record)
-        context.contentResolver.openFileDescriptor(input, "r").use { pfd ->
-            requireNotNull(pfd) { "Couldn't open the shared file." }
-            result(VaultSendNative.vaultImportShared(dataDir, vault, secret, password, pfd.fd, singleName, progress))
-        }
+        readFd(input) { result(VaultSendNative.vaultImportShared(dataDir, vault, secret, password, it, singleName, progress)) }
     }
 
-    // --- Receiving a share ---------------------------------------------------
-
-    private inline fun <T> readFd(input: Uri, block: (Int) -> T): T =
-        context.contentResolver.openFileDescriptor(input, "r").use { pfd ->
-            requireNotNull(pfd) { "Couldn't open the selected file." }
-            block(pfd.fd)
-        }
-
-    /** "password" or "key": which prompt a shared file needs. */
-    suspend fun sharedKind(input: Uri): String = withContext(Dispatchers.IO) {
-        readFd(input) { VaultSendNative.sharedKind(it) }
-    }
-
-    /** Null if `password` opens the file, else what to say. Only the file key is unwrapped. */
-    suspend fun sharedCheckPassword(input: Uri, password: ByteArray): String? = withContext(Dispatchers.IO) {
-        try {
-            readFd(input) { VaultSendNative.sharedCheckPassword(it, password) }
-            null
-        } catch (e: Exception) {
-            e.message ?: "Wrong password."
-        }
-    }
-
-    /** Save a shared file as it is (an archive stays one); `output` is removed if this fails. */
-    suspend fun sharedDecrypt(password: ByteArray?, input: Uri, output: Uri) = withContext(Dispatchers.IO) {
-        try {
-            withFds(input, output) { inFd, outFd -> VaultSendNative.sharedDecrypt(dataDir, password, inFd, outFd) }
-        } catch (e: Exception) {
-            discardOutput(output)
-            throw e
-        }
-    }
-
-    /** Unpack a shared archive into a new folder `name` inside the picked folder `outTree`. */
-    suspend fun sharedExtract(
-        password: ByteArray?,
-        input: Uri,
-        outTree: Uri,
-        name: String,
-        progress: ProgressSink?,
-    ): VaultResult = withContext(Dispatchers.IO) {
-        val folder = VaultTree.fromTree(context, outTree)
-        readFd(input) { result(VaultSendNative.sharedExtract(dataDir, password, it, folder, name, progress)) }
-    }
+    // --- Opened copies and staged shares (cache) ------------------------------
 
     /** Where Open's copies go: see OpenCopies.kt. */
-    val openRoot: File get() = File(context.cacheDir, OPEN_DIR)
+    private val openRoot: File get() = File(context.cacheDir, OPEN_DIR)
 
     /**
      * A new, empty file named `name` for encrypted output that goes to the share
@@ -570,25 +541,27 @@ class Backend(private val context: Context) {
      */
     fun sweepStaging() = VaultSendNative.sweepStaging(dataDir)
 
-    /** Delete opened copies: these, or with none given, every one in the folder. */
-    fun discardCopies(copies: Collection<File>? = null) {
-        if (copies == null) {
-            clearStaleCopies(openRoot)
-        } else {
-            copies.forEach { deleteTree(it.parentFile ?: it) }
-        }
+    /** Delete these opened copies, each with its private folder. */
+    fun discardCopies(copies: Collection<File>) {
+        copies.forEach { deleteTree(it.parentFile ?: it) }
     }
 
-    /** How long a password vault's key is remembered: 0 never, null until the app closes. */
-    fun setVaultRemember(seconds: Long?) = VaultSendNative.vaultSetRemember(seconds ?: -1)
+    /** Delete every opened copy in the folder, including ones an earlier process handed out. */
+    fun discardAllCopies() = clearStaleCopies(openRoot)
+
+    // --- Remembered vault keys ------------------------------------------------
+
+    /** Whether a password vault's key is remembered until the app closes. Forgets every key. */
+    fun setVaultRemember(on: Boolean) = VaultSendNative.vaultSetRemember(on)
 
     fun forgetVault(record: VaultRecord) {
-        runCatching { VaultSendNative.vaultForget(vaultTree(record).key("")) }
+        runCatching { VaultSendNative.vaultForget(vaultTree(record).key()) }
     }
 
     fun isVaultRemembered(record: VaultRecord): Boolean =
-        runCatching { VaultSendNative.vaultIsRemembered(vaultTree(record).key("")) }.getOrDefault(false)
+        runCatching { VaultSendNative.vaultIsRemembered(vaultTree(record).key()) }.getOrDefault(false)
 
-    fun sweepVaultKeys() = VaultSendNative.vaultSweep()
+    private companion object {
+        const val READ_WRITE = Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION
+    }
 }
-

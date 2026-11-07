@@ -44,8 +44,9 @@ use std::iter::once;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::{ExposeSecret, SecretString};
 use age::x25519;
@@ -893,51 +894,35 @@ fn unlock(store: &dyn Store, secret: &Secret) -> R<x25519::Identity> {
 // chose under Remember passphrase. Here what's remembered is a password vault's own
 // key, which is what the password unlocks, and it's held in native memory: zeroizing,
 // locked in RAM, never in the JVM, where a String can't be wiped. A `self` vault
-// needs nothing remembered, because it opens with the unlocked session key. The
-// lifetime counts from when the key was remembered, as on desktop, and setting it
-// forgets everything, as `set_lifetime` does there.
+// needs nothing remembered, because it opens with the unlocked session key. There
+// are two choices, as in the app's Remember passphrase: nothing, or until the app
+// closes (or Lock now, or the background lock). Setting it forgets everything, as
+// `set_lifetime` does on desktop.
 // ---------------------------------------------------------------------------
-#[derive(Clone, Copy, PartialEq)]
-enum Lifetime {
-    Off,
-    For(Duration),
-    UntilClosed,
-}
+static REMEMBER: AtomicBool = AtomicBool::new(false);
+/// Vault key text by the vault's store key.
+static REMEMBERED: Mutex<BTreeMap<String, Held>> = Mutex::new(BTreeMap::new());
 
-static LIFETIME: Mutex<Lifetime> = Mutex::new(Lifetime::Off);
-/// Vault key text by the vault's store key, with when it expires.
-static REMEMBERED: Mutex<BTreeMap<String, (Held, Option<SystemTime>)>> = Mutex::new(BTreeMap::new());
-
-/// 0 remembers nothing, a negative number until the app closes, otherwise seconds.
-pub fn set_remember(seconds: i64) {
-    let lifetime = match seconds {
-        0 => Lifetime::Off,
-        s if s < 0 => Lifetime::UntilClosed,
-        s => Lifetime::For(Duration::from_secs(s as u64)),
-    };
-    *LIFETIME.lock().unwrap_or_else(|e| e.into_inner()) = lifetime;
+/// Whether a password vault's key is kept once its password has opened it.
+pub fn set_remember(on: bool) {
+    REMEMBER.store(on, Ordering::SeqCst);
     forget_all();
 }
 
 fn remember(vault: &str, key: &x25519::Identity) {
-    let expiry = match *LIFETIME.lock().unwrap_or_else(|e| e.into_inner()) {
-        Lifetime::Off => return,
-        Lifetime::For(d) => Some(SystemTime::now() + d),
-        Lifetime::UntilClosed => None,
-    };
-    let held = Held::new(key.to_string());
-    REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).insert(vault.to_string(), (held, expiry));
+    if REMEMBER.load(Ordering::SeqCst) {
+        let held = Held::new(key.to_string());
+        REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).insert(vault.to_string(), held);
+    }
 }
 
 fn remembered(vault: &str) -> Option<x25519::Identity> {
-    sweep();
     let keys = REMEMBERED.lock().unwrap_or_else(|e| e.into_inner());
-    keys.get(vault)?.0.expose().parse().ok()
+    keys.get(vault)?.expose().parse().ok()
 }
 
 /// True if a key for this vault is remembered now.
 pub fn is_remembered(vault: &str) -> bool {
-    sweep();
     REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).contains_key(vault)
 }
 
@@ -947,13 +932,6 @@ pub fn forget(vault: &str) {
 
 pub fn forget_all() {
     REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).clear();
-}
-
-/// Forget whatever has expired. Wall clock rather than monotonic, as on desktop,
-/// so time asleep counts.
-pub fn sweep() {
-    let now = SystemTime::now();
-    REMEMBERED.lock().unwrap_or_else(|e| e.into_inner()).retain(|_, (_, expiry)| !matches!(expiry, Some(t) if now >= *t));
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,8 +1865,9 @@ mod tests {
     use super::*;
     use crate::vault_cli::{parse_opts, run};
     use std::os::unix::io::FromRawFd;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::AtomicU32;
     use std::sync::Once;
+    use std::time::Duration;
 
     const ID_PASS: &str = "test identity passphrase";
     const VAULT_PASS: &str = "test vault password";
@@ -3293,13 +3272,13 @@ mod tests {
         let open = |s: &Secret| Vault::open_in(Box::new(PathStore::new(&dir)), s, false);
         let key = || PathStore::new(&dir).key().unwrap();
 
-        set_remember(0);
+        set_remember(false);
         create(Box::new(PathStore::new(&dir)), "password", &typed).unwrap();
         assert_eq!(open(&nothing).err().unwrap(), PASSWORD_NEEDED);
         open(&typed).unwrap();
         assert!(!is_remembered(&key()), "Off remembers nothing");
 
-        set_remember(-1);
+        set_remember(true);
         open(&typed).unwrap();
         assert!(is_remembered(&key()));
         let v = open(&nothing).unwrap();
@@ -3315,13 +3294,15 @@ mod tests {
         crate::backend::lock(); // Lock now forgets vault keys too
         assert_eq!(open(&nothing).err().unwrap(), PASSWORD_NEEDED);
 
-        // Changing the lifetime forgets everything, as on desktop.
+        // Setting it again forgets everything, as on desktop.
         open(&typed).unwrap();
-        set_remember(300);
+        assert!(is_remembered(&key()));
+        set_remember(true);
         assert!(!is_remembered(&key()));
         open(&typed).unwrap();
         assert!(is_remembered(&key()));
-        set_remember(0);
+        set_remember(false);
+        assert!(!is_remembered(&key()));
     }
 
     #[test]

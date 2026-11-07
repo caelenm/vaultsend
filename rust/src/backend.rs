@@ -745,33 +745,6 @@ fn decrypt_with_identity<R2: Read, W: Write>(
     Ok(())
 }
 
-/// Decrypt a file to another file, preserving the desktop guarantee that a
-/// truncated or tampered ciphertext never leaves partial plaintext at the
-/// destination. age authenticates as it streams, so we stage the plaintext to a
-/// private 0600 temp inside `data_dir`, fsync it, and only copy it out to the
-/// caller's (SAF-provided) writer once the whole stream has decrypted cleanly.
-/// The temp is always removed.
-pub fn decrypt_file_to<R2: Read, W: Write>(
-    data_dir: &str,
-    passphrase: &[u8],
-    input: R2,
-    output: W,
-) -> R<()> {
-    decrypt_file_staged(data_dir, input, output, |inp, tmp| {
-        decrypt(data_dir, passphrase, inp, tmp)
-    })
-}
-
-/// As [`decrypt_file_to`], but using the unlocked session key instead of a
-/// passphrase.
-pub fn decrypt_file_to_session<R2: Read, W: Write>(
-    data_dir: &str,
-    input: R2,
-    output: W,
-) -> R<()> {
-    decrypt_file_staged(data_dir, input, output, |inp, tmp| decrypt_session(inp, tmp))
-}
-
 /// A staging file name unique to this operation. It used to be a fixed
 /// `.decrypt.part`, so two file decrypts running at once (the UI does not
 /// serialize them) deleted and reused each other's staging file, and one
@@ -1112,7 +1085,7 @@ mod tests {
         let mut ct = Vec::new();
         encrypt(&[pk], false, Cursor::new(&msg), &mut ct).unwrap();
         let mut out = Vec::new();
-        decrypt_file_to_session(&dir, Cursor::new(&ct), &mut out).unwrap();
+        crate::shared::decrypt_file_to(&dir, &crate::shared::Key::Session, Cursor::new(&ct), &mut out).unwrap();
         assert_eq!(out, msg);
         assert!(!stale.exists());
         let leftovers: Vec<_> = fs::read_dir(&dir)

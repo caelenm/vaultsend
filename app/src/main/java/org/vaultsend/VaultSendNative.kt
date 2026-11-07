@@ -58,26 +58,20 @@ object VaultSendNative {
     @Throws(BackendException::class)
     external fun encryptBytes(recipients: Array<String>, armor: Boolean, input: ByteArray): ByteArray
 
-    @Throws(BackendException::class)
-    external fun decryptBytes(dataDir: String, passphrase: ByteArray, input: ByteArray): ByteArray
-
-    /** Decrypt copy/paste text with the unlocked session key (no passphrase). */
+    /**
+     * Decrypt copy/paste text with the unlocked session key. Every decrypt goes
+     * through the session; a file is decrypted with [sharedDecrypt].
+     */
     @Throws(BackendException::class)
     external fun decryptBytesSession(input: ByteArray): ByteArray
 
+    /** A file for [recipients], binary. */
     @Throws(BackendException::class)
-    external fun encryptFd(recipients: Array<String>, armor: Boolean, inFd: Int, outFd: Int)
+    external fun encryptFd(recipients: Array<String>, inFd: Int, outFd: Int)
 
     /** A file for anyone with [password], as a vault's password share. */
     @Throws(BackendException::class)
     external fun encryptFdPassword(password: ByteArray, inFd: Int, outFd: Int)
-
-    @Throws(BackendException::class)
-    external fun decryptFd(dataDir: String, passphrase: ByteArray, inFd: Int, outFd: Int)
-
-    /** Decrypt a file with the unlocked session key (no passphrase). */
-    @Throws(BackendException::class)
-    external fun decryptFdSession(dataDir: String, inFd: Int, outFd: Int)
 
     // --- Vaults (vault.rs, through ffi.rs) ------------------------------------
     //
@@ -217,7 +211,10 @@ object VaultSendNative {
     @Throws(BackendException::class)
     external fun sharedCheckPassword(inFd: Int, password: ByteArray)
 
-    /** Save a shared file as it is; null [password] for the session key. */
+    /**
+     * Decrypt a file as it is, staged and authenticated in full before a byte
+     * reaches [outFd]: a share, or any age file. Null [password] for the session key.
+     */
     @Throws(BackendException::class)
     external fun sharedDecrypt(dataDir: String, password: ByteArray?, inFd: Int, outFd: Int)
 
@@ -232,15 +229,12 @@ object VaultSendNative {
         progress: ProgressSink?,
     ): String
 
-    /** 0 remembers no vault key, negative until the app closes, else seconds. Forgets all. */
-    external fun vaultSetRemember(seconds: Long)
+    /** Whether a password vault's key is remembered until the app closes. Forgets all. */
+    external fun vaultSetRemember(on: Boolean)
 
     /** Forget one vault's remembered key, by [VaultTree.key]. */
     external fun vaultForget(key: String)
 
     external fun vaultIsRemembered(key: String): Boolean
-
-    /** Forget remembered keys whose time is up. */
-    external fun vaultSweep()
 }
 

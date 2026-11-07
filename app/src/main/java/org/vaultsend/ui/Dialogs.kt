@@ -55,7 +55,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.foundation.text.KeyboardOptions
 import kotlinx.coroutines.launch
 import org.vaultsend.Contact
-import org.vaultsend.looksLikePubkey
 import org.vaultsend.shortKey
 
 // --- Contacts (in the side drawer; see SidebarDrawer) ----------------------
@@ -376,15 +375,15 @@ fun AddContactDialog(
             }
         },
         confirmButton = {
-            // Waits for a name and an age1… key, as on desktop: a slip here would
-            // otherwise throw away what was typed part way through Share.
+            // The key is checked by the core's own parser (checkKey); a bad one says
+            // why here and keeps what was typed, so nothing is lost part way through Share.
             TextButton(
                 onClick = {
                     val problem = checkKey(key.trim())
                     error = problem
                     if (problem == null) onAdd(name, key)
                 },
-                enabled = name.isNotBlank() && looksLikePubkey(key),
+                enabled = name.isNotBlank() && key.isNotBlank(),
             ) { Text("Add") }
         },
         dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } },
@@ -492,7 +491,7 @@ fun AboutDialog(onClose: () -> Unit) {
                 if (version.isNotEmpty()) Text(version, style = MaterialTheme.typography.bodyMedium)
                 Text(
                     "File and text encryption using the age format.\n" +
-                        "All cryptography is performed by a small separate backend.\n" +
+                        "All cryptography is done by a small Rust core inside this app.\n" +
                         "Source code can be found here:",
                     style = MaterialTheme.typography.bodyMedium,
                 )

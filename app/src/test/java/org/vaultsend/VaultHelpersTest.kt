@@ -140,14 +140,12 @@ class VaultHelpersTest {
     }
 
     @Test
-    fun everyChoiceHasALifetime() {
-        assertEquals(0L, REMEMBER_SECONDS["off"])
-        assertNull(REMEMBER_SECONDS["session"])
-        assertTrue("session" in REMEMBER_SECONDS)
-        assertEquals(
-            listOf("Off", "Until VaultSend closes"),
-            REMEMBER_CHOICES.map { it.label },
-        )
+    fun onlyOffForgets() {
+        assertEquals(listOf("off", "session"), REMEMBER_CHOICES.keys.toList())
+        assertEquals(listOf("Off", "Until VaultSend closes"), REMEMBER_CHOICES.values.toList())
+        assertFalse(AppSettings("off").remembers)
+        assertTrue(AppSettings("session").remembers)
+        assertTrue(AppSettings().remembers)
     }
 
     // --- Names -------------------------------------------------------------

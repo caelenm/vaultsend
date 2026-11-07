@@ -330,6 +330,16 @@ open with the same passphrase and hold the same key before it replaces the old o
 
 ## Build verification status
 
+**A smaller surface (unreleased).** `cargo test --locked` passes 89 tests on Rust
+1.75, and `cargo clippy --lib --features cli -D warnings` is clean. The Kotlin
+compiles (`compileDebugKotlin`), and the 33 `external fun`s in `VaultSendNative`
+match the 33 `Java_org_vaultsend_VaultSendNative_*` functions in `ffi.rs` one for
+one, as do the names and signatures of every call back into Kotlin.
+`testDebugUnitTest` was run on Windows, where 55 of 60 pass; the other 5 create
+files with POSIX permissions or symlinks, which Windows can't, and run on CI's
+Linux. The `.so` and APK weren't built here (no NDK), and the app wasn't run on a
+device. See `CHANGES.md`.
+
 **Audit fixes (0.3.2).** `cargo test --locked` passes 86 tests on current stable,
 eight of them new: reading an identity's work factor from its header; a weak
 identity re-wrapped on import; one already on the device re-wrapped on unlock (and

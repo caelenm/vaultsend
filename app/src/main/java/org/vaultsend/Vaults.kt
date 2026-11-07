@@ -4,6 +4,9 @@ import org.json.JSONArray
 import org.json.JSONObject
 import org.json.JSONTokener
 import java.io.File
+import java.nio.file.Files
+import java.nio.file.StandardCopyOption
+import java.nio.file.attribute.PosixFilePermissions
 
 /*
  * The vault registry and the app's settings: plain JSON in the app's private
@@ -61,20 +64,15 @@ fun serializeVaults(vaults: List<VaultRecord>): String {
     return array.toString(2)
 }
 
-/** How long a typed secret may be remembered: (value, menu label, seconds). */
-data class RememberChoice(val value: String, val label: String, val seconds: Long?)
-
 /**
- * null seconds means until the app closes; the choice itself is never a secret.
- * Only Off and Until VaultSend closes are offered: a saved timed choice from an
- * older version falls back to the default.
+ * Remember passphrase, by saved value, with its menu label: Off (ask every time),
+ * or until the app closes. The choice itself is never a secret. A saved timed
+ * choice from an older version falls back to the default.
  */
-val REMEMBER_CHOICES = listOf(
-    RememberChoice("off", "Off", 0),
-    RememberChoice("session", "Until VaultSend closes", null),
+val REMEMBER_CHOICES: Map<String, String> = linkedMapOf(
+    "off" to "Off",
+    "session" to "Until VaultSend closes",
 )
-
-val REMEMBER_SECONDS: Map<String, Long?> = REMEMBER_CHOICES.associate { it.value to it.seconds }
 
 /**
  * The app's settings. `remember` defaults to "session", not the desktop's "off":
@@ -85,7 +83,10 @@ data class AppSettings(
     val remember: String = DEFAULT_REMEMBER,
     val cacheExplained: Boolean = false,
     val openExplained: Boolean = false,
-)
+) {
+    /** Whether the unlocked key, and a password vault's key, are kept between operations. */
+    val remembers: Boolean get() = remember != "off"
+}
 
 const val DEFAULT_REMEMBER = "session"
 
@@ -93,7 +94,7 @@ fun parseSettings(text: String): AppSettings {
     val data = runCatching { JSONTokener(text).nextValue() }.getOrNull() as? JSONObject ?: return AppSettings()
     val remember = data.opt("remember")
     return AppSettings(
-        remember = if (remember is String && remember in REMEMBER_SECONDS) remember else DEFAULT_REMEMBER,
+        remember = if (remember is String && remember in REMEMBER_CHOICES) remember else DEFAULT_REMEMBER,
         cacheExplained = data.opt("cache_explained") == true,
         openExplained = data.opt("open_explained") == true,
     )
@@ -108,25 +109,16 @@ fun serializeSettings(s: AppSettings): String =
 
 /**
  * Write `text` to `file` so it's only ever the old or the new contents, readable
- * by this app alone: the desktop's save_json. A temp file left by a crash is
- * replaced rather than reused.
+ * by this app alone: the desktop's save_json. The temp file is created 0600, so
+ * it is never readable by anyone else, and one left by a crash is replaced
+ * rather than reused. Throws rather than ever writing `file` in place.
  */
 fun savePrivately(file: File, text: String) {
-    val tmp = File(file.parentFile, file.name + ".tmp")
-    tmp.delete()
-    tmp.writeText(text)
-    tmp.setReadable(false, false)
-    tmp.setWritable(false, false)
-    tmp.setReadable(true, true)
-    tmp.setWritable(true, true)
-    if (!tmp.renameTo(file)) {
-        // As ContactStore always did: a rename in the app's own folder doesn't fail
-        // in practice, but if it does, a direct write is better than losing the change.
-        tmp.delete()
-        file.writeText(text)
-        file.setReadable(false, false)
-        file.setReadable(true, true)
-    }
+    val tmp = File(file.parentFile, file.name + ".tmp").toPath()
+    Files.deleteIfExists(tmp)
+    Files.createFile(tmp, PosixFilePermissions.asFileAttribute(PosixFilePermissions.fromString("rw-------")))
+    Files.write(tmp, text.toByteArray(Charsets.UTF_8))
+    Files.move(tmp, file.toPath(), StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING)
 }
 
 /** The registry and settings files under the app's private storage. */

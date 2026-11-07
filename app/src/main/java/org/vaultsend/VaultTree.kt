@@ -95,8 +95,7 @@ class VaultTree(context: Context, val treeUri: Uri, val rootId: String) {
     // --- Called from Rust (SafStore). ---------------------------------------
 
     /** Stable, path-like name for this folder: whether one folder is inside another. */
-    @Suppress("UNUSED_PARAMETER")
-    fun key(unused: String): String = "${treeUri.authority}/$rootId"
+    fun key(): String = "${treeUri.authority}/$rootId"
 
     /** `rel` as a person would recognise it. */
     fun show(rel: String): String {
@@ -363,10 +362,10 @@ class VaultSources private constructor(
 
 /**
  * Called from Rust with whole percents as a vault operation goes, and asked by it
- * whether the user has pressed Cancel. A class rather than a fun interface, so
- * both methods exist on the object the native side calls, however it was made.
+ * whether the user has pressed Cancel. A final class rather than a fun interface,
+ * so both methods exist on the object the native side calls, by these names.
  */
-open class ProgressSink(private val onReport: (Int) -> Unit = {}) {
+class ProgressSink(private val onReport: (Int) -> Unit = {}) {
     @Volatile
     var cancelled: Boolean = false
 

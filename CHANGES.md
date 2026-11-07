@@ -1,5 +1,37 @@
 # What changed in this build
 
+## Unreleased: a smaller surface
+
+A review pass for security, then auditability, then simplicity. Nothing a person
+does in the app changes, except where noted.
+
+- **Four fewer JNI entry points (37 → 33).** `decryptBytes` and `decryptFd`, which
+  took the identity passphrase on every call, were never used: every decrypt
+  already went through the unlocked session. They're gone, with Rust's
+  passphrase-taking `decrypt_file_to`. `decryptFdSession` did exactly what
+  `sharedDecrypt` does with no password, so the main page's Decrypt now uses that
+  one path for every file (and `backend::decrypt_file_to_session` is gone).
+  `vaultSweep` only served timed Remember choices, removed in 0.2.0.
+- **Remember passphrase is a yes/no in the core.** `vault::set_remember` takes a
+  bool instead of seconds, so the wall-clock expiry, `sweep()` and the app's
+  15-second polling loop are gone. Off and Until VaultSend closes behave as before.
+- **settings.json, vaults.json and contacts.json** are written through a temp file
+  created 0600 and atomically moved into place. The old fallback that, if the
+  rename failed, wrote the file in place (and briefly readable by default
+  permissions) is gone: a save now either replaces the file whole or fails.
+- **Files shared into a running app in a batch** (several at once, to add to the
+  open vault) were ignored unless the app was starting: the screen watched only
+  for single files and text. The three kinds are now one pending value it watches.
+- **Add contact** checks a key with the core's parser only. The separate
+  look-alike check (`looksLikePubkey`) that greyed out Add is gone; a bad key says
+  why under the field, as before, and keeps what was typed.
+- Smaller: one unlock prompt instead of three copies; one Save File or Share flow
+  for a file and one for a vault (each was written twice, for contacts and for a
+  password); every "write to a destination" in `Backend` removes the destination
+  itself on failure; `VaultTree.key()` takes no unused argument; `ProgressSink` is
+  final, so its R8 rule for subclasses is gone; About no longer calls the
+  in-process core "a separate backend".
+
 ## Unreleased: notes and Rename… in vaults
 
 - **Add note…** on a vault's action panel opens a note editor in place of the page:

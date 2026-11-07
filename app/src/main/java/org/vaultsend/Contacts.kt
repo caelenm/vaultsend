@@ -62,19 +62,6 @@ fun writeContacts(out: OutputStream, contacts: List<Contact>) {
     out.write(serializeContacts(contacts).toByteArray(Charsets.UTF_8))
 }
 
-/**
- * A cheap sanity check on a public key before saving it, mirroring the desktop
- * `looks_like_pubkey`: starts with "age1", a plausible length, and otherwise
- * alphanumeric (bech32). Not a cryptographic check — the core rejects truly
- * invalid keys at encrypt time — just enough to catch a bad paste.
- */
-fun looksLikePubkey(value: String): Boolean {
-    val s = value.trim()
-    return s.startsWith("age1") &&
-        s.length in 50..80 &&
-        s.drop(4).all { it.isLetterOrDigit() }
-}
-
 /** Shorten a key for display: first 12 + "…" + last 6, like the desktop `short`. */
 fun shortKey(pubkey: String): String =
     if (pubkey.length > 24) pubkey.take(12) + "…" + pubkey.takeLast(6) else pubkey

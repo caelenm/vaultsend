@@ -268,25 +268,6 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptBytes<'l>(
     ret_bytes(&mut env, r)
 }
 
-#[no_mangle]
-pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptBytes<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-    data_dir: JString<'l>,
-    passphrase: JByteArray<'l>,
-    input: JByteArray<'l>,
-) -> jbyteArray {
-    let r = guard(|| {
-        let dir = get_string(&mut env, &data_dir)?;
-        let pass = get_bytes(&mut env, &passphrase)?;
-        let data = get_bytes(&mut env, &input)?;
-        let mut out = Zeroizing::new(Vec::new());
-        backend::decrypt(&dir, &pass, &data[..], &mut *out)?;
-        Ok(out)
-    });
-    ret_bytes(&mut env, r)
-}
-
 /// Decrypt copy/paste text using the unlocked session key (no passphrase).
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptBytesSession<'l>(
@@ -305,12 +286,12 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptBytesSession<'l
 
 // --- file (descriptor) paths ------------------------------------------------
 
+/// A file for `recipients`, binary (files are never armored).
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptFd<'l>(
     mut env: JNIEnv<'l>,
     _class: JClass<'l>,
     recipients: JObjectArray<'l>,
-    armor: jboolean,
     in_fd: jint,
     out_fd: jint,
 ) {
@@ -318,7 +299,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptFd<'l>(
         let recips = get_string_array(&mut env, &recipients)?;
         let mut input = borrow_fd(in_fd);
         let mut output = borrow_fd(out_fd);
-        backend::encrypt(&recips, armor == JNI_TRUE, &mut *input, &mut *output)
+        backend::encrypt(&recips, false, &mut *input, &mut *output)
     });
     ret_unit(&mut env, r);
 }
@@ -341,43 +322,7 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_encryptFdPassword<'l>(
     ret_unit(&mut env, r);
 }
 
-#[no_mangle]
-pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptFd<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-    data_dir: JString<'l>,
-    passphrase: JByteArray<'l>,
-    in_fd: jint,
-    out_fd: jint,
-) {
-    let r = guard(|| {
-        let dir = get_string(&mut env, &data_dir)?;
-        let pass = get_bytes(&mut env, &passphrase)?;
-        let mut input = borrow_fd(in_fd);
-        let mut output = borrow_fd(out_fd);
-        backend::decrypt_file_to(&dir, &pass, &mut *input, &mut *output)
-    });
-    ret_unit(&mut env, r);
-}
-
-/// Decrypt a file using the unlocked session key (no passphrase). Same staged,
-/// authenticate-before-write guarantee as the passphrase path.
-#[no_mangle]
-pub extern "system" fn Java_org_vaultsend_VaultSendNative_decryptFdSession<'l>(
-    mut env: JNIEnv<'l>,
-    _class: JClass<'l>,
-    data_dir: JString<'l>,
-    in_fd: jint,
-    out_fd: jint,
-) {
-    let r = guard(|| {
-        let dir = get_string(&mut env, &data_dir)?;
-        let mut input = borrow_fd(in_fd);
-        let mut output = borrow_fd(out_fd);
-        backend::decrypt_file_to_session(&dir, &mut *input, &mut *output)
-    });
-    ret_unit(&mut env, r);
-}
+// Decrypting a file, for a key or a password, is `sharedDecrypt` below.
 
 // ===========================================================================
 // Vaults.
@@ -504,7 +449,10 @@ impl Store for SafStore {
         if let Some(key) = self.key.get() {
             return Ok(key.clone());
         }
-        let key = self.string("key", "")?;
+        let key: String = self.tree.call(|env, tree| {
+            let value = env.call_method(tree, "key", "()Ljava/lang/String;", &[])?.l()?;
+            Ok(env.get_string(&JString::from(value))?.into())
+        })?;
         Ok(self.key.get_or_init(|| key).clone())
     }
     fn show(&self, rel: &str) -> String {
@@ -936,16 +884,16 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultShare<'l>(
     ret_string(&mut env, r)
 }
 
-/// How long a password vault's key is remembered: 0 not at all, negative until
-/// the app closes, otherwise seconds. Changing it forgets every key.
+/// Whether a password vault's key is remembered until the app closes, or not at
+/// all. Changing it forgets every key.
 #[no_mangle]
 pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSetRemember<'l>(
     _env: JNIEnv<'l>,
     _class: JClass<'l>,
-    seconds: jni::sys::jlong,
+    on: jboolean,
 ) {
     let _ = guard(|| {
-        vault::set_remember(seconds);
+        vault::set_remember(on == JNI_TRUE);
         Ok(())
     });
 }
@@ -974,15 +922,6 @@ pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultIsRemembered<'l>(
         Ok(true) => JNI_TRUE,
         _ => JNI_FALSE,
     }
-}
-
-/// Forget remembered keys whose time is up.
-#[no_mangle]
-pub extern "system" fn Java_org_vaultsend_VaultSendNative_vaultSweep<'l>(_env: JNIEnv<'l>, _class: JClass<'l>) {
-    let _ = guard(|| {
-        vault::sweep();
-        Ok(())
-    });
 }
 
 // ===========================================================================
