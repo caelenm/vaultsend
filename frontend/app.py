@@ -2673,9 +2673,12 @@ class Window(Adw.ApplicationWindow):
         dlg.present(self)
 
     def vault_verify(self):
+        """Verify every file, and only then remove encrypted files the vault doesn't list
+        (left by an interrupted change). Ordinary changes never delete those: in a
+        synced folder they may be another device's change still on its way."""
         vault = self.vault
         self.with_vault_secret(vault, lambda s: self._run_vault_op(
-            vault, s, ["vault-check"],
+            vault, s, ["vault-check", "--clean"],
             heading="Verifying…", subject=vault["name"], note="Every file verified.",
         ))
 

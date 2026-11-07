@@ -196,8 +196,8 @@ def section_crash():
 
     if committed + aborted:
         check(backend("vault-add", "--dir", v, "--src", make_files(T / "crash-after-add", 1), secret=ID_PASS).returncode == 0, "the next change works")
-        chk = backend("vault-check", "--dir", v, secret=ID_PASS)
-        check(chk.returncode == 0 and "orphan" not in chk.stdout, "and collects what the killed runs left", chk.stdout[-200:])
+        chk = backend("vault-check", "--clean", "--dir", v, secret=ID_PASS)
+        check(chk.returncode == 0 and "orphan" not in chk.stdout, "and vault-check --clean collects what the killed runs left", chk.stdout[-200:])
 
     # Removing: the same promise.
     r = backend("vault-list", "--dir", v, secret=ID_PASS)
@@ -1490,18 +1490,19 @@ def section_shares():
                 ok = ok and staged_left() == [] and (gen == 1 or ("cancelled" in err and "orphan" not in chk.stdout))
                 term_ok = term_ok and ok
             else:
-                # The next change collects the killed run's blobs; the next staging run sweeps.
+                # The next change works; vault-check --clean collects the killed run's
+                # blobs; the next staging run sweeps.
                 assert backend("vault-add", "--dir", target, "--src", make_files(T / f"after-{n}", 1), secret=ID_PASS).returncode == 0
                 with_pipes(["share-check", "--in", share], {"--share-pass-fd": SHARE_PASS})
                 with_pipes(["share-decrypt", "--in", key_share, "--out", T / "sweep.tar"], {"--pass-fd": ID_PASS})
-                chk = backend("vault-check", "--dir", target, secret=ID_PASS)
+                chk = backend("vault-check", "--clean", "--dir", target, secret=ID_PASS)
                 ok = ok and staged_left() == [] and "orphan" not in chk.stdout
                 kill_ok = kill_ok and ok
             if not ok:
                 print(f"      {how} import round {n}: gen={gen} staged={staged_left()} {err[:160]} {chk.stdout[-120:]}", flush=True)
             shutil.rmtree(target, ignore_errors=True)
     check(term_ok, f"vault-import stopped by SIGTERM {rounds} times: generation 0 with no blobs and no staging, or the whole import")
-    check(kill_ok, f"vault-import killed -9 {rounds} times: generation 0 or the whole import; the next change and the next run clear the rest")
+    check(kill_ok, f"vault-import killed -9 {rounds} times: generation 0 or the whole import; vault-check --clean and the next run clear the rest")
 
     # Hostile archives, encrypted to this user's key by the backend itself (so any size
     # is a proper age file), and opened with the identity passphrase.

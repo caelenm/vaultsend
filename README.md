@@ -152,7 +152,12 @@ applies on Linux for now — see Platform support below.
   files and folders, open a file in its default app from a copy held in memory,
   extract files where you choose, delete them, and verify the whole vault for tampering. Open one with your own key, or with a password if you
   want to share it. Names and folder structure stay hidden; see the limitations
-  below for what a vault does reveal.
+  below for what a vault does reveal. Once every file passes, **Verify all** also
+  removes encrypted files the vault doesn't list, which an interrupted change leaves
+  behind. Ordinary changes never delete those, because a folder synced between devices
+  can hold another device's change before its file list arrives. So with a synced
+  vault, change it from one device at a time, and don't run Verify all until syncing
+  has finished.
 - **Remember passphrase.** Optionally keep your passphrase in memory until the app
   closes, with **Lock now** in the menu.
   Off by default; see the security model above for the trade-off.
@@ -295,7 +300,7 @@ vaultsend-backend vault-remove  --dir P --pass-fd N --all             # empty th
 vaultsend-backend vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH   # "/" is the whole vault
 vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH
 vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --share-pass-fd M --out PATH   # for a password
-vaultsend-backend vault-check   --dir P --pass-fd N                   # verify every file in RAM
+vaultsend-backend vault-check   --dir P --pass-fd N [--clean]         # verify every file in RAM; --clean then removes unlisted blobs
 vaultsend-backend vault-import  --dir P --pass-fd N (--id-pass-fd M | --share-pass-fd M) [--in PATH] [--name NAME] [--dest VAULTDIR]
 
 vaultsend-backend share-kind    [--in PATH]                           # password | key

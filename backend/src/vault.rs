@@ -209,6 +209,14 @@ impl Manifest {
         Ok(Manifest { generation, entries })
     }
 
+    /// The blob IDs this manifest names.
+    fn blobs(&self) -> BTreeSet<&str> {
+        self.entries.values().filter_map(|e| match e {
+            Entry::File { blob, .. } => Some(blob.as_str()),
+            Entry::Dir => None,
+        }).collect()
+    }
+
     /// Plaintext bytes in these paths; folders count for nothing.
     fn size_of<'a>(&self, paths: impl Iterator<Item = &'a str>) -> u64 {
         paths.fold(0, |sum, path| match self.entries.get(path) {
@@ -643,18 +651,20 @@ pub(crate) struct Vault {
     /// Held only for its flock, released when this is dropped.
     _lock: Option<File>,
     pub(crate) progress: Rc<Progress>,
+    /// The blobs the change in progress has written (`change`).
+    written: RefCell<Vec<String>>,
 }
 
 impl Vault {
     fn open(dir: &str, pass_fd: i32, exclusive: bool) -> R<Vault> {
         let lock = lock_vault(dir, exclusive)?;
-        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd)?, _lock: Some(lock), progress: Rc::default() })
+        Ok(Vault { dir: dir.to_string(), key: unlock(dir, pass_fd)?, _lock: Some(lock), progress: Rc::default(), written: RefCell::default() })
     }
 
     /// `wrap` already holds key.age's wrapped file key, so scrypt (for a password
     /// vault) has run by now. VAULT goes last: its presence marks a complete vault.
     pub(crate) fn create(dir: &str, mode: &str, wrap: age::Encryptor) -> R<Vault> {
-        let v = Vault { dir: dir.to_string(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default() };
+        let v = Vault { dir: dir.to_string(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default(), written: RefCell::default() };
         let populate = || -> R<()> {
             private_dir(dir, true)?;
             fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| format!("{dir}: {e}"))?;
@@ -744,14 +754,35 @@ impl Vault {
         Ok(())
     }
 
+    /// Every change goes through here: load the manifest, let `edit` change it (writing
+    /// any new blobs), and commit it as the next generation. If that fails, the blobs
+    /// `edit` wrote are deleted again, and nothing else: the old manifest is still the
+    /// vault (the rename that commits a manifest replaces the old one in one step).
+    fn change<T>(&self, edit: impl FnOnce(&mut Manifest) -> R<T>) -> R<T> {
+        let old = self.load_manifest()?;
+        let mut m = old.clone();
+        self.written.borrow_mut().clear();
+        let changed = edit(&mut m).and_then(|done| self.commit_next(&old, m).map(|()| done));
+        let written = self.written.take();
+        if changed.is_err() {
+            for blob in written {
+                let _ = fs::remove_file(self.blob_path(&blob));
+            }
+        }
+        changed
+    }
+
     /// The write protocol, once any new blobs are durable: bump the generation and
-    /// rename the manifest into place (the commit point), then delete everything the
-    /// new manifest does not reference. A crash at any moment leaves the old vault or
-    /// the new one, never a mix.
-    fn commit_next(&self, mut m: Manifest) -> R<()> {
+    /// rename the manifest into place (the commit point), then delete the blobs this
+    /// change dropped from `old`. A crash at any moment leaves the old vault or the new
+    /// one, never a mix. Nothing else is deleted, since a blob no manifest here names may
+    /// be another device's change that hasn't finished syncing: `clean` removes those,
+    /// when the user runs Verify all.
+    fn commit_next(&self, old: &Manifest, mut m: Manifest) -> R<()> {
         m.generation = m.generation.checked_add(1).ok_or("generation counter overflow")?;
         self.write_manifest(&m)?;
-        self.collect_garbage(&m);
+        let dropped = old.blobs().difference(&m.blobs()).map(|blob| self.blob_path(blob)).collect();
+        self.delete_blobs(dropped);
         Ok(())
     }
 
@@ -760,10 +791,7 @@ impl Vault {
     /// is ever reported or deleted. file_type doesn't follow symlinks, so a link is
     /// neither entered nor deleted.
     fn orphans(&self, m: &Manifest) -> R<Vec<String>> {
-        let live: BTreeSet<&str> = m.entries.values().filter_map(|e| match e {
-            Entry::File { blob, .. } => Some(blob.as_str()),
-            Entry::Dir => None,
-        }).collect();
+        let live = m.blobs();
         let part_suffix = staging_path("");
         let root = format!("{}/{BLOBS_DIR}", self.dir);
         let list = |p: PathBuf| fs::read_dir(&p).map_err(|e| format!("{}: {e}", p.display()));
@@ -790,23 +818,24 @@ impl Vault {
         Ok(found)
     }
 
-    /// Only a warning if this fails: it runs after the commit point, so the vault is
-    /// already correct and the next change will try again.
-    fn collect_garbage(&self, m: &Manifest) {
-        let removed = self.orphans(m).and_then(|list| {
-            // Deleting has no bytes to measure, so it counts blobs instead.
-            if self.progress.total.get() == 0 {
-                self.progress.start(list.len() as u64);
-            }
-            list.iter().try_for_each(|p| {
-                fs::remove_file(p).map_err(|e| format!("{p}: {e}"))?;
-                self.progress.advance(1);
-                Ok(())
-            })
-        });
-        if let Err(e) = removed {
-            eprintln!("warning: could not remove an unused blob: {e}");
+    /// Delete these blob files, and say how many went. Only a warning if one can't be:
+    /// this runs after the commit point, so the vault is already correct, and Verify
+    /// all will remove the rest.
+    fn delete_blobs(&self, doomed: Vec<String>) -> usize {
+        // Deleting has no bytes to measure, so it counts blobs instead.
+        if self.progress.total.get() == 0 {
+            self.progress.start(doomed.len() as u64);
         }
+        for (removed, path) in doomed.iter().enumerate() {
+            if let Err(e) = fs::remove_file(path) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    eprintln!("warning: could not remove an unused blob: {path}: {e}");
+                    return removed;
+                }
+            }
+            self.progress.advance(1);
+        }
+        doomed.len()
     }
 
     /// Encrypt one source file to a new blob: stage, hash while writing, fsync, rename.
@@ -829,6 +858,7 @@ impl Vault {
         // before the manifest's is.
         sync_dir(parent_of(&path));
         sync_dir(&format!("{}/{BLOBS_DIR}", self.dir));
+        self.written.borrow_mut().push(blob.clone());
         Ok(Entry::File { blob, sha256, size: size.get() })
     }
 
@@ -838,15 +868,15 @@ impl Vault {
     }
 
     pub(crate) fn add_from(&self, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<()> {
-        let old = self.load_manifest()?;
-        let added = self.add_to(old.clone(), sources, dest, replace);
-        if added.is_err() {
-            self.collect_garbage(&old); // the failed attempt's blobs; old is still current
+        let skipped = self.change(|m| self.add_to(m, sources, dest, replace))?;
+        if skipped > 0 {
+            eprintln!("warning: skipped {skipped} item(s) that are not regular files or folders");
         }
-        added
+        Ok(())
     }
 
-    fn add_to(&self, mut m: Manifest, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<()> {
+    /// Returns how many sources were skipped as neither a file nor a folder.
+    fn add_to(&self, m: &mut Manifest, sources: &dyn Sources, dest: Option<&str>, replace: bool) -> R<usize> {
         let dest = dest.filter(|d| *d != ROOT_ENTRY);
         if let Some(d) = dest {
             if !valid_vault_path(d) {
@@ -907,11 +937,7 @@ impl Vault {
             };
             m.entries.insert(path, entry);
         }
-        self.commit_next(m)?;
-        if skipped > 0 {
-            eprintln!("warning: skipped {skipped} item(s) that are not regular files or folders");
-        }
-        Ok(())
+        Ok(skipped)
     }
 
     /// All of these or none of them: one new manifest, so one new generation.
@@ -919,20 +945,22 @@ impl Vault {
         if let Some(bad) = entries.iter().find(|e| !valid_vault_path(e)) {
             return Err(format!("invalid vault path: {bad}"));
         }
-        let mut m = self.load_manifest()?;
-        if let Some(missing) = entries.iter().find(|e| !m.entries.contains_key(**e)) {
-            return Err(format!("'{missing}' is not in the vault"));
-        }
-        m.entries.retain(|path, _| entries.iter().all(|entry| within(path, entry).is_none()));
-        self.commit_next(m)
+        self.change(|m| {
+            if let Some(missing) = entries.iter().find(|e| !m.entries.contains_key(**e)) {
+                return Err(format!("'{missing}' is not in the vault"));
+            }
+            m.entries.retain(|path, _| entries.iter().all(|entry| within(path, entry).is_none()));
+            Ok(())
+        })
     }
 
     /// Empties the vault and leaves it in place. Its own command-line flag rather than
     /// `--entry /`, so that no path, however it got built, can mean this by accident.
     fn remove_everything(&self) -> R<()> {
-        let mut m = self.load_manifest()?;
-        m.entries.clear();
-        self.commit_next(m)
+        self.change(|m| {
+            m.entries.clear();
+            Ok(())
+        })
     }
 
     pub(crate) fn extract(&self, entry: &str, out: &str) -> R<()> {
@@ -1088,18 +1116,31 @@ impl Vault {
     }
 
     /// The RAM-only rule for every file, discarding the plaintext; stops at the first
-    /// failure. Orphans are reported but are no failure: a crash leaves them behind
-    /// and the next change removes them.
+    /// failure. Orphans, blob files the manifest doesn't name, are reported but are no
+    /// failure: an interrupted change leaves them, and so does another device's change
+    /// that hasn't finished syncing. `clean` removes them.
     pub(crate) fn check(&self) -> R<String> {
+        self.verify_all(false)
+    }
+
+    /// `check`, then, only if every file verified, delete the orphans it found. Needs
+    /// the vault open for changes.
+    pub(crate) fn clean(&self) -> R<String> {
+        self.verify_all(true)
+    }
+
+    fn verify_all(&self, clean: bool) -> R<String> {
         let m = self.load_manifest()?;
         let orphans = self.orphans(&m)?;
-        if !orphans.is_empty() {
+        if !orphans.is_empty() && !clean {
             eprintln!("warning: {} blob file(s) on disk are not in the manifest", orphans.len());
         }
         self.progress.start(m.size_of(m.entries.keys().map(String::as_str)));
         let mut report = String::new();
-        for orphan in &orphans {
-            report.push_str(&format!("orphan {}\n", &orphan[self.dir.len() + 1..]));
+        if !clean {
+            for orphan in &orphans {
+                report.push_str(&format!("orphan {}\n", &orphan[self.dir.len() + 1..]));
+            }
         }
         let mut verified = 0;
         for (path, entry) in &m.entries {
@@ -1107,6 +1148,11 @@ impl Vault {
                 self.read_verified(path, blob, sha256)?;
                 verified += 1;
             }
+        }
+        if clean && !orphans.is_empty() {
+            let removed = self.delete_blobs(orphans);
+            eprintln!("warning: removed {removed} unused encrypted file(s) left by an interrupted change");
+            report.push_str(&format!("removed {removed} unused blob file(s)\n"));
         }
         report.push_str(&format!("ok {verified} file(s) verified\n"));
         Ok(report)
@@ -1127,18 +1173,20 @@ pub(crate) struct Opts<'a> {
     pairs: Vec<(&'a str, &'a str)>,
     replace: bool,
     everything: bool,
+    clean: bool,
 }
 
 /// Strict "--name value" pairs, unlike the scanning helpers in main.rs, because
 /// values here can be names out of a vault: a folder called "--replace" must not
 /// read as the flag.
 pub(crate) fn parse_opts(args: &[String]) -> R<Opts<'_>> {
-    let mut o = Opts { pairs: Vec::new(), replace: false, everything: false };
+    let mut o = Opts { pairs: Vec::new(), replace: false, everything: false, clean: false };
     let mut it = args.iter().map(String::as_str);
     while let Some(name) = it.next() {
         match name {
             "--replace" => o.replace = true,
             "--all" => o.everything = true,
+            "--clean" => o.clean = true,
             "--dir" | "--mode" | "--pass-fd" | "--progress-fd" | "--src" | "--dest" | "--entry" | "--out" | "--to"
             | "--share-pass-fd" | "--id-pass-fd" | "--in" | "--name" => {
                 o.pairs.push((name, it.next().ok_or_else(|| format!("{name} needs a value"))?))
@@ -1246,6 +1294,7 @@ pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
             }
             Ok(())
         }
+        "vault-check" if o.clean => print_out(&open(true)?.clean()?),
         "vault-check" => print_out(&open(false)?.check()?),
         other => Err(format!("unknown command '{other}'")),
     }
@@ -1667,7 +1716,7 @@ mod tests {
 
         // A manifest encrypted to some other key: what a forger without the vault's
         // public key would have to produce.
-        let other = Vault { dir: v.dir.clone(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default() };
+        let other = Vault { dir: v.dir.clone(), key: x25519::Identity::generate(), _lock: None, progress: Rc::default(), written: RefCell::default() };
         other.write_manifest(&Manifest::default()).unwrap();
         assert!(v.load_manifest().unwrap_err().contains("damaged"));
     }
@@ -1848,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn crash_leftovers_are_collected_and_old_contents_survive() {
+    fn crash_leftovers_survive_changes_and_go_on_clean() {
         let t = TempDir::new();
         let v = quick_vault(&t);
         add(&v, &t.write("a.txt", b"aaa"));
@@ -1869,13 +1918,28 @@ mod tests {
         assert!(report.contains("orphan blobs/ab/abababababababababababababababab.age\n"), "{report}");
         assert!(report.contains("ok 1 file(s) verified"), "{report}");
 
+        // A change deletes only the blobs it dropped: these could be another device's
+        // change that hasn't finished syncing. Its own staged manifest replaces the old one.
         add(&v, &t.write("b.txt", b"bbb"));
-        for gone in [&stray, &stray_part, &manifest_part, &live_part] {
-            assert!(!Path::new(gone).exists(), "{gone} should have been collected");
+        v.remove(&["b.txt"]).unwrap();
+        for kept in [&stray, &stray_part, &live_part] {
+            assert!(Path::new(kept).exists(), "{kept} was deleted by a change");
+        }
+        assert!(!Path::new(&manifest_part).exists());
+
+        // Clean refuses while anything fails to verify, and deletes nothing.
+        let saved = fs::read(&a).unwrap();
+        fs::write(&a, b"tampered").unwrap();
+        assert!(v.clean().unwrap_err().contains("failed verification"));
+        assert!(Path::new(&stray).exists());
+        fs::write(&a, saved).unwrap();
+
+        let report = v.clean().unwrap();
+        assert_eq!(report, "removed 3 unused blob file(s)\nok 1 file(s) verified\n");
+        for gone in [&stray, &stray_part, &live_part] {
+            assert!(!Path::new(gone).exists(), "{gone} should have been cleaned");
         }
         assert!(Path::new(&a).exists());
-        let m = v.load_manifest().unwrap();
-        assert!(m.entries.contains_key("a.txt") && m.entries.contains_key("b.txt"));
         assert!(!v.check().unwrap().contains("orphan"));
     }
 
@@ -1902,6 +1966,7 @@ mod tests {
 
         add(&v, &t.write("a.txt", b"aaa"));
         v.remove(&["a.txt"]).unwrap();
+        v.clean().unwrap();
         for f in safe.iter().chain([&outside]) {
             assert_eq!(fs::read(f).unwrap(), b"mine", "{f} was touched");
         }
@@ -1946,6 +2011,39 @@ mod tests {
             assert_eq!(v.orphans(&before).unwrap(), Vec::<String>::new());
         }
         fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o600)).unwrap();
+    }
+
+    /// Two files, the second of which can't be read.
+    struct SecondFails;
+
+    impl Sources for SecondFails {
+        fn plan(&self) -> R<Plan> {
+            Ok((vec![("one.txt".into(), Some(0)), ("two.txt".into(), Some(1))], 0))
+        }
+        fn open(&self, index: usize) -> R<Box<dyn Read>> {
+            match index {
+                0 => Ok(Box::new(Cursor::new(b"one".to_vec()))),
+                _ => Err("the second source can't be read".into()),
+            }
+        }
+        fn size(&self, _: usize) -> u64 {
+            3
+        }
+    }
+
+    /// A failed change removes the blobs it wrote, and nothing else: a blob it didn't
+    /// write may be another device's change that hasn't finished syncing.
+    #[test]
+    fn failed_add_removes_only_its_own_blobs() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        add(&v, &t.write("a.txt", b"a"));
+        let before = v.load_manifest().unwrap();
+        let stray = t.write("v.vsvault/blobs/ab/abababababababababababababababab.age", b"stray");
+        assert!(v.add_from(&SecondFails, None, false).unwrap_err().contains("can't be read"));
+        assert_eq!(v.load_manifest().unwrap(), before);
+        let orphans = v.orphans(&before).unwrap();
+        assert_eq!(orphans, vec![stray.clone()], "the failed add left its own blob behind");
     }
 
     #[test]

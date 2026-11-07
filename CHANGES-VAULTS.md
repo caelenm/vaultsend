@@ -427,9 +427,14 @@ D <escaped-path>
    writing, fsync, rename, fsync its folder.
 2. Write the new manifest with `generation + 1` to `manifest.age.vaultsend-part`, fsync,
    rename → **this rename is the commit point.** fsync the vault folder.
-3. Delete blobs the new manifest doesn't reference, including orphans from an earlier
-   crash. Only files under `blobs/` named exactly
+3. Delete the blobs this change dropped: in the old manifest and not the new one. A
+   change that fails deletes only the blobs it wrote. Orphans from an earlier crash, or
+   from another device's change that hasn't finished syncing, stay until
+   `vault-check --clean` (the app's Verify all), which removes them only after every file
+   has verified. Only files under `blobs/` named exactly
    `^[0-9a-f]{2}/[0-9a-f]{32}\.age(\.vaultsend-part)?$` qualify. Nothing else is ever deleted.
+   (Changed from "every change deletes every unreferenced blob": in a folder synced
+   between devices, that deleted another device's new blobs before its manifest arrived.)
 
 A crash at any point leaves the old vault or the new one, never a mix.
 
@@ -568,8 +573,9 @@ The same as the rest of VaultSend, plus what someone with write access can still
   line, any non-UTF-8 argument aborts the backend, as it already did for the existing commands.
 - `vault-list` runs synchronously, as the existing text decrypt does, so unlocking freezes
   the window for the length of one scrypt.
-- A cancelled or failed `add` leaves encrypted orphan blobs if the backend is killed; the
-  next change collects them, and `vault-check` reports them until then.
+- A cancelled or failed `add` removes the blobs it wrote. If the backend is killed instead,
+  they stay as orphans: `vault-check` reports them, and Verify all (`vault-check --clean`)
+  removes them.
 - A folder extract killed partway leaves the files written so far in `<out>.vaultsend-part`,
   decrypted, until the same extract is run again. A killed process can't clean up after itself.
   The same goes for `share-extract` killed with SIGKILL. SIGTERM, the frontend's Cancel, cleans
