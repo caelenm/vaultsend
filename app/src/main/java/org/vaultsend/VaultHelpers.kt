@@ -265,10 +265,54 @@ data class VaultSelection(
     val single: String? = null,
     val ticked: Set<String> = emptySet(),
     val expanded: Set<String> = emptySet(),
+    /** Paths waiting to be pasted (Cut): top-level, none inside another. Empty when nothing is cut. */
+    val cut: List<String> = emptyList(),
 ) {
-    /** A fresh listing: nothing selected, the same folders open (desktop keeps `expanded`). */
-    fun withEntries(list: List<VaultEntry>): VaultSelection =
-        VaultSelection(entries = list.associateBy { it.path }, multiple = multiple, expanded = expanded)
+    /** A fresh listing: nothing selected, the same folders open and the same things cut that still exist. */
+    fun withEntries(list: List<VaultEntry>): VaultSelection {
+        val byPath = list.associateBy { it.path }
+        return VaultSelection(
+            entries = byPath,
+            multiple = multiple,
+            expanded = expanded,
+            cut = cut.filter { it in byPath },
+        )
+    }
+
+    /** Whether Cut can act: something is chosen, and it isn't the whole vault. */
+    fun canCut(): Boolean = chosen().let { it.isNotEmpty() && ROOT_ENTRY !in it }
+
+    /**
+     * Cut: set what's chosen aside and go back to choosing one row, so the next tap picks
+     * the folder to paste into.
+     */
+    fun cutChosen(): VaultSelection =
+        if (!canCut()) this else copy(cut = chosen(), multiple = false, single = null, ticked = emptySet())
+
+    fun cancelCut(): VaultSelection = copy(cut = emptyList())
+
+    fun isCut(path: String): Boolean = cut.any { path == it || path.startsWith("$it/") }
+
+    /** The moves Paste would make: each cut item into [addDestination], skipping any already there. */
+    fun pasteMoves(): List<Pair<String, String>> {
+        val dest = addDestination()
+        return cut.map { it to (if (dest.isEmpty()) "" else "$dest/") + it.substringAfterLast('/') }
+            .filter { (from, to) -> from != to }
+    }
+
+    /** Why Paste can't go ahead into [addDestination], or null if it can (or there's nothing to move). */
+    fun pasteProblem(): String? {
+        val dest = addDestination()
+        for ((from, to) in pasteMoves()) {
+            val name = from.substringAfterLast('/')
+            if (dest == from || dest.startsWith("$from/")) return "Can't paste “$name” inside itself."
+            if (to in entries) return "“$name” already exists there."
+        }
+        return null
+    }
+
+    /** Paste is on offer: something is cut, it would really move, and nothing stands in the way. */
+    fun canPaste(): Boolean = pasteMoves().isNotEmpty() && pasteProblem() == null
 
     /** What the actions act on: paths, none inside another; ROOT_ENTRY for everything; or nothing. */
     fun chosen(): List<String> = when {

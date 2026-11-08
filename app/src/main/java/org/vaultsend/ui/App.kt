@@ -79,6 +79,7 @@ import org.vaultsend.filesInSelection
 import org.vaultsend.isArchiveName
 import org.vaultsend.noteSuffix
 import org.vaultsend.noteTitle
+import org.vaultsend.parentFolders
 import org.vaultsend.renamedPath
 import org.vaultsend.singleNameFromShared
 import org.vaultsend.vaultNameFromShared
@@ -1430,6 +1431,38 @@ fun App(vm: AppViewModel = viewModel()) {
         }
     }
 
+    fun vaultCut() {
+        vm.vaultPage = vm.vaultPage?.cutChosen()
+    }
+
+    /** Paste what's cut into the chosen folder: one rename per item, stopping at the first that fails. */
+    fun vaultPaste() {
+        val vault = vm.selectedVault ?: return
+        val page = vm.vaultPage ?: return
+        if (!page.canPaste()) return
+        val moves = page.pasteMoves()
+        val dest = page.addDestination()
+        withVaultSecret(vault) { secret ->
+            val ok = runVaultOp(vault, secret, "Moving…", "Moved.", relist = true) { _ ->
+                var last = Backend.VaultResult("", emptyList())
+                for ((from, to) in moves) last = vm.backend.vaultRename(vault, secret, from, to)
+                last
+            }
+            if (ok) {
+                vm.vaultPage = vm.vaultPage?.let { p ->
+                    fun moved(e: String): String {
+                        val m = moves.firstOrNull { (from, _) -> e == from || e.startsWith("$from/") } ?: return e
+                        return m.second + e.removePrefix(m.first)
+                    }
+                    p.copy(
+                        cut = emptyList(),
+                        expanded = p.expanded.map(::moved).toSet() + parentFolders("$dest/x").filter { it.isNotEmpty() },
+                    )
+                }
+            }
+        }
+    }
+
     val vaultActions = VaultActions(
         onUnlock = { vaultUnlock() },
         onAddFiles = {
@@ -1440,6 +1473,8 @@ fun App(vm: AppViewModel = viewModel()) {
         onAddNote = { vaultAddNote() },
         onEditNote = { vaultEditNote() },
         onRename = { vaultRename() },
+        onCut = { vaultCut() },
+        onPaste = { vaultPaste() },
         onOpen = { vaultOpen() },
         onExtract = { vaultExtract() },
         onShare = { vaultShare() },

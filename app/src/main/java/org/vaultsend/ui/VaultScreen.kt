@@ -37,6 +37,8 @@ import androidx.compose.material.icons.automirrored.filled.NoteAdd
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.ContentCopy
+import androidx.compose.material.icons.filled.ContentCut
+import androidx.compose.material.icons.filled.ContentPaste
 import androidx.compose.material.icons.filled.CreateNewFolder
 import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.DriveFileRenameOutline
@@ -80,6 +82,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
@@ -100,6 +103,7 @@ import org.vaultsend.VaultEntry
 import org.vaultsend.VaultRecord
 import org.vaultsend.VaultSelection
 import org.vaultsend.entryIndent
+import org.vaultsend.countOf
 import org.vaultsend.entryNameProblem
 import org.vaultsend.humanSize
 import org.vaultsend.isValidVaultName
@@ -303,6 +307,8 @@ class VaultActions(
     val onAddNote: () -> Unit,
     val onEditNote: () -> Unit,
     val onRename: () -> Unit,
+    val onCut: () -> Unit = {},
+    val onPaste: () -> Unit = {},
     val onOpen: () -> Unit,
     val onExtract: () -> Unit,
     val onShare: () -> Unit,
@@ -374,6 +380,22 @@ fun VaultPage(
             )
         }
 
+        if (page != null && page.cut.isNotEmpty()) {
+            val problem = page.pasteProblem()
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        "${countOf(page.cut.size, "item")} cut. Choose a folder, then Paste.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    if (problem != null) {
+                        Text(problem, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+                    }
+                }
+                TextButton(onClick = { onChange(page.cancelCut()) }) { Text("Cancel") }
+            }
+        }
+
         Box(modifier = Modifier.weight(1f).fillMaxWidth()) {
             if (page == null) {
                 Column(
@@ -415,6 +437,12 @@ fun VaultPage(
             chosen = page?.chosen().orEmpty().isNotEmpty(),
             one = page?.oneChosen() != null,
             note = page?.chosenNote() != null,
+            canCut = page?.canCut() == true,
+            pasteLabel = page?.takeIf { it.cut.isNotEmpty() }?.let { p ->
+                val dest = p.addDestination()
+                if (dest.isEmpty()) "Paste here (top of vault)" else "Paste into ${dest.substringAfterLast('/')}/"
+            },
+            canPaste = page?.canPaste() == true,
             unlocked = page != null,
             actions = actions,
         )
@@ -478,6 +506,11 @@ private fun VaultActionSheet(
     one: Boolean,
     /** That one is a .md or .txt file: Edit note. */
     note: Boolean,
+    /** Something other than the whole vault is chosen: Cut. */
+    canCut: Boolean,
+    /** Set while something is cut: what Paste says, naming where it goes. */
+    pasteLabel: String?,
+    canPaste: Boolean,
     unlocked: Boolean,
     actions: VaultActions,
 ) {
@@ -506,6 +539,11 @@ private fun VaultActionSheet(
                 // Plain rows with a line between each, on the app's own background.
                 Column(modifier = Modifier.padding(bottom = 8.dp)) {
                     HorizontalDivider()
+                    // With something cut, Paste leads: it's the next step.
+                    if (pasteLabel != null) {
+                        SheetItem(Icons.Filled.ContentPaste, pasteLabel, idle && canPaste, actions.onPaste)
+                        HorizontalDivider()
+                    }
                     SheetItem(Icons.Filled.UploadFile, "Add files…", idle, actions.onAddFiles)
                     HorizontalDivider()
                     SheetItem(Icons.Filled.CreateNewFolder, "Add folder…", idle, actions.onAddFolder)
@@ -517,6 +555,8 @@ private fun VaultActionSheet(
                     SheetItem(Icons.Filled.Edit, "Edit note", idle && note, actions.onEditNote)
                     HorizontalDivider()
                     SheetItem(Icons.Filled.DriveFileRenameOutline, "Rename…", idle && one, actions.onRename)
+                    HorizontalDivider()
+                    SheetItem(Icons.Filled.ContentCut, "Cut", idle && canCut, actions.onCut)
                     HorizontalDivider()
                     SheetItem(Icons.Filled.Unarchive, "Extract…", idle && chosen, actions.onExtract)
                     HorizontalDivider()
@@ -559,6 +599,7 @@ private fun EntryRow(entry: VaultEntry, page: VaultSelection, onChange: (VaultSe
     Row(
         modifier = Modifier
             .fillMaxWidth()
+            .alpha(if (page.isCut(entry.path)) 0.5f else 1f)
             .clickable { choose() }
             // Indented by depth, and no further than INDENT_LEVELS: the list can't scroll sideways.
             .padding(start = entryIndent(entry.path).dp),

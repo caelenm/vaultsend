@@ -588,4 +588,95 @@ class VaultHelpersTest {
             assertTrue(n, isValidVaultName(archiveFolderName(n)))
         }
     }
+
+    // --- Cut and Paste ---
+
+    private val tree = VaultSelection().withEntries(
+        listOf(
+            VaultEntry("a", true, 0), VaultEntry("a/1.txt", false, 1), VaultEntry("a/b", true, 0),
+            VaultEntry("dest", true, 0), VaultEntry("dest/1.txt", false, 1),
+            VaultEntry("x.txt", false, 1), VaultEntry("y.txt", false, 1),
+        ),
+    )
+
+    /** Cut `paths` (ticked), then choose `target` the way a tap would, or nothing for the top. */
+    private fun cutThenChoose(paths: List<String>, target: String?): VaultSelection {
+        var p = tree.withMultiple(true)
+        for (path in paths) p = p.tick(path, true)
+        p = p.cutChosen()
+        return if (target == null) p else p.select(target)
+    }
+
+    @Test
+    fun cutSetsAsideAndReturnsToSingleChoice() {
+        val p = cutThenChoose(listOf("x.txt", "y.txt"), null)
+        assertEquals(listOf("x.txt", "y.txt"), p.cut)
+        assertFalse(p.multiple)
+        assertEquals(emptyList<String>(), p.chosen())
+        assertTrue(p.isCut("x.txt"))
+        assertFalse(p.isCut("a"))
+        assertEquals(emptyList<String>(), p.cancelCut().cut)
+    }
+
+    @Test
+    fun cutNeedsSomethingAndNotTheWholeVault() {
+        assertFalse(tree.canCut())
+        assertFalse(tree.selectAll().canCut())
+        assertEquals(emptyList<String>(), tree.selectAll().cutChosen().cut)
+    }
+
+    @Test
+    fun cutFolderCoversWhatIsInside() {
+        val p = cutThenChoose(listOf("a"), null)
+        assertEquals(listOf("a"), p.cut)
+        assertTrue(p.isCut("a/b"))
+    }
+
+    @Test
+    fun pasteIntoFolderMovesEachItemThere() {
+        val p = cutThenChoose(listOf("x.txt", "y.txt"), "dest")
+        assertEquals(listOf("x.txt" to "dest/x.txt", "y.txt" to "dest/y.txt"), p.pasteMoves())
+        assertNull(p.pasteProblem())
+        assertTrue(p.canPaste())
+    }
+
+    @Test
+    fun pasteBesideChosenFileUsesItsFolder() {
+        val p = cutThenChoose(listOf("x.txt"), "a/1.txt")
+        assertEquals(listOf("x.txt" to "a/x.txt"), p.pasteMoves())
+    }
+
+    @Test
+    fun pasteWithNothingChosenGoesToTheTop() {
+        val p = cutThenChoose(listOf("a/1.txt"), null)
+        assertEquals(listOf("a/1.txt" to "1.txt"), p.pasteMoves())
+        assertTrue(p.canPaste())
+    }
+
+    @Test
+    fun pasteWhereItAlreadyIsDoesNothing() {
+        val p = cutThenChoose(listOf("x.txt"), null)
+        assertEquals(emptyList<Pair<String, String>>(), p.pasteMoves())
+        assertFalse(p.canPaste())
+    }
+
+    @Test
+    fun pasteRefusesAFolderInsideItself() {
+        assertEquals("Can't paste “a” inside itself.", cutThenChoose(listOf("a"), "a").pasteProblem())
+        assertFalse(cutThenChoose(listOf("a"), "a/b").canPaste())
+    }
+
+    @Test
+    fun pasteRefusesACollision() {
+        val p = cutThenChoose(listOf("a/1.txt"), "dest")
+        assertEquals("“1.txt” already exists there.", p.pasteProblem())
+        assertFalse(p.canPaste())
+    }
+
+    @Test
+    fun relistingDropsCutPathsThatAreGone() {
+        val p = cutThenChoose(listOf("x.txt", "y.txt"), null)
+        val after = p.withEntries(tree.entries.values.filter { it.path != "y.txt" })
+        assertEquals(listOf("x.txt"), after.cut)
+    }
 }
