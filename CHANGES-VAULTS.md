@@ -4,6 +4,7 @@ Record for `feature/vaults`, version 0.2.0 (spec: `VAULTS_PLAN.md`). Local branc
 only; nothing has been pushed.
 
 - [Summary](#summary)
+- [Ported from the Android build: Cut and Paste](#ported-from-the-android-build-cut-and-paste)
 - [Ported from the Android build: opening shares safely](#ported-from-the-android-build-opening-shares-safely)
 - [Changes from the owner's testing](#changes-from-the-owners-testing)
 - [Decisions made by the owner](#decisions-made-by-the-owner)
@@ -33,6 +34,17 @@ chose to change so secret buffers are locked in memory: `read_passphrase`, `load
 `cmd_keygen`. Those changes are listed below.
 
 ---
+
+## Ported from the Android build: Cut and Paste
+
+Android's Cut and Paste (`android` branch, 2af7687) is on desktop as **Cut** and **Paste**
+buttons, with the same rules: the whole vault can't be cut, a folder can't go inside itself,
+a name already taken refuses the whole paste, and pasting where an item already is does
+nothing. Android makes one `vaultRename` per item; desktop has no rename, so the backend
+gets `vault-move`: every `--entry` into `--dest` (the top if omitted) in one commit, so a
+paste is all or nothing and uses one generation. Only the manifest changes, as with Android's
+rename: no blob is read, decrypted or rewritten. Tests: `move_entries_is_all_or_nothing_and_manifest_only`
+and `CutAndPaste` in `tests/test_frontend_helpers.py`. The GUI itself wasn't run here (no GTK in the build container).
 
 ## Ported from the Android build: opening shares safely
 
@@ -365,6 +377,7 @@ vault-list    --dir P --pass-fd N
 vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
 vault-remove  --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]...
 vault-remove  --dir P --pass-fd N --all
+vault-move    --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... [--dest FOLDER]
 vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH
 vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH
 vault-check   --dir P --pass-fd N

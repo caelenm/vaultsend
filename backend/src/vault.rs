@@ -954,6 +954,57 @@ impl Vault {
         })
     }
 
+    /// Cut and Paste: move each of `entries`, a file or a folder with all it holds, into
+    /// the folder `dest` ("" or None for the top of the vault), keeping its name. All of
+    /// them or none, in one commit. Only the manifest changes: no blob is touched or
+    /// decrypted, so a folder of any size moves at once.
+    fn move_entries(&self, entries: &[&str], dest: Option<&str>) -> R<()> {
+        let dest = dest.unwrap_or("");
+        if let Some(bad) = entries.iter().chain(Some(&dest).filter(|d| !d.is_empty())).find(|p| !valid_vault_path(p)) {
+            return Err(format!("invalid vault path: {bad}"));
+        }
+        self.change(|m| {
+            if !dest.is_empty() && m.entries.get(dest) != Some(&Entry::Dir) {
+                return Err(format!("'{dest}' is not a folder in the vault"));
+            }
+            let mut moves = Vec::new();
+            for &from in entries {
+                if !m.entries.contains_key(from) {
+                    return Err(format!("'{from}' is not in the vault"));
+                }
+                let name = from.rsplit('/').next().unwrap_or(from);
+                let to = if dest.is_empty() { name.to_string() } else { format!("{dest}/{name}") };
+                if to == from {
+                    continue; // already there
+                }
+                if !dest.is_empty() && within(dest, from).is_some() {
+                    return Err(format!("'{name}' can't be moved inside itself"));
+                }
+                moves.push((from, to));
+            }
+            let mut targets = std::collections::BTreeSet::new();
+            for (from, to) in &moves {
+                let name = from.rsplit('/').next().unwrap_or(from);
+                if m.entries.contains_key(to) || !targets.insert(to.clone()) {
+                    return Err(format!("'{name}' already exists there"));
+                }
+            }
+            for (from, to) in moves {
+                let inside: Vec<String> = m.entries.keys().filter(|k| within(k, from).is_some()).cloned().collect();
+                for old in inside {
+                    let rest = within(&old, from).unwrap_or("");
+                    let new = if rest.is_empty() { to.clone() } else { format!("{to}/{rest}") };
+                    if !valid_vault_path(&new) {
+                        return Err(format!("can't store this path in a vault: {new}"));
+                    }
+                    let entry = m.entries.remove(&old).expect("listed above");
+                    m.entries.insert(new, entry);
+                }
+            }
+            Ok(())
+        })
+    }
+
     /// Empties the vault and leaves it in place. Its own command-line flag rather than
     /// `--entry /`, so that no path, however it got built, can mean this by accident.
     fn remove_everything(&self) -> R<()> {
@@ -1274,6 +1325,7 @@ pub(crate) fn run(cmd: &str, args: &[String]) -> R<()> {
         "vault-add" => open(true)?.add(&o.all("--src"), o.get("--dest"), o.replace),
         "vault-remove" if o.everything => open(true)?.remove_everything(),
         "vault-remove" => open(true)?.remove(&o.entries()?),
+        "vault-move" => open(true)?.move_entries(&o.entries()?, o.get("--dest")),
         "vault-extract" => match o.entries()?[..] {
             [one] => open(false)?.extract(one, o.need("--out")?),
             ref many => open(false)?.extract_many(many, o.need("--out")?),
@@ -1386,6 +1438,56 @@ mod tests {
             Some(Entry::File { blob, .. }) => v.blob_path(blob),
             other => panic!("{path}: {other:?}"),
         }
+    }
+
+    #[test]
+    fn move_entries_is_all_or_nothing_and_manifest_only() {
+        let t = TempDir::new();
+        let v = quick_vault(&t);
+        v.change(|m| {
+            for d in ["a", "a/b", "dest"] {
+                m.entries.insert(d.into(), Entry::Dir);
+            }
+            for f in ["a/1.txt", "a/b/2.txt", "dest/1.txt", "x.txt", "y.txt"] {
+                m.entries.insert(f.into(), fake_entry());
+            }
+            Ok(())
+        })
+        .unwrap();
+        let keys = |v: &Vault| v.load_manifest().unwrap().entries.keys().cloned().collect::<Vec<_>>();
+        let before = keys(&v);
+        let gen = v.load_manifest().unwrap().generation;
+
+        // Refusals change nothing, not even the generation.
+        for (items, dest) in [
+            (vec!["a"], Some("a")),            // into itself
+            (vec!["a"], Some("a/b")),          // into its own subfolder
+            (vec!["a/1.txt"], Some("dest")),   // name collision
+            (vec!["x.txt", "y.txt"], Some("x.txt")), // destination is a file
+            (vec!["x.txt"], Some("nope")),     // destination missing
+            (vec!["x.txt", "gone"], Some("dest")), // one source missing
+        ] {
+            assert!(v.move_entries(&items, dest).is_err(), "{items:?} -> {dest:?}");
+        }
+        assert_eq!(keys(&v), before);
+        assert_eq!(v.load_manifest().unwrap().generation, gen);
+
+        // Moving where it already is is a quiet success.
+        v.move_entries(&["x.txt"], None).unwrap();
+
+        // Several at once, a folder bringing what it holds.
+        v.move_entries(&["x.txt", "y.txt", "a"], Some("dest")).unwrap();
+        let after = keys(&v);
+        for gone in ["x.txt", "y.txt", "a", "a/1.txt", "a/b", "a/b/2.txt"] {
+            assert!(!after.contains(&gone.to_string()), "{gone}");
+        }
+        for here in ["dest/x.txt", "dest/y.txt", "dest/a", "dest/a/1.txt", "dest/a/b", "dest/a/b/2.txt", "dest/1.txt"] {
+            assert!(after.contains(&here.to_string()), "{here}");
+        }
+
+        // And back out to the top.
+        v.move_entries(&["dest/a/b/2.txt"], None).unwrap();
+        assert!(keys(&v).contains(&"2.txt".to_string()));
     }
 
     fn assert_nothing_written(out: &str) {

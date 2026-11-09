@@ -271,6 +271,12 @@ what lets this device notice a rolled-back vault.
   click *Add new contact* to add one on the way. You then choose where to save a file
   that only you and they can read, to send however you like. They decrypt it on the main
   page. One file stays that file; a folder or several items arrive as a `.tar` archive.
+- **Moving things between folders:** select a file, a folder, or several (with *Select
+  multiple*) and click **Cut**; they fade, and a bar says what's waiting. Then click the
+  folder to move them into, or a file to use its folder, or nothing for the top of the
+  vault, and click **Paste**. Paste is off when a folder would go inside itself or a name
+  is already taken there; the bar says which. Only the vault's index changes, so a big
+  folder moves at once, and all of them move or none do. Cancel in the bar changes nothing.
 - **Opening a file from a vault:** select it and click **Open**. It opens in its default
   app from a copy in memory, which is deleted when you lock the vault or close VaultSend.
   Changes aren't saved back to the vault: to keep them, use **Save As** in that app, then
@@ -296,6 +302,7 @@ vaultsend-backend vault-create  --dir P --mode password --pass-fd N   # at least
 vaultsend-backend vault-list    --dir P --pass-fd N                   # names and sizes only
 vaultsend-backend vault-add     --dir P --pass-fd N --src PATH [--src PATH]... [--dest VAULTDIR] [--replace]
 vaultsend-backend vault-remove  --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]...
+vaultsend-backend vault-move    --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... [--dest FOLDER]
 vaultsend-backend vault-remove  --dir P --pass-fd N --all             # empty the vault, keep the vault
 vaultsend-backend vault-extract --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --out PATH   # "/" is the whole vault
 vaultsend-backend vault-share   --dir P --pass-fd N --entry VAULTPATH [--entry VAULTPATH]... --to AGE1.. [--to AGE1..]... --out PATH

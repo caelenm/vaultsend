@@ -579,8 +579,8 @@ fn run() -> R<()> {
             opt_value(rest, "--in").as_deref(),
             opt_value(rest, "--out").as_deref(),
         ),
-        "vault-create" | "vault-list" | "vault-add" | "vault-remove" | "vault-extract"
-        | "vault-share" | "vault-check" => vault::run(cmd, rest),
+        "vault-create" | "vault-list" | "vault-add" | "vault-remove" | "vault-move"
+        | "vault-extract" | "vault-share" | "vault-check" => vault::run(cmd, rest),
         "vault-import" => {
             catch_stop_signals();
             vault::run(cmd, rest)
@@ -592,7 +592,7 @@ fn run() -> R<()> {
         }
         other => Err(format!(
             "unknown command '{other}' (expected keygen|pubkey|status|recover-pubkey|encrypt|decrypt|\
-             vault-create|vault-list|vault-add|vault-remove|vault-extract|vault-share|vault-check|\
+             vault-create|vault-list|vault-add|vault-remove|vault-move|vault-extract|vault-share|vault-check|\
              vault-import|share-kind|share-check|share-decrypt|share-extract)"
         )),
     }

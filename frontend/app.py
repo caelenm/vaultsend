@@ -410,6 +410,31 @@ def top_level_selection(paths) -> list:
     return sorted(p for p in chosen if not any(parent in chosen for parent in parent_folders(p)))
 
 
+def destination_folder(chosen, entries) -> str:
+    """Where Add and Paste put things: the chosen folder, or the folder of the chosen file.
+    With several chosen there's no one place that could mean, so the top of the vault ("")."""
+    one = chosen[0] if len(chosen) == 1 else ROOT_ENTRY
+    selected = entries.get(one)
+    return one if selected and selected["is_dir"] else one.rpartition("/")[0]
+
+
+def paste_moves(cut, dest) -> list:
+    """The moves Paste would make: each cut item into `dest`, skipping any already there."""
+    moves = [(p, f"{dest}/{p.rpartition('/')[2]}" if dest else p.rpartition("/")[2]) for p in cut]
+    return [(src, to) for src, to in moves if src != to]
+
+
+def paste_problem(cut, dest, entries):
+    """Why Paste can't go ahead into `dest`, or None if it can (or there's nothing to move)."""
+    for src, to in paste_moves(cut, dest):
+        name = src.rpartition("/")[2]
+        if dest == src or dest.startswith(src + "/"):
+            return f"Can't paste “{name}” inside itself."
+        if to in entries:
+            return f"“{name}” already exists there."
+    return None
+
+
 def files_in_selection(selection, entries) -> list:
     """The files a selection covers, in display order. `entries` is a listing by path."""
     def covered(path):
@@ -871,6 +896,7 @@ class Window(Adw.ApplicationWindow):
         self.syncing_checks = False  # ticking one box is ticking others too; see _on_entry_ticked
         self.syncing_select_all = False  # Select all's state set from _update_selection
         self.expanded = set()  # folders left open, kept across re-listing
+        self.cut = []  # paths set aside by Cut, waiting for Paste
         self.opened = []  # decrypted copies given to other apps; see vault_open()
         clear_stale_copies()
         self.connect("close-request", self._on_close_request)
@@ -2141,6 +2167,16 @@ class Window(Adw.ApplicationWindow):
         files_row.append(self.verify_btn)
         col.append(files_row)
 
+        # Shown while something is cut: what Paste will do, or what stands in its way.
+        self.cut_bar = Gtk.Box(spacing=8, visible=False)
+        self.cut_label = Gtk.Label(xalign=0, hexpand=True, wrap=True)
+        cancel_cut = Gtk.Button(label="Cancel", valign=Gtk.Align.CENTER)
+        cancel_cut.add_css_class("flat")
+        cancel_cut.connect("clicked", lambda *_: self.vault_cancel_cut())
+        self.cut_bar.append(self.cut_label)
+        self.cut_bar.append(cancel_cut)
+        col.append(self.cut_bar)
+
         unlock = Gtk.Button(label="Unlock", halign=Gtk.Align.CENTER)
         unlock.add_css_class("pill")
         unlock.add_css_class("suggested-action")
@@ -2169,6 +2205,8 @@ class Window(Adw.ApplicationWindow):
             (Gtk.Align.START, (("Add files…", self.vault_add_files), ("Add folder…", self.vault_add_folder))),
             (Gtk.Align.END, (
                 ("Open", self.vault_open),
+                ("Cut", self.vault_cut),
+                ("Paste", self.vault_paste),
                 ("Extract…", self.vault_extract),
                 ("Share…", self.vault_share),
                 ("Delete", self.vault_delete),
@@ -2182,6 +2220,10 @@ class Window(Adw.ApplicationWindow):
                 group.append(btn)
                 if handler in (self.vault_open, self.vault_extract, self.vault_share, self.vault_delete):
                     self.selection_buttons.append(btn)
+                elif handler == self.vault_cut:
+                    self.cut_btn = btn
+                elif handler == self.vault_paste:
+                    self.paste_btn = btn
             self.vault_actions.append(group)
             group.get_parent().set_focusable(False)  # Tab goes to the buttons, not around them
         col.append(self.vault_actions)
@@ -2195,6 +2237,7 @@ class Window(Adw.ApplicationWindow):
     def _clear_files(self):
         self.vault_entries = None
         self.selected_entry = None
+        self.cut = []
         self.entry_checks = {}
         child = self.file_list.get_first_child()
         while child:
@@ -2212,8 +2255,10 @@ class Window(Adw.ApplicationWindow):
         self._update_selection()
 
     def _show_files(self, entries, ticked=()):
+        keep_cut = self.cut
         self._clear_files()
         self.vault_entries = {e["path"]: e for e in entries}
+        self.cut = [p for p in keep_cut if p in self.vault_entries]
         several = self.select_mode_btn.get_active()
         if not entries:
             row = Adw.ActionRow(title="Nothing in this vault yet", subtitle="Add files or a folder, or drop them here.")
@@ -2244,6 +2289,8 @@ class Window(Adw.ApplicationWindow):
                 row = plain_row(name, human_bytes(e["size"]))
                 row.set_activatable_widget(radio)
             row.add_prefix(radio)
+            if any(e["path"] == c or e["path"].startswith(c + "/") for c in self.cut):
+                row.add_css_class("dim-label")
             if parent in folders:
                 folders[parent].add_row(row)
             else:
@@ -2291,6 +2338,7 @@ class Window(Adw.ApplicationWindow):
         self.files_heading.set_label(summary)
         for btn in self.selection_buttons:
             btn.set_sensitive(bool(chosen))
+        self._update_cut(chosen)
         everything = chosen == [ROOT_ENTRY]
         self.select_all_btn.set_label("Select none" if everything else "Select all")
         self.select_all_btn.set_sensitive(bool(self.vault_entries))
@@ -2302,6 +2350,65 @@ class Window(Adw.ApplicationWindow):
         (self.select_mode_btn.add_css_class if everything else self.select_mode_btn.remove_css_class)(
             "vaultsend-outranked"
         )
+
+    def _update_cut(self, chosen):
+        """Cut needs something chosen, and not the whole vault. Paste leads once something is
+        cut, and says where it would go; the bar says why it can't."""
+        self.cut_btn.set_sensitive(bool(chosen) and chosen != [ROOT_ENTRY])
+        self.cut_bar.set_visible(bool(self.cut))
+        if not self.cut:
+            self.paste_btn.set_sensitive(False)
+            self.paste_btn.set_tooltip_text("Cut something first")
+            return
+        dest = destination_folder(chosen, self.vault_entries or {})
+        problem = paste_problem(self.cut, dest, self.vault_entries or {})
+        ok = bool(paste_moves(self.cut, dest)) and problem is None
+        self.paste_btn.set_sensitive(ok)
+        where = f"into {dest.rpartition('/')[2]}/" if dest else "at the top of the vault"
+        self.paste_btn.set_tooltip_text(f"Move the cut items {where}")
+        count = "1 item" if len(self.cut) == 1 else f"{len(self.cut)} items"
+        self.cut_label.set_label(
+            f"{count} cut. Choose a folder, then Paste — it goes {where}." + (f"\n{problem}" if problem else "")
+        )
+
+    def vault_cut(self):
+        chosen = self._selection()
+        if not chosen or chosen == [ROOT_ENTRY]:
+            return
+        self.cut = chosen
+        # Back to choosing one row, so the next click picks the folder to paste into.
+        if self.select_mode_btn.get_active():
+            self.select_mode_btn.set_active(False)  # re-lists
+        else:
+            self._show_files(list(self.vault_entries.values()))
+
+    def vault_cancel_cut(self):
+        self.cut = []
+        if self.vault_entries is not None:
+            self._show_files(list(self.vault_entries.values()))
+
+    def vault_paste(self):
+        vault = self.vault
+        dest = destination_folder(self._selection(), self.vault_entries)
+        moves = paste_moves(self.cut, dest)
+        if not moves or paste_problem(self.cut, dest, self.vault_entries):
+            return
+        args = ["vault-move", *entry_args([src for src, _ in moves])]
+        if dest:
+            args += ["--dest", dest]
+
+        # Folders left open stay open under their new names, and the one pasted into opens,
+        # so the result is in sight.
+        def renamed(path):
+            for src, to in moves:
+                if path == src or path.startswith(src + "/"):
+                    return to + path[len(src):]
+            return path
+
+        self.expanded = {renamed(p) for p in self.expanded} | {f for f in parent_folders(dest + "/x") if f}
+        self.with_vault_secret(vault, lambda s: self._run_vault_op(
+            vault, s, args, heading="Moving…", subject=vault["name"], note="Moved.", relist=True,
+        ))
 
     def _on_select_all(self, _btn):
         """Selecting everything takes the tick boxes, so this turns them on if they aren't."""
@@ -2476,11 +2583,8 @@ class Window(Adw.ApplicationWindow):
             return
         # Into the selected folder, or the folder of the selected file. With several
         # selected there's no one place that could mean, so into the top of the vault.
-        chosen = self._selection()
-        one = chosen[0] if len(chosen) == 1 else ROOT_ENTRY
-        selected = self.vault_entries.get(one)
-        dest = one if selected and selected["is_dir"] else one.rpartition("/")[0]
-        targets =[f"{dest}/{os.path.basename(p.rstrip('/'))}".lstrip("/") for p in paths]
+        dest = destination_folder(self._selection(), self.vault_entries)
+        targets = [f"{dest}/{os.path.basename(p.rstrip('/'))}".lstrip("/") for p in paths]
         clashes = [t for t in targets if t in self.vault_entries]
         vault = self.vault
 

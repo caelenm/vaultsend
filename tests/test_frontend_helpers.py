@@ -403,5 +403,36 @@ class VaultFiles(unittest.TestCase):
         self.assertIsNone(app.read_vault_mode(self.dir))
 
 
+class CutAndPaste(unittest.TestCase):
+    """The rules behind Cut and Paste, the same as on Android."""
+
+    ENTRIES = {
+        p: {"path": p, "is_dir": d}
+        for p, d in [("a", True), ("a/1.txt", False), ("a/b", True), ("dest", True),
+                     ("dest/1.txt", False), ("x.txt", False), ("y.txt", False)]
+    }
+
+    def test_destination(self):
+        e = self.ENTRIES
+        self.assertEqual(app.destination_folder(["dest"], e), "dest")
+        self.assertEqual(app.destination_folder(["a/1.txt"], e), "a")  # beside a chosen file
+        self.assertEqual(app.destination_folder([], e), "")
+        self.assertEqual(app.destination_folder(["x.txt", "y.txt"], e), "")
+        self.assertEqual(app.destination_folder([app.ROOT_ENTRY], e), "")
+
+    def test_moves_skip_what_is_already_there(self):
+        self.assertEqual(app.paste_moves(["x.txt", "y.txt"], "dest"), [("x.txt", "dest/x.txt"), ("y.txt", "dest/y.txt")])
+        self.assertEqual(app.paste_moves(["a/1.txt"], ""), [("a/1.txt", "1.txt")])
+        self.assertEqual(app.paste_moves(["x.txt"], ""), [])
+        self.assertEqual(app.paste_moves(["dest/1.txt"], "dest"), [])
+
+    def test_problems(self):
+        e = self.ENTRIES
+        self.assertIsNone(app.paste_problem(["x.txt"], "dest", e))
+        self.assertEqual(app.paste_problem(["a"], "a", e), "Can't paste “a” inside itself.")
+        self.assertEqual(app.paste_problem(["a"], "a/b", e), "Can't paste “a” inside itself.")
+        self.assertEqual(app.paste_problem(["a/1.txt"], "dest", e), "“1.txt” already exists there.")
+
+
 if __name__ == "__main__":
     unittest.main()
