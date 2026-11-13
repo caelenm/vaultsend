@@ -69,6 +69,9 @@ pointer to the desktop and mobile versions.
 - **Shown safely.** Names are inserted as text, and control or text-direction
   characters in them are spelled out (`\u{202e}`), so a name cannot pose as
   another on screen. The saved file keeps its real name.
+- **Without a key.** A password file opens before any key exists ("Open it
+  without a key"). That mode creates and stores nothing; encrypting and
+  key-encrypted files stay unavailable until a key is set up.
 - **The decrypted copy** lives as long as the list is open and is dropped when
   it closes. It is not tied to the session lock: a password share never
   unlocks your key.

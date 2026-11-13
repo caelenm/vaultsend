@@ -139,6 +139,9 @@ The web build opens those files, and has no vaults of its own:
   **Save all to a folder…** (a new folder inside one you pick, never over an
   existing name; in browsers without that, **Download as .zip**), or **Save as
   .tar**. Closing the list drops the decrypted copy.
+- **No key is needed for a password.** On the welcome page, **Open it without
+  a key** (or just dropping the file there) goes straight to Decrypt. Nothing
+  is created or stored. Encrypting, and files made for a key, still need yours.
 - **A shared archive is read as hostile**, by the same rules as the apps'
   reader: age has authenticated it, but only as coming from whoever knew the
   password. Names that could leave the folder (`..`, absolute paths, drive
@@ -263,7 +266,8 @@ what is and isn't proven by a reproducible build.
    your passphrase.
 6. **Open a share** — drop the `.age` file someone shared from their vault and
    click **Decrypt**. Enter the password they gave you, or your passphrase if it
-   was made for your key. An archive (`Name.tar.age`) lists what it holds;
+   was made for your key. With only a password you don't need a key of your
+   own: choose **Open it without a key** on the welcome page. An archive (`Name.tar.age`) lists what it holds;
    choose what to save.
 
 > **"This was not encrypted to you"?** That means your key wasn't among the

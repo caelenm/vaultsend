@@ -24,7 +24,7 @@
     Editing either <script> body invalidates its hash; re-pin with
     `python3 update-csp.py`.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-MLAW+chnzoUV5j4FvCitnY9rk/Xmeckk2WytFH1cbbE=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; manifest-src &#39;self&#39;; worker-src &#39;self&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-34H/Emg70bFsBvax2MzaRml/D9AkESvaHtJYSEYkps4=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; manifest-src &#39;self&#39;; worker-src &#39;self&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;">
   <title>VaultSend</title>
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#1c3a5e">
@@ -352,6 +352,16 @@
       100% { margin-left: 100%; }
     }
 
+    /* ─── Opening a password file with no key ─── */
+    .setup-card p.setup-guest { font-size: .82rem; margin: 1.25rem 0 0; }
+    .link-btn { color: var(--primary); text-decoration: underline; padding: 0; font-size: inherit; }
+    .guest-banner { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; justify-content: space-between;
+                    padding: .7rem 1rem; font-size: .85rem; color: var(--text-muted);
+                    background: color-mix(in oklab, var(--primary) 8%, var(--surface));
+                    border: 1px solid color-mix(in oklab, var(--primary) 30%, var(--border));
+                    border-radius: var(--r-md); }
+    .guest-banner span { flex: 1; min-width: 14rem; }
+
     /* ─── Shared files dialog (added v1.4.0) ─── */
     .modal-wide { max-width: 620px; }
     .modal-wide .modal-title { overflow-wrap: anywhere; }
@@ -481,6 +491,8 @@
             Import identity.age
           </button>
         </div>
+        <p class="setup-guest">Only opening a file someone shared with a password?
+          <button id="btn-guest" class="link-btn">Open it without a key</button></p>
         <div id="setup-pubkey-banner" class="pubkey-banner hidden">
           <div class="pubkey-banner-label">YOUR PUBLIC KEY — share this freely</div>
           <div class="pubkey-banner-key" id="setup-pubkey-text"></div>
@@ -497,6 +509,11 @@
       <div>
         <h1 class="section-title">Encrypt a message or a file</h1>
         <p class="section-subtitle">Type or paste text below, or drop a file here. Encrypting scrambles it for chosen recipients; decrypting needs your passphrase, or the password of a file that was shared with one.</p>
+      </div>
+
+      <div id="guest-banner" class="guest-banner hidden">
+        <span>No key yet. Files and messages protected with a password open here; encrypting, and anything made for a key, needs yours.</span>
+        <button class="btn" id="btn-guest-setup">Set up a key</button>
       </div>
 
       <div class="drop-card" id="drop-zone">
@@ -1064,9 +1081,15 @@
   });
 
   // ── View routing ──────────────────────────────────────────────────────────
+  // guestMode: no key, but the encrypt/decrypt page is shown anyway, because a
+  // file shared with a password needs only that password. Nothing is stored.
+  let guestMode = false;
+  $("btn-guest").addEventListener("click", () => { guestMode = true; updateView(); });
+  $("btn-guest-setup").addEventListener("click", () => { guestMode = false; updateView(); });
   function updateView() {
     const hasIdentity = !!store.get(SK_IDENTITY) && !!myPubkey;
-    if (hasIdentity) {
+    $("guest-banner").classList.toggle("hidden", hasIdentity);
+    if (hasIdentity || guestMode) {
       hide("setup-view");
       const cv = $("crypt-view");
       cv.classList.remove("hidden");
@@ -1183,7 +1206,7 @@
     const cached = keyVault.use();
     if (cached) return cached;
     const b64 = store.get(SK_IDENTITY);
-    if (!b64) { showToast("No identity stored. Set up your key first.", 4000, true); return null; }
+    if (!b64) { showToast("A password doesn't open this: it was made for a key, or isn't an age file. You have no key here yet.", 6000, true); return null; }
 
     const pass = await passphraseModal("Unlock your key", "Enter your passphrase to decrypt.", false);
     if (pass === null) return null;
@@ -1361,9 +1384,8 @@
     }
     const vault = await vaultAmong(list ? [] : files, list);
     if (vault) return vaultNotSupported(vault);
-    if ($("crypt-view").classList.contains("hidden")) {
-      return showToast("Create or import your key first, then drop the file again.", 4000);
-    }
+    // Dropped on the welcome page: it may need only a password, so take it.
+    if ($("crypt-view").classList.contains("hidden")) { guestMode = true; updateView(); }
     if (list) {
       if (!list.length) return showToast("That folder is empty.");
       return zipAndLoad(list, entries[0].name);
@@ -1699,6 +1721,7 @@
   // ── Encrypt ─────────────────────────────────────────────────────────────--
   $("btn-encrypt").addEventListener("click", async () => {
     const text = $("editor").value;   // encrypted verbatim; whitespace is part of the message
+    if (!myPubkey) return showToast("Encrypting needs a key. Choose “Set up a key” first.", 4000);
     if (!text.trim() && !hasActivePayload()) return showToast("Type a message or drop a file first.");
 
     // Build recipient picker.
