@@ -1,4 +1,4 @@
-# VaultSend — security notes (v1.3.0)
+# VaultSend — security notes (v1.4.0)
 
 ## Session key lifetime (hardened in 1.2.0)
 
@@ -30,6 +30,48 @@ garbage collection. None of this defends against script already executing in the
 page (e.g. a malicious extension). It bounds *when* the key sits in memory; it
 cannot make a browser tab a secure enclave. Tune the timeouts via `IDLE_LOCK_MS`
 and `HIDDEN_LOCK_MS` near the top of the app script.
+
+## Files shared from a vault (added in 1.4.0)
+
+The desktop and Android apps share part of a vault as a plain age file, to a
+key or to a password: one file, or a tar archive of several. The web build
+opens these; it keeps no vaults, and a dropped `.vsvault` is refused with a
+pointer to the desktop and mobile versions.
+
+- **Which key.** The header says in the clear whether a file is for a password
+  (an `scrypt` stanza) or for people. The page reads that and nothing else
+  before asking. A password file asking for more than scrypt 2^18 is refused
+  from the header, before scrypt runs.
+- **The password is checked once.** The library's `decryptHeader` unwraps the
+  file key; a wrong password fails there and is asked for again, with nothing
+  decrypted. The same file key then opens each pass over the file (verify, then
+  write), through the library's `Identity` interface, so scrypt runs once. The
+  library still checks the header MAC with that key every time, so it opens no
+  other file. The key is zeroed when the operation ends; the password is a
+  JavaScript string and is subject to the limits below. Neither is stored.
+- **Authenticated before it is read.** An archive is decrypted in full into a
+  Blob the browser manages (in memory, or a temporary file for a large one)
+  before a byte of it is parsed, so age has authenticated all of it, the last
+  chunk included. A tampered or truncated file shows nothing.
+- **Read as hostile input.** The reader is a port of the apps' `tar.rs` and is
+  kept to its rules and its tests (`tests/shared_archive_test.mjs`): every name
+  is canonicalized lexically and refused if it could leave the folder; only
+  regular files and folders are taken; counts and sizes are capped and checked
+  against the real length; nothing is buffered whole. It is stricter in one
+  place: folders implied by deep paths count against the entry limit too.
+- **Writing.** Nothing is written until you choose. Saving all into a folder
+  makes a new folder (never an existing name), re-checks every path, creates
+  entries one name at a time through the File System Access API (which takes no
+  paths, so there is no `..` to follow), and refuses two names that collide on
+  a case-insensitive disk rather than let one replace the other. If writing
+  fails or is cancelled, the new folder is removed. Unlike the apps, a page
+  cannot stage the tree privately and rename it into place.
+- **Shown safely.** Names are inserted as text, and control or text-direction
+  characters in them are spelled out (`\u{202e}`), so a name cannot pose as
+  another on screen. The saved file keeps its real name.
+- **The decrypted copy** lives as long as the list is open and is dropped when
+  it closes. It is not tied to the session lock: a password share never
+  unlocks your key.
 
 ## Provenance / integrity
 

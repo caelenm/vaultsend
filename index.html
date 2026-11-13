@@ -19,7 +19,7 @@
     Editing either <script> body invalidates its hash; re-pin with
     `python3 update-csp.py`.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-OQr3hb9mkuFSxQOfeTe9bOA8JsF8tLLxIZezsWPJBNM=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-50p9Rznx1LLTLPYGtV7MeVDn4YFPviutgkZnDK+5FEE=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;">
   <title>VaultSend</title>
   <style>
     /* ─── Design tokens — VaultSend "shield navy" / Material-3 aligned ─── */
@@ -342,6 +342,26 @@
       0%   { margin-left: -40%; }
       100% { margin-left: 100%; }
     }
+
+    /* ─── Shared files dialog (added v1.4.0) ─── */
+    .modal-wide { max-width: 620px; }
+    .modal-wide .modal-title { overflow-wrap: anywhere; }
+    .share-list { border: 1px solid var(--border); border-radius: var(--r-sm);
+                  background: var(--surface-2); max-height: min(46vh, 380px);
+                  overflow-y: auto; padding: .25rem 0; }
+    .share-row { display: flex; align-items: center; gap: .5rem; min-height: 2.1rem;
+                 padding: .15rem .6rem; font-size: .875rem; }
+    .share-row:hover { background: var(--surface-off); }
+    .share-row svg { flex-shrink: 0; color: var(--text-muted); }
+    .share-name { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+    .share-dir .share-name { font-weight: 600; }
+    .share-size { color: var(--text-faint); font-size: .78rem; white-space: nowrap; }
+    .share-save { font-size: .78rem; padding: .2rem .65rem; border: 1px solid var(--border);
+                  border-radius: var(--r-sm); background: var(--surface); white-space: nowrap; }
+    .share-save:hover { background: var(--surface-off); }
+    .share-note { color: var(--text-muted); font-size: .8rem; margin-top: .6rem; }
+    .share-actions { flex-wrap: wrap; }
+    .share-actions .spacer { flex: 1; }
 </style>
 </head>
 <body>
@@ -467,7 +487,7 @@
     <div id="crypt-view" class="hidden" style="display: none; flex-direction: column; gap: 1.5rem; flex: 1 1 0%;">
       <div>
         <h1 class="section-title">Encrypt a message or a file</h1>
-        <p class="section-subtitle">Type or paste text below, or drop a file here. Encrypting scrambles it for chosen recipients; decrypting needs your passphrase.</p>
+        <p class="section-subtitle">Type or paste text below, or drop a file here. Encrypting scrambles it for chosen recipients; decrypting needs your passphrase, or the password of a file that was shared with one.</p>
       </div>
 
       <div class="drop-card" id="drop-zone">
@@ -573,6 +593,26 @@
     <div class="modal-actions">
       <button class="btn" id="recip-cancel">Cancel</button>
       <button class="btn btn-primary" id="recip-confirm">Encrypt</button>
+    </div>
+  </div>
+</div>
+
+<!-- ───────────────── MODAL: Shared files ─────────────────
+     What someone shared from a vault on the desktop or Android app: an age file
+     holding a folder or several files. This is a read-only view of one such
+     file; the web build has no vaults of its own. -->
+<div class="backdrop" id="modal-share">
+  <div class="modal modal-wide" role="dialog" aria-modal="true" aria-labelledby="share-title">
+    <div class="modal-title" id="share-title"></div>
+    <div class="modal-sub" id="share-sub"></div>
+    <div class="share-list" id="share-list"></div>
+    <div class="share-note hidden" id="share-note"></div>
+    <div class="modal-actions share-actions">
+      <button class="btn" id="share-close">Close</button>
+      <div class="spacer"></div>
+      <button class="btn" id="share-save-tar">Save as .tar</button>
+      <button class="btn" id="share-save-zip">Download as .zip</button>
+      <button class="btn btn-primary" id="share-save-folder">Save all to a folder…</button>
     </div>
   </div>
 </div>
@@ -1230,9 +1270,54 @@
   }
   $("file-clear-btn").addEventListener("click", clearActiveFile);
 
+  // ── Vaults are not imported here ──────────────────────────────────────────
+  // A vault is a folder ("Name.vsvault") the desktop and Android apps keep and
+  // change in place. A web page has nowhere to keep one, so this build has no
+  // vaults: it only opens what someone shared from one (see "Shared files").
+  // Anything that is a vault is refused up front, with where to take it instead.
+  const VAULT_SUFFIX = ".vsvault";
+  const VAULT_MAGIC  = "vaultsend-vault 1";
+  const isVaultName = (name) => String(name || "").toLowerCase().endsWith(VAULT_SUFFIX);
+  function vaultNotSupported(name) {
+    return alertModal(
+      name ? "“" + shownName(name) + "” is a vault" : "That is a vault",
+      "Importing vaults is not supported on the web. Please use the desktop or mobile versions.",
+      '<p class="share-note">A file someone shared from a vault (a <code>.age</code> file) does open here: '
+        + "drop it in and choose Decrypt.</p>",
+      [{ label: "OK", val: "ok", primary: true }]
+    );
+  }
+  // The name of the vault among what was dropped or picked, or null. By name
+  // (the folder, or anything inside it that the browser reports with its path),
+  // or by a vault's own marker: its VAULT file, alone or at the top of a folder.
+  async function vaultAmong(files, walked) {
+    for (const f of files) {
+      if (isVaultName(f.name)) return f.name;
+      const inside = String(f.webkitRelativePath || "").split("/").find(isVaultName);
+      if (inside) return inside;
+    }
+    const markers = files.filter((f) => f.name === "VAULT")
+      .concat((walked || []).filter((m) => /^[^/]+\/VAULT$/.test(m.path)).map((m) => m.file));
+    for (const f of markers) {
+      try {
+        const head = new Uint8Array(await f.slice(0, VAULT_MAGIC.length).arrayBuffer());
+        if (String.fromCharCode.apply(null, head) === VAULT_MAGIC) {
+          const m = (walked || []).find((w) => w.file === f);
+          return m ? m.path.split("/")[0] : f.name;
+        }
+      } catch {}
+    }
+    return null;
+  }
+
   // ── Drag & drop ───────────────────────────────────────────────────────────
+  // The card shows the drop target, but a drop anywhere on the page is taken:
+  // otherwise the browser would navigate away to show the file, losing the
+  // page's state, and a vault dropped beside the card would get no answer.
   const dropZone = $("drop-zone");
   let dragDepth = 0;
+  const dragHasFiles = (e) =>
+    !!e.dataTransfer && Array.prototype.indexOf.call(e.dataTransfer.types || [], "Files") !== -1;
 
   dropZone.addEventListener("dragenter", (e) => {
     e.preventDefault(); dragDepth++;
@@ -1244,21 +1329,33 @@
   dropZone.addEventListener("dragleave", () => {
     dragDepth--; if (dragDepth <= 0) { dragDepth = 0; dropZone.classList.remove("dragover"); }
   });
-  dropZone.addEventListener("dragover", (e) => e.preventDefault());
-  dropZone.addEventListener("drop", async (e) => {
+  document.addEventListener("dragover", (e) => { if (dragHasFiles(e)) e.preventDefault(); });
+  document.addEventListener("drop", async (e) => {
+    if (!dragHasFiles(e)) return;
     e.preventDefault(); dragDepth = 0; dropZone.classList.remove("dragover");
     // DataTransfer items are only readable during the event, so take the
     // entries before the first await.
     const items = Array.prototype.slice.call(e.dataTransfer.items || []);
     const entries = items.map((i) => (i.webkitGetAsEntry ? i.webkitGetAsEntry() : null));
     const files = Array.prototype.slice.call(e.dataTransfer.files);
+    // A modal is asking something: the drop isn't an answer to it.
+    if (document.querySelector(".backdrop.open")) return;
+    const named = entries.filter(Boolean).map((en) => en.name).find(isVaultName);
+    if (named) return vaultNotSupported(named);
     if (!files.length) return;
+    let list = null;
     if (entries.length && entries.every(Boolean) && entries.some((en) => en.isDirectory)) {
       // A dropped folder arrives in dataTransfer.files as a single unreadable
       // File, so walk the directory entries to get its real contents.
-      let list;
       try { list = await filesFromEntries(entries); }
       catch (err) { return showToast("Couldn't read the dropped folder: " + err.message, 4000, true); }
+    }
+    const vault = await vaultAmong(list ? [] : files, list);
+    if (vault) return vaultNotSupported(vault);
+    if ($("crypt-view").classList.contains("hidden")) {
+      return showToast("Create or import your key first, then drop the file again.", 4000);
+    }
+    if (list) {
       if (!list.length) return showToast("That folder is empty.");
       return zipAndLoad(list, entries[0].name);
     }
@@ -1321,6 +1418,8 @@
   }
 
   async function loadFiles(files) {
+    const vault = await vaultAmong(files, null);
+    if (vault) { await vaultNotSupported(vault); return; }
     // Single files stream and are not size-limited by memory. Zipping several
     // still buffers every member, so zipAndLoad warns on that path.
     if (files.length === 1) {
@@ -1549,9 +1648,9 @@
   // Verify before writing plaintext. This intentionally costs a second read on
   // decrypt: age reports final truncation/tampering only at end-of-stream, and
   // the web API has no portable atomic rename for a temporary output file.
-  async function verifyCiphertext(identity, total, prog) {
+  async function verifyCiphertext(key, total, prog) {
     const dec = new age.Decrypter();
-    dec.addIdentity(identity);
+    key.add(dec);
     const stream = await dec.decrypt(activeStream());
     await stream
       .pipeThrough(countingStream(total, (n) => prog.update(n, total)))
@@ -1693,88 +1792,724 @@
   });
   $("recip-cancel").addEventListener("click",  () => { closeBackdrop("modal-recip"); if (pendingResolve) { pendingResolve(false); pendingResolve = null; } });
 
+  // ── Shared files: a strict tar reader ─────────────────────────────────────
+  // What Share writes from a vault on the desktop or Android app is a plain age
+  // file: one file stays that file, anything else is a tar archive inside it.
+  // This is the same reader as their tar.rs, rule for rule, so all three treat
+  // an archive alike. age has authenticated it, but only as coming from whoever
+  // knew the password (or your public key), so it is read as hostile input:
+  //   * Every path is canonicalized lexically (canonicalEntryPath): no NUL, no
+  //     backslash, nothing absolute, no drive prefix, no "..", no empty
+  //     component. What is left joins onto any folder and stays inside it.
+  //   * Only regular files and folders are taken. Links, devices, FIFOs and
+  //     anything else are skipped and counted, never followed or created.
+  //   * Entry count, each entry's size and the total are capped, and every
+  //     declared size must fit in the archive as it really is.
+  //   * Nothing is buffered whole: headers are read a block at a time from the
+  //     staged Blob and data is skipped; only a PAX record is read, capped at
+  //     64 KiB.
+  // Everything between the two "vs-tar" marks is free of the page (no DOM, no
+  // crypto), and tests/shared_archive_test.mjs runs exactly these lines.
+  // >>> vs-tar
+  const TAR_BLOCK = 512;
+  // What ustar's 11 octal digits can hold.
+  const TAR_MAX_SIZE = 0o77777777777;
+  const TAR_LIMITS = { maxEntries: 100000, maxEntrySize: TAR_MAX_SIZE, maxTotal: 32 * 2 ** 30 };
+  // The largest PAX record read. Real ones are a few hundred bytes.
+  const TAR_MAX_PAX = 64 * 1024;
+  const CANCELLED = "cancelled";
+  // ignoreBOM keeps a leading U+FEFF in the name rather than dropping it.
+  const utf8Strict = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+  const utf8Length = (s) => new TextEncoder().encode(s).length;
+
+  // The one path validator, as vault.rs has it. Lengths are in UTF-8 bytes.
+  function validVaultPath(p) {
+    if (!p || p.indexOf("\0") !== -1 || utf8Length(p) > 4096) return false;
+    return p.split("/").every((c) => c !== "" && c !== "." && c !== ".." && utf8Length(c) <= 255);
+  }
+
+  // A name from an archive, safe to show: control and text-direction characters
+  // are spelled out, so a name can't pass itself off as another on screen.
+  function shownName(raw) {
+    let out = "", n = 0;
+    for (const ch of String(raw)) {
+      if (n++ >= 200) { out += "…"; break; }
+      const c = ch.codePointAt(0);
+      const hidden = c < 0x20 || (c >= 0x7f && c < 0xa0) || (c >= 0x200b && c <= 0x200f)
+        || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) || c === 0xfeff;
+      out += hidden ? "\\u{" + c.toString(16) + "}" : ch;
+    }
+    return out;
+  }
+
+  // An archive's name for an entry as a path inside the output, or null for the
+  // archive's own top ("./"). Purely lexical. Throws for a name that isn't safe.
+  function canonicalEntryPath(raw) {
+    const bad = () => new Error('the archive holds an unsafe name: "' + shownName(raw) + '"');
+    if (raw === "" || raw.indexOf("\0") !== -1 || raw.indexOf("\\") !== -1 || raw[0] === "/") throw bad();
+    const parts = [];
+    for (const part of raw.replace(/\/+$/, "").split("/")) {
+      if (part === ".") continue;
+      if (part === ".." || part === "") throw bad();
+      if (!parts.length && /^[A-Za-z]:/.test(part)) throw bad();   // C:, as Windows would read it
+      parts.push(part);
+    }
+    if (!parts.length) return null;
+    const path = parts.join("/");
+    if (!validVaultPath(path)) throw bad();
+    return path;
+  }
+
+  // An octal header field: optional leading spaces, digits, then only spaces or
+  // NULs. null for anything else, base-256 included (only needed above 8 GB).
+  function tarOctal(field) {
+    let start = 0;
+    while (start < field.length && field[start] === 0x20) start++;
+    if (start === field.length) return null;
+    let value = 0, end = field.length;
+    for (let i = start; i < field.length; i++) {
+      const b = field[i];
+      if (b >= 0x30 && b <= 0x37) value = value * 8 + (b - 0x30);
+      else if (b === 0x20 || b === 0) { end = i; break; }
+      else return null;
+    }
+    for (let i = end; i < field.length; i++) if (field[i] !== 0x20 && field[i] !== 0) return null;
+    return value;
+  }
+
+  function tarChecksumOk(h) {
+    const stored = tarOctal(h.subarray(148, 156));
+    if (stored === null) return false;
+    let unsigned = 0, signed = 0;
+    for (let i = 0; i < TAR_BLOCK; i++) {
+      const b = i >= 148 && i < 156 ? 0x20 : h[i];
+      unsigned += b;
+      signed += b > 127 ? b - 256 : b;
+    }
+    // Some old tars summed signed bytes; both are accepted, as GNU tar does.
+    return stored === unsigned || stored === signed;
+  }
+
+  // A NUL-terminated text field.
+  function tarText(field) {
+    let end = field.indexOf(0);
+    if (end < 0) end = field.length;
+    try { return utf8Strict.decode(field.subarray(0, end)); }
+    catch { throw new Error("a name in the archive is not valid UTF-8"); }
+  }
+
+  // The `path` and `size` keys of a PAX record; the rest is ignored. Strict
+  // about its framing: "<len> key=value\n", where len counts the whole record.
+  function parsePax(data) {
+    const bad = () => new Error("the archive is damaged (a bad extended header)");
+    const canonical = /^(0|[1-9][0-9]*)$/;
+    let path = null, size = null;
+    while (data.length) {
+      const space = data.indexOf(0x20);
+      if (space < 0 || space > 15) throw bad();
+      const digits = String.fromCharCode.apply(null, data.subarray(0, space));
+      if (!canonical.test(digits)) throw bad();
+      const len = Number(digits);
+      if (len <= space + 1 || len > data.length || data[len - 1] !== 0x0a) throw bad();
+      let record;
+      try { record = utf8Strict.decode(data.subarray(space + 1, len - 1)); } catch { throw bad(); }
+      const eq = record.indexOf("=");
+      if (eq < 0) throw bad();
+      const key = record.slice(0, eq), value = record.slice(eq + 1);
+      if (value.indexOf("\0") !== -1) throw bad();
+      if (key === "path") path = value;
+      else if (key === "size") {
+        // A u64 in the Rust reader. Above 2^53 this loses precision, but any
+        // such size is far past the per-entry limit and is refused either way.
+        if (!canonical.test(value) || value.length > 20 || BigInt(value) > 0xffffffffffffffffn) throw bad();
+        size = Number(value);
+      }
+      data = data.subarray(len);
+    }
+    return { path, size };
+  }
+
+  function tarAdd(scan, explicit, path, item, limits) {
+    const clash = (p) =>
+      new Error('"' + shownName(p) + '" appears twice in the archive, or is both a file and a folder');
+    for (let i = path.indexOf("/"); i !== -1; i = path.indexOf("/", i + 1)) {
+      const folder = path.slice(0, i);
+      const have = scan.items.get(folder);
+      if (have === undefined) scan.items.set(folder, { dir: true });
+      else if (!have.dir) throw clash(folder);
+    }
+    const have = scan.items.get(path);
+    // A folder made for something inside it first, and now named itself, is
+    // the same folder; anything else seen twice is a clash.
+    if (have !== undefined && !(have.dir && item.dir && !explicit.has(path))) throw clash(path);
+    if (item.dir) explicit.add(path);
+    scan.items.set(path, item);
+    // Tighter than the Rust reader, which counts headers only: one deep path
+    // implies a folder per component, and a page can't afford millions of them.
+    if (scan.items.size > 2 * limits.maxEntries) {
+      throw new Error("the archive holds more than " + 2 * limits.maxEntries + " files and folders");
+    }
+  }
+
+  // Exactly n bytes at pos of a Blob. Reads a window at a time, so the headers
+  // of many small files cost one read between them, not one each.
+  function blobReader(blob) {
+    const WINDOW = 64 * 1024;
+    let start = 0, buf = new Uint8Array(0);
+    return async function read(pos, n) {
+      if (pos < start || pos + n > start + buf.length) {
+        buf = new Uint8Array(await blob.slice(pos, pos + Math.max(n, WINDOW)).arrayBuffer());
+        start = pos;
+        if (buf.length < n) throw new Error("reading the archive: it ends early");
+      }
+      return buf.slice(pos - start, pos - start + n);
+    };
+  }
+
+  // Read an archive's headers and say what it holds: `items` maps each
+  // canonical path to { dir: true } or { dir: false, offset, size } (where its
+  // data starts in the Blob, and how long it is), and every parent of an entry
+  // is a folder entry. Nothing is written and no file's data is read.
+  // `cancelled` is asked between headers.
+  async function tarScan(blob, limits, cancelled) {
+    const truncated = () => new Error("the archive is incomplete: it ends early");
+    const damaged = () => new Error("the archive is damaged (a bad header checksum)");
+    const len = blob.size, read = blobReader(blob);
+    const scan = { items: new Map(), skipped: 0, total: 0 };
+    const explicit = new Set();
+    let pos = 0, headers = 0, paxPath = null, paxSize = null, skipNext = false;
+    for (;;) {
+      if (cancelled()) throw new Error(CANCELLED);
+      if (len - pos < TAR_BLOCK) throw truncated();
+      const h = await read(pos, TAR_BLOCK);
+      pos += TAR_BLOCK;
+      if (h.every((b) => b === 0)) break;   // the end marker; anything after it is ignored, as tar does
+      headers++;
+      if (headers > limits.maxEntries) {
+        throw new Error("the archive holds more than " + limits.maxEntries + " entries");
+      }
+      if (!tarChecksumOk(h)) throw damaged();
+      const kind = h[156];
+      let size = paxSize;
+      paxSize = null;
+      if (size === null) {
+        size = tarOctal(h.subarray(124, 136));
+        if (size === null) throw damaged();
+      }
+      if (size > limits.maxEntrySize) throw new Error("an entry in the archive is too large (" + size + " bytes)");
+      if (size > len - pos) throw truncated();
+      const dataAt = pos;
+      const next = Math.min(pos + Math.ceil(size / TAR_BLOCK) * TAR_BLOCK, len);
+      if (kind === 0x78) {                          // 'x': a PAX record for the next entry
+        if (size > TAR_MAX_PAX) throw new Error("the archive is damaged (an extended header is too large)");
+        const pax = parsePax(await read(pos, size));
+        paxPath = pax.path; paxSize = pax.size;
+      } else if (kind === 0x67) {                   // 'g': global settings, nothing VaultSend uses
+      } else if (kind === 0x4c || kind === 0x4b) {  // 'L' / 'K': GNU long names
+        // Not read, so the entry they belong to is skipped too.
+        scan.skipped++;
+        skipNext = true;
+      } else {
+        let name = paxPath;
+        paxPath = null;
+        if (name === null) {
+          name = tarText(h.subarray(0, 100));
+          const ustar = String.fromCharCode.apply(null, h.subarray(257, 263)) === "ustar\0";
+          const prefix = ustar ? tarText(h.subarray(345, 500)) : "";
+          if (prefix) name = prefix + "/" + name;
+        }
+        const regular = kind === 0x30 || kind === 0;
+        const isDir = kind === 0x35 || (regular && name.endsWith("/"));
+        const skip = skipNext;
+        skipNext = false;
+        if (skip || !(isDir || regular)) {
+          scan.skipped++;   // a link, device, FIFO or unknown kind: never created
+        } else {
+          const path = canonicalEntryPath(name);
+          if (path !== null && isDir) {
+            tarAdd(scan, explicit, path, { dir: true }, limits);
+          } else if (path !== null) {
+            scan.total += size;
+            if (scan.total > limits.maxTotal) {
+              throw new Error("the archive holds more than " + limits.maxTotal + " bytes");
+            }
+            tarAdd(scan, explicit, path, { dir: false, offset: dataAt, size }, limits);
+          }
+        }
+      }
+      pos = next;
+    }
+    if (paxPath !== null || paxSize !== null || skipNext) throw truncated();
+    return scan;
+  }
+
+  // Whether a block looks like the start of a tar archive: a valid header checksum.
+  function looksLikeTar(first) {
+    return first.length === TAR_BLOCK && !first.every((b) => b === 0) && tarChecksumOk(first);
+  }
+  // <<< vs-tar
+
+  // ── Shared files: which key, and opening one ──────────────────────────────
+  // The steps the desktop and Android apps take for a file someone shared
+  // (their shared.rs), as far as a page can take them:
+  //   * the header says, in the clear, whether a password or a key opens it;
+  //   * a password is checked at once, by unwrapping the file key only, so a
+  //     wrong one is asked for again before anything is decrypted;
+  //   * an archive is decrypted in full into a Blob the browser manages before
+  //     any of it is read, so age has authenticated every byte, the last chunk
+  //     included; then the reader above says what it holds, and nothing is
+  //     written that it didn't accept.
+  // What is not here is a vault to add the files to: they can be looked at and
+  // saved, one at a time or all together.
+
+  // How much of a file is read to see its header. A password header is under
+  // 300 bytes; one for people grows by about 120 bytes each.
+  const HEADER_SNIFF_BYTES = 64 * 1024;
+  // Opening a password file allows scrypt at 2^18, what VaultSend and the age
+  // tool make them with, and no more: a file asking for more could otherwise
+  // cost a gigabyte and minutes. (Importing identity.age keeps the library's
+  // own limit of 2^20.) Checked here, before scrypt runs.
+  const SHARE_SCRYPT_MAX_LOG_N = 18;
+  // The most an archive can be: its files plus a header block per entry, generously.
+  const ARCHIVE_CAP = TAR_LIMITS.maxTotal + TAR_LIMITS.maxEntries * 4 * TAR_BLOCK + (1 << 20);
+  // How many rows the dialog draws. Everything is still saved by "Save all".
+  const SHARE_ROWS_SHOWN = 2000;
+
+  // What an age header asks for: { kind: "password", logN } for a file
+  // encrypted to a password, { kind: "key" } for one encrypted to people, or
+  // null if these bytes don't start like an age file. Nothing is decrypted.
+  function ageHeaderInfo(prefix) {
+    const text = String.fromCharCode.apply(null, prefix.subarray(0, 512));
+    const m = /^age-encryption\.org\/v1\n-> ([^ \n]+)((?: [^ \n]+)*)\n/.exec(text);
+    if (!m) return null;
+    if (m[1] !== "scrypt") return { kind: "key" };
+    const args = m[2].split(" ");   // "", salt, log2(N)
+    const ok = args.length === 3 && /^[1-9][0-9]*$/.test(args[2]);
+    return { kind: "password", logN: ok ? Number(args[2]) : NaN };
+  }
+
+  // What opens a file, for as many passes as it takes: add(decrypter) hands it
+  // the key, wipe() drops what can be dropped.
+  async function identityKey() {
+    const identity = await unlockIdentity();
+    if (!identity) return null;
+    return { add: (dec) => dec.addIdentity(identity), wipe() {} };
+  }
+
+  // A password file's key. scrypt at 2^18 holds the page for a second or more
+  // and the file is read more than once (checked, then written), so it runs
+  // once, here: the library's decryptHeader unwraps the file key, and each
+  // pass is given that key through the library's Identity interface. The
+  // library still checks the header's MAC with it every time, so a key from
+  // one file opens no other. Resolves null if the prompt is cancelled.
+  async function passwordKey(prefix, name) {
+    const what = name ? "“" + shownName(name) + "”" : "This message";
+    for (let retry = false; ; retry = true) {
+      const password = await passphraseModal(
+        retry ? "Wrong password. Try again" : "Enter the password",
+        what + " is protected with a password. Enter the one the person who shared it gave you.",
+        false, true);
+      if (password === null) return null;
+      showToast("Checking the password…", 1500);
+      await new Promise((r) => setTimeout(r, 50));   // let that paint before scrypt holds the page
+      let fileKey;
+      try {
+        const dec = new age.Decrypter();
+        dec.addPassphrase(password);
+        fileKey = await dec.decryptHeader(prefix);
+      } catch (e) {
+        if (/no identity matched/.test(e.message)) continue;
+        throw new Error("the file is damaged (" + e.message + ")");
+      }
+      return {
+        add: (dec) => dec.addIdentity({ unwrapFileKey: async () => fileKey }),
+        wipe() { fileKey.fill(0); },
+      };
+    }
+  }
+
+  // Share's own naming: "Holiday.tar.age" is an archive, "photo.jpg.age" one file.
+  function isArchiveName(name) {
+    const n = String(name || "").toLowerCase();
+    return n.endsWith(".tar.age") || n.endsWith(".tar");
+  }
+  function withoutSuffix(name, suffix) {
+    return name.length > suffix.length && name.toLowerCase().endsWith(suffix)
+      ? name.slice(0, -suffix.length) : name;
+  }
+  // The folder an archive unpacks into: "Holiday.tar.age" gives "Holiday".
+  function archiveFolderName(name) {
+    const base = withoutSuffix(withoutSuffix(name, ".age"), ".tar").trim();
+    return validVaultPath(base) && !/[\/\\:]/.test(base) ? base : "Shared files";
+  }
+
+  // Decrypt all of the loaded file into a Blob, or throw. Only once this
+  // returns has age authenticated every byte.
+  async function stageDecrypted(key, prog) {
+    const dec = new age.Decrypter();
+    key.add(dec);
+    const plain = await dec.decrypt(activeStream());
+    const total = plain.size(activeSize());
+    let refusal = null;
+    if (total > ARCHIVE_CAP) refusal = "this file is larger than VaultSend will unpack";
+    else {
+      const headroom = await storageHeadroom();
+      if (headroom !== null && total > headroom) {
+        refusal = "not enough browser storage: this needs " + formatSize(total)
+          + " but only " + formatSize(headroom) + " is available";
+      }
+    }
+    if (refusal) { await plain.cancel(); throw new Error(refusal); }
+    return drainToBlob(plain.pipeThrough(countingStream(total, (n) => prog.update(n, total))), prog);
+  }
+
+  let openShare = null;   // what the Shared files dialog is showing, or null
+
+  // Decrypt on a file Share named as an archive: show what it holds.
+  async function openSharedArchive(key, name, withPassword) {
+    const prog = newProgress("Decrypting…", name);
+    let staged, scan;
+    try {
+      staged = await stageDecrypted(key, prog);
+      const first = new Uint8Array(await staged.slice(0, TAR_BLOCK).arrayBuffer());
+      if (staged.size >= 2 * TAR_BLOCK && looksLikeTar(first)) {
+        scan = await tarScan(staged, TAR_LIMITS, () => prog.cancelled);
+      }
+      prog.finish();
+    } catch (err) {
+      prog.finish();
+      if (prog.cancelled || (err && (err.name === "AbortError" || err.message === CANCELLED))) {
+        return showToast("Cancelled.");
+      }
+      return shareError("Couldn’t open “" + shownName(name) + "”", err);
+    }
+    if (!scan) {
+      // Named like an archive, but one file after all: the ordinary result.
+      setActiveBlob(withoutSuffix(name, ".age"), staged, true);
+      return showToast("Decrypted. This isn’t an archive of files and folders, so it is kept as one file. Click Download.", 6000);
+    }
+    const order = Array.from(scan.items.keys()).sort();   // a folder sorts before what's in it
+    openShare = { name, staged, items: scan.items, order, total: scan.total };
+
+    const files = order.filter((p) => !scan.items.get(p).dir).length;
+    const count = (n, one) => n + " " + one + (n === 1 ? "" : "s");
+    $("share-title").textContent = shownName(name);
+    $("share-sub").textContent =
+      "Shared with " + (withPassword ? "a password" : "your key") + ". It holds "
+      + count(files, "file") + (order.length > files ? " in " + count(order.length - files, "folder") : "")
+      + " (" + formatSize(scan.total) + "). Nothing is saved until you choose.";
+    renderShareList();
+    const notes = [];
+    if (order.length > SHARE_ROWS_SHOWN) {
+      notes.push("Showing the first " + SHARE_ROWS_SHOWN + " of " + order.length + " items; saving all of them saves the rest too.");
+    }
+    if (scan.skipped) {
+      notes.push(count(scan.skipped, "item") + " that " + (scan.skipped === 1 ? "is" : "are")
+        + " not a regular file or folder (links, devices and the like) "
+        + (scan.skipped === 1 ? "was" : "were") + " skipped.");
+    }
+    $("share-note").textContent = notes.join(" ");
+    notes.length ? show("share-note") : hide("share-note");
+    const toFolder = typeof window.showDirectoryPicker === "function";
+    $("share-save-folder").classList.toggle("hidden", !toFolder || !order.length);
+    $("share-save-zip").classList.toggle("hidden", toFolder || !order.length);
+    $("share-save-zip").classList.toggle("btn-primary", !toFolder);
+    openBackdrop("modal-share");
+    setTimeout(() => $("share-close").focus(), 60);
+  }
+
+  function shareError(heading, err) {
+    return alertModal(heading, err && err.message ? err.message : String(err), null,
+      [{ label: "OK", val: "ok", primary: true }]);
+  }
+
+  const SHARE_ICON_DIR = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+  const SHARE_ICON_FILE = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" focusable="false"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+
+  function renderShareList() {
+    const s = openShare, list = $("share-list");
+    list.innerHTML = "";
+    if (!s.order.length) {
+      list.innerHTML = '<div class="empty-state">This archive is empty.</div>';
+      return;
+    }
+    const leaf = (p) => p.slice(p.lastIndexOf("/") + 1);
+    s.order.slice(0, SHARE_ROWS_SHOWN).forEach((path) => {
+      const item = s.items.get(path);
+      const row = document.createElement("div");
+      row.className = item.dir ? "share-row share-dir" : "share-row";
+      row.style.paddingLeft = (0.6 + 1.1 * Math.min(path.split("/").length - 1, 12)) + "rem";
+      row.innerHTML = item.dir ? SHARE_ICON_DIR : SHARE_ICON_FILE;   // constants; names go in as text
+      const nm = document.createElement("span");
+      nm.className = "share-name";
+      nm.textContent = shownName(leaf(path));
+      nm.title = shownName(path);
+      row.appendChild(nm);
+      if (!item.dir) {
+        const size = document.createElement("span");
+        size.className = "share-size";
+        size.textContent = formatSize(item.size);
+        const save = document.createElement("button");
+        save.className = "share-save";
+        save.textContent = "Save";
+        save.setAttribute("aria-label", "Save " + shownName(leaf(path)));
+        save.addEventListener("click", () => {
+          if (openShare !== s) return;
+          dlBlob(s.staged.slice(item.offset, item.offset + item.size), leaf(path));
+        });
+        row.appendChild(size);
+        row.appendChild(save);
+      }
+      list.appendChild(row);
+    });
+  }
+
+  function closeShare() {
+    const was = openShare;
+    openShare = null;   // the staged plaintext goes with it
+    closeBackdrop("modal-share");
+    $("share-list").innerHTML = "";
+    if (was) showToast("Closed. The decrypted copy has been dropped from this page.");
+  }
+  $("share-close").addEventListener("click", closeShare);
+
+  // The archive as it is, for anything that reads a .tar.
+  $("share-save-tar").addEventListener("click", () => {
+    const s = openShare;
+    if (!s) return;
+    const base = withoutSuffix(s.name, ".age");
+    dlBlob(s.staged, base.toLowerCase().endsWith(".tar") ? base : base + ".tar");
+  });
+
+  // Whether `dir` already holds something called `name`, of either kind.
+  async function entryExists(dir, name) {
+    try { await dir.getDirectoryHandle(name); return true; }
+    catch (e) {
+      if (e && e.name === "TypeMismatchError") return true;
+      if (e && e.name === "NotFoundError") return false;
+      throw e;
+    }
+  }
+
+  // Unpack into a new folder inside `parent`, which the user picked: never
+  // over an existing name, so "Holiday" becomes "Holiday (2)" beside one. The
+  // archive is already authenticated and scanned in full, so the only failures
+  // left are the disk's and Cancel; either removes the new folder again.
+  // A page can't build the tree somewhere private and rename it into place as
+  // the apps do, so removing is how a failure leaves nothing behind.
+  async function unpackShare(s, parent, prog) {
+    let folder = archiveFolderName(s.name);
+    for (let n = 2; await entryExists(parent, folder); n++) folder = archiveFolderName(s.name) + " (" + n + ")";
+    const root = await parent.getDirectoryHandle(folder, { create: true });
+    try {
+      const dirs = new Map([["", root]]);
+      let written = 0;
+      for (const path of s.order) {   // in order, so every folder is made before what's in it
+        if (prog.cancelled) throw new DOMException("Aborted", "AbortError");
+        // Checked once more before anything is made. The file system API also
+        // takes one name at a time, never a path, so there is no ".." to follow.
+        if (canonicalEntryPath(path) !== path) throw new Error("refusing to write outside the folder: " + shownName(path));
+        const cut = path.lastIndexOf("/");
+        const into = dirs.get(cut < 0 ? "" : path.slice(0, cut));
+        const leaf = path.slice(cut + 1);
+        // New folder, so anything already there is the archive's own: on a
+        // case-insensitive disk "A" and "a" are one file, and one would
+        // otherwise silently replace the other.
+        if (await entryExists(into, leaf)) {
+          throw new Error("“" + shownName(path) + "”: two names in the archive collide on this disk");
+        }
+        const item = s.items.get(path);
+        if (item.dir) {
+          dirs.set(path, await into.getDirectoryHandle(leaf, { create: true }));
+          continue;
+        }
+        const writable = await (await into.getFileHandle(leaf, { create: true })).createWritable();
+        const before = written;
+        try {
+          await s.staged.slice(item.offset, item.offset + item.size).stream()
+            .pipeThrough(countingStream(s.total, (n) => prog.update(before + n, s.total)))
+            .pipeTo(writable, { signal: prog.ctrl.signal });
+        } catch (err) {
+          try { await writable.abort(); } catch {}
+          throw err;
+        }
+        written += item.size;
+      }
+    } catch (err) {
+      try { await parent.removeEntry(folder, { recursive: true }); } catch {}
+      throw err;
+    }
+    return folder;
+  }
+
+  $("share-save-folder").addEventListener("click", async () => {
+    const s = openShare;
+    if (!s) return;
+    let parent;
+    try { parent = await window.showDirectoryPicker({ mode: "readwrite" }); }
+    catch (e) {
+      if (e && e.name === "AbortError") return;
+      return shareError("Couldn’t open that folder", e);
+    }
+    const prog = newProgress("Unpacking…", s.name);
+    try {
+      const folder = await unpackShare(s, parent, prog);
+      prog.finish();
+      showToast("Unpacked into “" + shownName(folder) + "”.", 5000);
+    } catch (err) {
+      prog.finish();
+      if (prog.cancelled || (err && err.name === "AbortError")) {
+        return showToast("Cancelled. Nothing was left in the folder.", 4000);
+      }
+      shareError("Couldn’t unpack “" + shownName(s.name) + "”", err);
+    }
+  });
+
+  // Where the browser can't write into a folder: everything as one .zip, under
+  // a top folder of the archive's name. Built in memory, like zipAndLoad.
+  $("share-save-zip").addEventListener("click", async () => {
+    const s = openShare;
+    if (!s) return;
+    if (s.total >= 256 * 1024 * 1024) {
+      showToast("Zipping holds every file in memory — if this fails, use Save as .tar instead.", 7000, true);
+    } else {
+      showToast("Zipping…", 1500);
+    }
+    await new Promise((r) => setTimeout(r, 50));
+    const top = archiveFolderName(s.name);
+    const map = {};
+    let zipped;
+    try {
+      for (const path of s.order) {
+        const item = s.items.get(path);
+        if (item.dir) map[top + "/" + path + "/"] = new Uint8Array(0);
+        else map[top + "/" + path] = new Uint8Array(await s.staged.slice(item.offset, item.offset + item.size).arrayBuffer());
+      }
+      zipped = fflate.zipSync(map, { level: 0 });
+    } catch (err) {
+      return shareError("Couldn’t make the .zip", new Error(err.message + ". Save as .tar instead, or save the files one at a time."));
+    }
+    if (openShare !== s) return;
+    dlBlob(new Blob([zipped], { type: "application/zip" }), top + ".zip");
+  });
+
   // ── Decrypt ─────────────────────────────────────────────────────────────--
   $("btn-decrypt").addEventListener("click", async () => {
     const text = $("editor").value.trim();
-    if (!text && !hasActivePayload()) return showToast("Paste encrypted text or drop an age file first.");
+    const payload = hasActivePayload();
+    if (!text && !payload) return showToast("Paste encrypted text or drop an age file first.");
 
-    const streamingPayload = hasActivePayload() && activeSize() >= STREAM_THRESHOLD;
+    // Which key opens it, a password or yours, is in the header, in the clear.
+    let textBytes = null, prefix;
+    try {
+      if (!payload) {
+        try { textBytes = age.armor.decode(text); }
+        catch { textBytes = new TextEncoder().encode(text); }
+        prefix = textBytes.subarray(0, HEADER_SNIFF_BYTES);
+      } else if (activeFileBytes) {
+        prefix = activeFileBytes.subarray(0, HEADER_SNIFF_BYTES);
+      } else {
+        prefix = new Uint8Array(await activeFileBlob.slice(0, HEADER_SNIFF_BYTES).arrayBuffer());
+      }
+    } catch (e) {
+      return showToast("Couldn't read the file: " + e.message, 4000, true);
+    }
+    const header = ageHeaderInfo(prefix);
+    const withPassword = !!header && header.kind === "password";
+    if (withPassword && !(header.logN <= SHARE_SCRYPT_MAX_LOG_N)) {
+      return showToast(isNaN(header.logN)
+        ? "Decryption failed: the file is damaged (invalid scrypt stanza)."
+        : "This file asks for more work to decrypt (scrypt 2^" + header.logN
+          + ") than VaultSend allows (2^" + SHARE_SCRYPT_MAX_LOG_N + ").", 6000, true);
+    }
+
+    // An archive (Share's .tar.age) is opened to show what it holds; anything
+    // else decrypts to one file or one message, as always.
+    const archive = payload && isArchiveName(activeFileName);
+    const streamingPayload = payload && !archive && activeSize() >= STREAM_THRESHOLD;
     const outName = activeFileName ? activeFileName.replace(/\.age$/, "") : "decrypted.bin";
     // Reserve before the passphrase modal consumes transient user activation.
     const reservedSink = streamingPayload ? await reserveDiskSink(outName) : null;
     if (reservedSink && reservedSink.kind === "abort") return;
-    const identity = await unlockIdentity();
-    if (!identity) { await discardReservedSink(reservedSink); return; }
-
-    // Large ciphertext: stream it. The whole point is that neither the
-    // ciphertext nor the plaintext is ever fully resident, so a file far larger
-    // than available memory decrypts fine.
-    if (streamingPayload) {
-      const prog = newProgress("Decrypting…", activeFileName || "file");
-      try {
-        // Pass 1 — authenticate the whole ciphertext, keeping nothing. A
-        // wrong key fails here (header parsing), and so does any truncation or
-        // tampering, all before a destination file exists.
-        prog.phase("Verification (1 of 2)");
-        const probe = new age.Decrypter();
-        probe.addIdentity(identity);
-        const head = await probe.decrypt(activeStream());
-        const total = head.size(activeSize());   // exact plaintext length
-        await head.cancel();
-        await verifyCiphertext(identity, total, prog);
-
-        // Pass 2 — the ciphertext is now known intact, so it is safe to write.
-        prog.phase("Decryption (2 of 2)");
-        const dec = new age.Decrypter();
-        dec.addIdentity(identity);
-        const plainStream = await dec.decrypt(activeStream());
-        const res = await runStreamingJob(plainStream, total, outName, prog, reservedSink);
-        prog.finish();
-        if (res.aborted) return showToast("Cancelled.");
-        if (res.needsGesture) return showToast(
-          "The browser needs a fresh click to choose a save location. Press Decrypt again.", 6000, true);
-        if (res.tooBig) return showToast(
-          "Not enough browser storage: this needs " + formatSize(res.need)
-          + " but only " + formatSize(res.have) + " is available. "
-          + "Free up disk space, or use a browser that can save directly to a file.", 8000, true);
-        if (res.saved) { clearActiveFile(); return showToast("Decrypted and saved to disk."); }
-        setActiveBlob(outName, res.blob, true);
-        return showToast("Decrypted. Click Download — it is held in memory until you do.", 5000);
-      } catch (err) {
-        prog.finish();
-        if (prog.cancelled || (err && err.name === "AbortError")) return showToast("Cancelled.");
-        return showToast("Decryption failed: " + err.message, 4000, true);
-      }
-    }
-
+    let key = null;
     try {
-      let cipherBytes;
-      if (hasActivePayload()) {
-        cipherBytes = activeFileBytes || new Uint8Array(await activeFileBlob.arrayBuffer());
-      } else {
-        try { cipherBytes = age.armor.decode(text); }
-        catch { cipherBytes = new TextEncoder().encode(text); }
-      }
-
-      const dec = new age.Decrypter();
-      dec.addIdentity(identity);
-      const plain = await dec.decrypt(cipherBytes);
-
-      const isText = isValidUTF8(plain);
-      if (isText && !hasActivePayload()) {
-        // clearActiveFile() resets the editor, so decode and assign AFTER it
-        // (the original wrote-then-cleared, wiping the decrypted result).
-        clearActiveFile();
-        $("editor").value = new TextDecoder().decode(plain);
-        showToast("Decrypted successfully.");
-      } else {
-        const ext = isText ? ".txt" : ".bin";
-        const fname = activeFileName ? activeFileName.replace(/\.age$/, "") : ("decrypted" + ext);
-        setActiveFile(fname, plain, true);
-        showToast("Decrypted successfully. Click Download.");
-      }
+      key = withPassword ? await passwordKey(prefix, activeFileName) : await identityKey();
     } catch (e) {
       showToast("Decryption failed: " + e.message, 4000, true);
+    }
+    if (!key) { await discardReservedSink(reservedSink); return; }
+
+    try {
+      if (archive) return await openSharedArchive(key, activeFileName, withPassword);
+
+      // Large ciphertext: stream it. The whole point is that neither the
+      // ciphertext nor the plaintext is ever fully resident, so a file far larger
+      // than available memory decrypts fine.
+      if (streamingPayload) {
+        const prog = newProgress("Decrypting…", activeFileName || "file");
+        try {
+          // Pass 1 — authenticate the whole ciphertext, keeping nothing. A
+          // wrong key fails here (header parsing), and so does any truncation or
+          // tampering, all before a destination file exists.
+          prog.phase("Verification (1 of 2)");
+          const probe = new age.Decrypter();
+          key.add(probe);
+          const head = await probe.decrypt(activeStream());
+          const total = head.size(activeSize());   // exact plaintext length
+          await head.cancel();
+          await verifyCiphertext(key, total, prog);
+
+          // Pass 2 — the ciphertext is now known intact, so it is safe to write.
+          prog.phase("Decryption (2 of 2)");
+          const dec = new age.Decrypter();
+          key.add(dec);
+          const plainStream = await dec.decrypt(activeStream());
+          const res = await runStreamingJob(plainStream, total, outName, prog, reservedSink);
+          prog.finish();
+          if (res.aborted) return showToast("Cancelled.");
+          if (res.needsGesture) return showToast(
+            "The browser needs a fresh click to choose a save location. Press Decrypt again.", 6000, true);
+          if (res.tooBig) return showToast(
+            "Not enough browser storage: this needs " + formatSize(res.need)
+            + " but only " + formatSize(res.have) + " is available. "
+            + "Free up disk space, or use a browser that can save directly to a file.", 8000, true);
+          if (res.saved) { clearActiveFile(); return showToast("Decrypted and saved to disk."); }
+          setActiveBlob(outName, res.blob, true);
+          return showToast("Decrypted. Click Download — it is held in memory until you do.", 5000);
+        } catch (err) {
+          prog.finish();
+          if (prog.cancelled || (err && err.name === "AbortError")) return showToast("Cancelled.");
+          return showToast("Decryption failed: " + err.message, 4000, true);
+        }
+      }
+
+      try {
+        const cipherBytes = payload
+          ? (activeFileBytes || new Uint8Array(await activeFileBlob.arrayBuffer()))
+          : textBytes;
+
+        const dec = new age.Decrypter();
+        key.add(dec);
+        const plain = await dec.decrypt(cipherBytes);
+
+        const isText = isValidUTF8(plain);
+        if (isText && !hasActivePayload()) {
+          // clearActiveFile() resets the editor, so decode and assign AFTER it
+          // (the original wrote-then-cleared, wiping the decrypted result).
+          clearActiveFile();
+          $("editor").value = new TextDecoder().decode(plain);
+          showToast("Decrypted successfully.");
+        } else {
+          const ext = isText ? ".txt" : ".bin";
+          const fname = activeFileName ? activeFileName.replace(/\.age$/, "") : ("decrypted" + ext);
+          setActiveFile(fname, plain, true);
+          showToast("Decrypted successfully. Click Download.");
+        }
+      } catch (e) {
+        showToast("Decryption failed: " + e.message, 4000, true);
+      }
+    } finally {
+      key.wipe();
     }
   });
 
@@ -1849,11 +2584,12 @@
       '<p style="font-size:.875rem;color:var(--text-muted);margin-top:.5rem">' +
         "Powered by <code>age-encryption</code> (typage v0.2.4) by Filippo Valsorda, bundled offline.<br>" +
         "Interoperable with the desktop app and <code>rage</code> CLI.<br>" +
+        "Opens files shared from a vault in the desktop or Android app, with your key or a password.<br>" +
         "Crypto bundle is reproducible from pinned upstream sources; verify it " +
         "live via Menu \u2192 Verify integrity and Run crypto self-test.<br>" +
         "Your unlocked key auto-locks when idle or when the tab is hidden.<br>" +
         '<a href="https://github.com/caelenm/vaultsend" target="_blank" rel="noopener noreferrer" style="color:var(--primary);text-decoration:underline;">https://github.com/caelenm/vaultsend</a><br>' +
-        "Version: 1.3.0 web (streaming output)" +
+        "Version: 1.4.0 web (streaming output, shared files)" +
       "</p>",
       [{ label: "Close", val: "close" }]
     );
@@ -1863,15 +2599,19 @@
   function openBackdrop(id)  { $(id).classList.add("open"); }
   function closeBackdrop(id) { $(id).classList.remove("open"); }
 
-  function passphraseModal(title, sub, confirm) {
+  // forShare: the prompt is for a shared file's password, not your passphrase.
+  // It is used for that one file and never kept, so there is nothing to remember.
+  function passphraseModal(title, sub, confirm, forShare) {
     return new Promise((res) => {
       $("pass-title").textContent = title;
       $("pass-sub").textContent   = sub;
       $("pass-input").value = "";
       $("pass-confirm").value = "";
+      $("pass-input").placeholder = forShare ? "Password" : "Passphrase";
+      $("pass-input").autocomplete = forShare ? "off" : "current-password";
       confirm ? show("pass-confirm-group") : hide("pass-confirm-group");
-      // "Keep unlocked this session" is offered only on unlock flows.
-      if (confirm) { hide("pass-remember-row"); }
+      // "Keep unlocked this session" is offered only when unlocking your own key.
+      if (confirm || forShare) { hide("pass-remember-row"); }
       else { show("pass-remember-row"); $("pass-remember").checked = keyVault.remember; }
       openBackdrop("modal-pass");
       pendingResolve = res;
@@ -1880,7 +2620,7 @@
   }
   $("pass-submit").addEventListener("click", () => {
     const p = $("pass-input").value;
-    if (!p) return showToast("Passphrase cannot be empty.");
+    if (!p) return showToast($("pass-input").placeholder + " cannot be empty.");
     if (!$("pass-confirm-group").classList.contains("hidden")) {
       // Creating a key: the passphrase is all that protects identity.age once
       // it is exported or backed up, so refuse trivially guessable ones.
@@ -1935,6 +2675,7 @@
   // invisibly -- dismissing it requests cancellation instead.
   function dismissBackdrop(bd) {
     if (bd.id === "modal-progress") { if (activeProgress) activeProgress.cancel(); return; }
+    if (bd.id === "modal-share") { closeShare(); return; }
     bd.classList.remove("open");
     if (bd.id === "modal-alert") {
       if (alertResolve) { const r = alertResolve; alertResolve = null; r(null); }
@@ -1943,12 +2684,16 @@
     if (pendingResolve) { pendingResolve(null); pendingResolve = null; }
   }
   document.querySelectorAll(".backdrop").forEach((bd) => {
-    bd.addEventListener("click", (e) => { if (e.target === bd) dismissBackdrop(bd); });
+    // A stray click beside the shared files dialog would throw away what was just
+    // decrypted; that one closes with its button or Escape.
+    bd.addEventListener("click", (e) => { if (e.target === bd && bd.id !== "modal-share") dismissBackdrop(bd); });
   });
   document.addEventListener("keydown", (e) => {
     if (e.key !== "Escape") return;
-    const open = document.querySelector(".backdrop.open");
-    if (open) dismissBackdrop(open);
+    // The topmost: progress and alerts open over the shared files dialog, and
+    // come after it in the document.
+    const open = document.querySelectorAll(".backdrop.open");
+    if (open.length) dismissBackdrop(open[open.length - 1]);
   });
 
   // ── Session-lock wiring + activity listeners ─────────────────────────────
@@ -2048,6 +2793,19 @@
       const p = await d.decrypt(b64ToBytes(KAT.ctPass), "text");
       add("decrypt upstream passphrase/scrypt ciphertext \u2192 expected plaintext", p === KAT.plaintext);
     } catch (e) { add("decrypt scrypt vector", false, e.message); }
+    try {
+      // What opening a password share does: unwrap the file key from the header
+      // once, then hand that key to the decrypter in place of the passphrase.
+      const ct = b64ToBytes(KAT.ctPass);
+      const d = new age.Decrypter(); d.addPassphrase(KAT.pass);
+      const fileKey = await d.decryptHeader(ct);
+      const d2 = new age.Decrypter(); d2.addIdentity({ unwrapFileKey: async () => fileKey });
+      const p = await d2.decrypt(ct, "text");
+      let refused = false;
+      try { const d3 = new age.Decrypter(); d3.addIdentity({ unwrapFileKey: async () => fileKey }); await d3.decrypt(b64ToBytes(KAT.ctRecip)); }
+      catch { refused = true; }
+      add("password file: key unwrapped once from the header opens it, and no other file", p === KAT.plaintext && refused);
+    } catch (e) { add("password file key", false, e.message); }
     let liveCt = null, liveId = null;
     try {
       liveId = await age.generateIdentity();
