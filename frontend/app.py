@@ -1974,7 +1974,7 @@ class Window(Adw.ApplicationWindow):
         how.add_css_class("heading")
         box.append(how)
         with_key = Gtk.CheckButton(label="Encrypt with my key (simplest, secure)", active=True)
-        with_password = Gtk.CheckButton(label="Use a password (shareable)")
+        with_password = Gtk.CheckButton(label="Use a password")
         with_password.set_group(with_key)
         box.append(with_key)
         box.append(with_password)
