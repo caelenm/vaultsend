@@ -154,7 +154,9 @@ The web build opens those files, and has no vaults of its own:
   `age` tool make, and one asking for more is refused before any work is done.
 - **A vault itself can't be imported.** Dropping a `.vsvault` folder (or its
   `VAULT` file) says so: importing vaults is not supported on the web, and the
-  desktop or mobile versions are the place for it.
+  desktop or mobile versions are the place for it. A vault that arrives as a
+  `.zip` is recognised too, by what the zip holds rather than its name, before
+  Decrypt asks for any key.
 
 What a page can't do that the apps can: build the unpacked folder somewhere
 private and rename it into place. Here the archive is verified and checked in

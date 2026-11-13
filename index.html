@@ -24,7 +24,7 @@
     Editing either <script> body invalidates its hash; re-pin with
     `python3 update-csp.py`.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-34H/Emg70bFsBvax2MzaRml/D9AkESvaHtJYSEYkps4=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; manifest-src &#39;self&#39;; worker-src &#39;self&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-ML3I6kWjnnx8QK7f3E6S49xVrQKMeSREVM3RehF7Rug=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; manifest-src &#39;self&#39;; worker-src &#39;self&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;">
   <title>VaultSend</title>
   <link rel="manifest" href="manifest.webmanifest">
   <meta name="theme-color" content="#1c3a5e">
@@ -1342,6 +1342,44 @@
     return null;
   }
 
+  // Whether a .zip holds a vault, by what is in it rather than what it is
+  // called: a folder (or the top) with a vault's three fixed files side by
+  // side, VAULT, key.age and manifest.age. Only the zip's list of names is
+  // read (its central directory); nothing is unpacked. Resolves the vault's
+  // folder name ("" at the top), or null.
+  async function zipHoldsVault(blob) {
+    try {
+      const u16 = (b, i) => b[i] | (b[i + 1] << 8);
+      const u32 = (b, i) => (b[i] | (b[i + 1] << 8) | (b[i + 2] << 16) | (b[i + 3] << 24)) >>> 0;
+      const head = new Uint8Array(await blob.slice(0, 4).arrayBuffer());
+      if (head.length < 4 || u32(head, 0) !== 0x04034b50) return null;        // "PK\3\4"
+      // The end record is the last 22 bytes, plus a comment of up to 64 KiB.
+      const tailAt = Math.max(0, blob.size - (22 + 65535));
+      const tail = new Uint8Array(await blob.slice(tailAt).arrayBuffer());
+      let end = tail.length - 22;
+      while (end >= 0 && u32(tail, end) !== 0x06054b50) end--;
+      if (end < 0) return null;
+      const size = u32(tail, end + 12), at = u32(tail, end + 16);
+      if (size > 64 * 1024 * 1024 || at + size > blob.size) return null;      // zip64 or damaged: not ours to judge
+      const dir = new Uint8Array(await blob.slice(at, at + size).arrayBuffer());
+      const names = new Set();
+      const decoder = new TextDecoder();
+      for (let i = 0; i + 46 <= dir.length && u32(dir, i) === 0x02014b50;) {
+        const n = u16(dir, i + 28);
+        names.add(decoder.decode(dir.subarray(i + 46, i + 46 + n)));
+        i += 46 + n + u16(dir, i + 30) + u16(dir, i + 32);
+      }
+      for (const name of names) {
+        if (name !== "VAULT" && !name.endsWith("/VAULT")) continue;
+        const folder = name.slice(0, -"VAULT".length);
+        if (names.has(folder + "key.age") && names.has(folder + "manifest.age")) {
+          return folder.replace(/\/$/, "").split("/").pop();
+        }
+      }
+    } catch {}
+    return null;
+  }
+
   // ── Drag & drop ───────────────────────────────────────────────────────────
   // The card shows the drop target, but a drop anywhere on the page is taken:
   // otherwise the browser would navigate away to show the file, losing the
@@ -2431,6 +2469,14 @@
     const payload = hasActivePayload();
     if (!text && !payload) return showToast("Paste encrypted text or drop an age file first.");
 
+    // A vault that arrived zipped (a dropped folder is zipped on the way in, or
+    // someone zipped it themselves) is still a vault: say so before any key is
+    // asked for. Told by what the zip holds, not by its name.
+    if (payload) {
+      const vault = await zipHoldsVault(activeFileBlob || new Blob([activeFileBytes]));
+      if (vault !== null) return vaultNotSupported(vault || activeFileName);
+    }
+
     // Which key opens it, a password or yours, is in the header, in the clear.
     let textBytes = null, prefix;
     try {
@@ -2445,6 +2491,12 @@
       }
     } catch (e) {
       return showToast("Couldn't read the file: " + e.message, 4000, true);
+    }
+    // Not age at all: say that, rather than ask for a passphrase and fail on it.
+    const AGE_INTRO = "age-encryption.org/v1\n";
+    if (String.fromCharCode.apply(null, prefix.subarray(0, AGE_INTRO.length)) !== AGE_INTRO) {
+      return showToast("Decryption failed: this isn't an age-encrypted "
+        + (payload ? "file" : "message") + ", so there is nothing to decrypt.", 5000, true);
     }
     const header = ageHeaderInfo(prefix);
     const withPassword = !!header && header.kind === "password";
