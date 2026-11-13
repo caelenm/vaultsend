@@ -14,13 +14,22 @@
         attributes; styles cannot exfiltrate data under default-src 'none'.
       * script-src has no 'self': the page loads no script files, so allowing
         same-origin scripts would only widen what an injection could pull in.
+      * manifest-src and worker-src allow this origin's own manifest.webmanifest
+        and sw.js, which make a hosted copy installable as an app. The worker
+        only re-fetches VaultSend's own files so the app opens offline; it
+        cannot change what the hashes above allow to run. Opened from disk,
+        neither is used.
       * frame-ancestors is not listed because browsers ignore it in a <meta>
         tag; a hosted copy must send it as an HTTP header to block framing.
     Editing either <script> body invalidates its hash; re-pin with
     `python3 update-csp.py`.
   -->
-  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-50p9Rznx1LLTLPYGtV7MeVDn4YFPviutgkZnDK+5FEE=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; base-uri &#39;none&#39;; form-action &#39;none&#39;">
+  <meta http-equiv="Content-Security-Policy" content="default-src &#39;none&#39;; script-src &#39;sha256-ICmTDSgHvTs31dRxgZS3fdCGun1CChgXbL3GFpYMnrI=&#39; &#39;sha256-MLAW+chnzoUV5j4FvCitnY9rk/Xmeckk2WytFH1cbbE=&#39;; style-src &#39;self&#39; &#39;unsafe-inline&#39;; img-src &#39;self&#39; data:; manifest-src &#39;self&#39;; worker-src &#39;self&#39;; base-uri &#39;none&#39;; form-action &#39;none&#39;">
   <title>VaultSend</title>
+  <link rel="manifest" href="manifest.webmanifest">
+  <meta name="theme-color" content="#1c3a5e">
+  <link rel="icon" type="image/png" sizes="192x192" href="icons/icon-192.png">
+  <link rel="apple-touch-icon" href="icons/icon-192.png">
   <style>
     /* ─── Design tokens — VaultSend "shield navy" / Material-3 aligned ─── */
     :root, [data-theme="light"] {
@@ -2843,6 +2852,14 @@
       : "One or more checks failed \u2014 do not trust this file.";
     $("alert-extra").innerHTML = '<div class="mono-block" style="font-size:.78rem">' + rows.join("") + "</div>";
   }); }
+
+  // ── Installable app (hosted copies only) ──────────────────────────────────
+  // Over https (or localhost) the page can be installed as an app. The service
+  // worker keeps a copy of VaultSend's own files so the installed app opens with
+  // no connection. Opened from disk there is nothing to install or register.
+  if ("serviceWorker" in navigator && /^https?:$/.test(location.protocol)) {
+    navigator.serviceWorker.register("sw.js").catch(() => {});
+  }
 
   // ── Init ──────────────────────────────────────────────────────────────────
   updateLockUI();

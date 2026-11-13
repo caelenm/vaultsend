@@ -57,6 +57,7 @@ The page ships a strict Content-Security-Policy:
 ```
 default-src 'none'; script-src 'sha256-…' 'sha256-…';
 style-src 'self' 'unsafe-inline'; img-src 'self' data:;
+manifest-src 'self'; worker-src 'self';
 base-uri 'none'; form-action 'none'
 ```
 
@@ -71,6 +72,35 @@ another site from framing it. If you host a copy, send
 
 After editing either inline script, re-pin its hash with `python3 update-csp.py`
 (`--check` only reports whether the pins are current).
+
+### Installing it as an app
+
+`index.html` on its own is the whole tool, and opened from disk (`file://`) it
+stays exactly that: browsers only offer to install a page served over `https`.
+
+A hosted copy can be installed (Chrome, Edge and Android: the install button in
+the address bar or menu; iOS and macOS Safari: Share → Add to Home Screen / Add
+to Dock). For that, host these beside `index.html`:
+
+| File | Purpose |
+|------|---------|
+| `manifest.webmanifest` | Name, colours and icons of the installed app. |
+| `icons/` | The app icon, 192 and 512 px. |
+| `sw.js` | Service worker: keeps a copy of these files so the app opens offline. |
+
+What this changes in the security model, and what it doesn't:
+
+- The CSP gains `manifest-src 'self'` and `worker-src 'self'`. `script-src` is
+  unchanged: page scripts still run only by pinned hash.
+- `sw.js` is the one script not pinned by hash (a service worker can't be
+  inline). It runs in its own context, sees no keys, text or files, and only
+  re-fetches VaultSend's own files from its own origin (network first, kept
+  copy when offline). It can decide which copy of `index.html` the browser
+  gets, as the host already can, but not what that copy is allowed to run.
+- The page itself still makes no network requests.
+
+If you'd rather not have a service worker, don't host `sw.js`: everything else
+works, and the app just won't open offline when installed.
 
 ### Pinned, auditable code
 
@@ -249,6 +279,7 @@ what is and isn't proven by a reproducible build.
 |------|---------|
 | `index.html` | The application — open this. |
 | `verify.sh`              | Reproducible-build verifier. |
+| `manifest.webmanifest`, `icons/`, `sw.js` | Make a hosted copy installable as an app (optional). |
 | `update-csp.py`          | Re-pins the CSP script hashes after an edit. |
 | `tests/shared_archive_test.mjs` | Tests the shared-archive reader inside `index.html` (Node only). |
 | `LICENSE`                | GPL-3.0 license text. |
